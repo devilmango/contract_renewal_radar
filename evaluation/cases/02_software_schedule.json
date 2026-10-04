@@ -1,0 +1,11 @@
+{
+  "id": "software-schedule-parenthetical-days",
+  "contract_text": "[PROVIDER] Software Schedule. The effective date of this Schedule is 2026-03-15 and its expiration date is 2027-03-14. The Schedule automatically renews for one-year periods unless either party gives notice at least 60 (sixty) days before expiration. Termination notice: 15 calendar days.",
+  "expected": {
+    "start_date": "2026-03-15",
+    "expiration_date": "2027-03-14",
+    "renewal_notice_days": 60,
+    "auto_renew": true,
+    "termination_notice": "15 calendar days"
+  }
+}

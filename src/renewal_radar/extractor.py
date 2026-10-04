@@ -316,8 +316,16 @@ _PROVIDER_MODELS = {
 _PROVIDER_MODEL_ALIASES = {"google": ("GEMINI_MODEL",)}
 
 
-def get_extractor() -> Extractor:
-    requested = os.getenv("LLM_PROVIDER", "auto").strip().lower()
+def configured_llm_providers() -> list[str]:
+    return [
+        name
+        for name, env_names in _PROVIDER_KEYS.items()
+        if any(os.getenv(key) for key in env_names)
+    ]
+
+
+def get_extractor(provider_override: str | None = None) -> Extractor:
+    requested = (provider_override or os.getenv("LLM_PROVIDER", "auto")).strip().lower()
     if requested == "rules":
         return RulesExtractor()
     if requested == "auto":

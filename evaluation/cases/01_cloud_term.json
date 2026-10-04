@@ -1,0 +1,11 @@
+{
+  "id": "cloud-successive-terms",
+  "contract_text": "[CUSTOMER] Cloud Services Agreement. Effective Date: January 1, 2025. Initial Term ends December 31, 2026. This Agreement will automatically renew for successive one-year terms unless either party delivers written notice of non-renewal at least 90 days prior to expiration. Termination notice period: 30 days.",
+  "expected": {
+    "start_date": "2025-01-01",
+    "expiration_date": "2026-12-31",
+    "renewal_notice_days": 90,
+    "auto_renew": true,
+    "termination_notice": "30 days"
+  }
+}

@@ -55,7 +55,6 @@ class ContractRecord(BaseModel):
 
 class ConfirmationRequest(BaseModel):
     contract: ContractData
-    actor: str = Field(min_length=1, max_length=150)
 
 
 class AuditEvent(BaseModel):
@@ -82,5 +81,4 @@ class ReminderTask(BaseModel):
 
 
 class ResolveTaskRequest(BaseModel):
-    actor: str = Field(min_length=1, max_length=150)
     comment: str | None = Field(default=None, max_length=2000)

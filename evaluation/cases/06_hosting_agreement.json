@@ -1,0 +1,11 @@
+{
+  "id": "hosting-agreement-renewal",
+  "contract_text": "[HOST] Hosting Agreement. Effective Date: 2025-10-01. The term ends on 2028-09-30. The Agreement shall not automatically renew; the parties may extend it only by signing a written amendment. Either party must provide notice of non-renewal at least 75 days before the end date. Termination notice period: 30 days.",
+  "expected": {
+    "start_date": "2025-10-01",
+    "expiration_date": "2028-09-30",
+    "renewal_notice_days": 75,
+    "auto_renew": false,
+    "termination_notice": "30 days"
+  }
+}

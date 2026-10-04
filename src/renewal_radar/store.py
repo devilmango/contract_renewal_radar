@@ -142,8 +142,18 @@ class Store:
         with self.connect() as db:
             return db.execute("SELECT * FROM audit_events WHERE contract_id=? ORDER BY id", (contract_id,)).fetchall()
 
-    def list_tasks(self, status: str | None = None) -> list[sqlite3.Row]:
+    def list_tasks(self, status: str | None = None, owner_email: str | None = None) -> list[sqlite3.Row]:
         with self.connect() as db:
+            if owner_email is not None and status:
+                return db.execute(
+                    "SELECT * FROM tasks WHERE status=? AND lower(owner_email)=lower(?) ORDER BY due_date",
+                    (status, owner_email),
+                ).fetchall()
+            if owner_email is not None:
+                return db.execute(
+                    "SELECT * FROM tasks WHERE lower(owner_email)=lower(?) ORDER BY due_date",
+                    (owner_email,),
+                ).fetchall()
             if status:
                 return db.execute("SELECT * FROM tasks WHERE status=? ORDER BY due_date", (status,)).fetchall()
             return db.execute("SELECT * FROM tasks ORDER BY due_date").fetchall()

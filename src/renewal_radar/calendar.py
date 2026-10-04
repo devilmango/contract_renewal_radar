@@ -5,9 +5,9 @@ from datetime import datetime, timezone
 from .store import Store
 
 
-def export_ics(store: Store) -> str:
+def export_ics(store: Store, owner_email: str | None = None) -> str:
     lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Contract Renewal Radar//EN", "CALSCALE:GREGORIAN"]
-    for task in store.list_tasks(status="open"):
+    for task in store.list_tasks(status="open", owner_email=owner_email):
         due = task["due_date"].replace("-", "")
         title = task["title"].replace("\\", "\\\\").replace(",", "\\,").replace(";", "\\;").replace("\n", "\\n")
         description = f"Review renewal before contract expiration on {task['expiration_date']}"

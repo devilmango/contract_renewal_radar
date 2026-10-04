@@ -1,0 +1,11 @@
+{
+  "id": "support-nonrenewing",
+  "contract_text": "[VENDOR] Support Services Agreement. Start date: February 1, 2025. Expiration date: January 31, 2026. This Agreement does not automatically renew. A written non-renewal notice must be received no later than 30 days before the expiration date. Termination notice period: 10 days.",
+  "expected": {
+    "start_date": "2025-02-01",
+    "expiration_date": "2026-01-31",
+    "renewal_notice_days": 30,
+    "auto_renew": false,
+    "termination_notice": "10 days"
+  }
+}

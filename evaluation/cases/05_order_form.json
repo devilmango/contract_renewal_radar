@@ -1,0 +1,11 @@
+{
+  "id": "order-form-renewal",
+  "contract_text": "[SUPPLIER] Order Form OF-REDACTED. This Order Form takes effect on 2025-07-01 and expires on 2026-06-30. It will be renewed automatically for a further twelve-month period unless the customer gives written notice of non-renewal at least 45 calendar days before the expiration date. Termination notice period: 20 days.",
+  "expected": {
+    "start_date": "2025-07-01",
+    "expiration_date": "2026-06-30",
+    "renewal_notice_days": 45,
+    "auto_renew": true,
+    "termination_notice": "20 days"
+  }
+}

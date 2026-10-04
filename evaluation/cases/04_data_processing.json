@@ -1,0 +1,11 @@
+{
+  "id": "data-processing-term",
+  "contract_text": "[PROCESSOR] Data Processing Addendum. Commencement Date: April 1, 2024. The initial term will expire on March 31, 2027. It renews automatically for additional two-year terms unless either party provides written notice at least 120 days in advance of the end of the then-current term. Termination notice period is 45 days.",
+  "expected": {
+    "start_date": "2024-04-01",
+    "expiration_date": "2027-03-31",
+    "renewal_notice_days": 120,
+    "auto_renew": true,
+    "termination_notice": "45 days"
+  }
+}
