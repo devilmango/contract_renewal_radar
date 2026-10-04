@@ -17,7 +17,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-llm = ["openai>=1.30,<3.0"]
+llm = ["openai>=1.55,<3.0"]
+llm-anthropic = ["anthropic>=0.75,<2.0"]
+llm-google = ["google-genai>=1.0,<2.0"]
+llm-mistral = ["mistralai>=1.9,<3.0"]
+llm-cohere = ["cohere>=5.11,<6.0"]
+llm-xai = ["openai>=1.55,<3.0"]
+llm-all = [
+  "openai>=1.55,<3.0",
+  "anthropic>=0.75,<2.0",
+  "google-genai>=1.0,<2.0",
+  "mistralai>=1.9,<3.0",
+  "cohere>=5.11,<6.0",
+]
 ocr = ["pymupdf>=1.24,<2.0", "pytesseract>=0.3.10,<1.0"]
 
 [project.scripts]

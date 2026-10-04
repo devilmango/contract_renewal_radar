@@ -30,7 +30,7 @@ An extraction is always a proposal. The service does not activate a contract or 
 
 - **PDF ingestion:** Accept PDF agreements up to 25 MB and extract selectable text.
 - **OCR support:** Optionally recognize scanned pages with Tesseract.
-- **Two extraction paths:** Use an optional LLM for contract language or a small, transparent rules extractor when no LLM is configured.
+- **Provider choice:** Use OpenAI, Anthropic Claude, Google Gemini, Mistral, Cohere, or xAI Grok with the same extraction schema, or use the deterministic rules fallback.
 - **Evidence-backed proposals:** Return extracted fields with supporting text and confidence values for reviewer context.
 - **Deterministic validation:** Validate date order, data types, notice-period ranges, and required terms before a contract can be activated.
 - **Human review:** Correct extracted fields, assign an owner, then confirm or reject each proposal.
@@ -63,7 +63,7 @@ See [the complete example record](examples/contract-extraction.json).
 
 - Python 3.11 or newer
 - Optional for scanned PDFs: Tesseract executable and the Python `ocr` extra
-- Optional for LLM extraction: an OpenAI API key and the Python `llm` extra
+- Optional for LLM extraction: an API key and the matching provider extra (OpenAI, Anthropic, Google, Mistral, Cohere, or xAI)
 - Optional for email delivery: SMTP server credentials
 
 ### Run locally
@@ -93,18 +93,36 @@ Compose stores the database in a named volume. Configure integrations in `.env` 
 
 ### Rules-based extraction (default)
 
-If `OPENAI_API_KEY` is unset, Radar uses its built-in rules extractor. This is useful for local evaluation and has no external model dependency. It recognizes common date labels and renewal language; contract wording varies, so the extractor may leave a value blank. Reviewers can supply or correct missing values during confirmation.
+If no supported provider API key is configured, Radar uses its built-in rules extractor. This is useful for local evaluation and has no external model dependency. It recognizes common date labels and renewal language; contract wording varies, so the extractor may leave a value blank. Reviewers can supply or correct missing values during confirmation.
 
-### Optional LLM extraction
+### Select an LLM provider
+
+Set `LLM_PROVIDER` and the provider's API key. The model name can be set with `LLM_MODEL` or the provider-specific model variable.
+
+| Provider | `LLM_PROVIDER` | Install extra | API key | Model override |
+| --- | --- | --- | --- | --- |
+| OpenAI | `openai` | `llm` | `OPENAI_API_KEY` | `OPENAI_MODEL` |
+| Anthropic Claude | `anthropic` | `llm-anthropic` | `ANTHROPIC_API_KEY` | `ANTHROPIC_MODEL` |
+| Google Gemini | `google` | `llm-google` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | `GOOGLE_MODEL` or `GEMINI_MODEL` |
+| Mistral | `mistral` | `llm-mistral` | `MISTRAL_API_KEY` | `MISTRAL_MODEL` |
+| Cohere | `cohere` | `llm-cohere` | `COHERE_API_KEY` | `COHERE_MODEL` |
+| xAI Grok | `xai` | `llm-xai` | `XAI_API_KEY` | `XAI_MODEL` |
+
+Install the extra for the selected provider. For example:
 
 ```bash
-pip install -e '.[llm]'
-export OPENAI_API_KEY='your-api-key'
-export OPENAI_MODEL='gpt-4o-mini'
+pip install -e '.[llm-anthropic]'
+export LLM_PROVIDER=anthropic
+export ANTHROPIC_API_KEY='your-api-key'
+export ANTHROPIC_MODEL='claude-sonnet-5'
 renewal-radar serve
 ```
 
-The configured model returns JSON constrained by a schema. Radar parses that result into its Pydantic model and applies deterministic validation. Do not treat model output as legal advice or an authoritative interpretation of a contract.
+Use `pip install -e '.[llm-all]'` to install all provider clients; xAI uses the OpenAI-compatible Python SDK. With `LLM_PROVIDER=auto` (the default), Radar selects the first configured key in this order: OpenAI, Anthropic, Google, Mistral, Cohere, xAI. Set a provider explicitly when more than one key is present. Set `LLM_PROVIDER=rules` to force the local rules extractor even when provider keys are available.
+
+The provider adapters request schema-constrained JSON where supported and parse the result into the shared Pydantic model. Radar then applies its own deterministic validation. Model names and structured-output availability are controlled by each provider and can change; override the defaults with the model variables above. Do not treat model output as legal advice or an authoritative interpretation of a contract.
+
+Provider API references: [OpenAI structured outputs](https://platform.openai.com/docs/guides/structured-outputs), [Anthropic structured outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs), [Gemini structured outputs](https://ai.google.dev/gemini-api/docs/structured-output), [Mistral custom structured outputs](https://docs.mistral.ai/studio/conversations/structured-output/custom), [Cohere structured outputs](https://docs.cohere.com/v2/docs/structured-outputs), and [xAI structured outputs](https://docs.x.ai/developers/model-capabilities/text/structured-outputs).
 
 ### Optional OCR
 
@@ -221,8 +239,20 @@ OpenAPI and interactive request examples are available at `/docs` while the serv
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DATABASE_PATH` | `renewal_radar.db` | SQLite database location |
-| `OPENAI_API_KEY` | unset | Enables the optional OpenAI extractor |
-| `OPENAI_MODEL` | `gpt-4o-mini` | Model used by the optional extractor |
+| `LLM_PROVIDER` | `auto` | Provider selection: `auto`, `rules`, `openai`, `anthropic`, `google`, `mistral`, `cohere`, or `xai` |
+| `LLM_MODEL` | provider default | Optional model override for the selected provider |
+| `OPENAI_API_KEY` | unset | OpenAI API key |
+| `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI model override |
+| `ANTHROPIC_API_KEY` | unset | Anthropic API key |
+| `ANTHROPIC_MODEL` | `claude-sonnet-5` | Anthropic model override |
+| `GOOGLE_API_KEY` / `GEMINI_API_KEY` | unset | Google AI Studio API key |
+| `GOOGLE_MODEL` / `GEMINI_MODEL` | `gemini-3.8-flash` | Gemini model override |
+| `MISTRAL_API_KEY` | unset | Mistral API key |
+| `MISTRAL_MODEL` | `ministral-8b-latest` | Mistral model override |
+| `COHERE_API_KEY` | unset | Cohere API key |
+| `COHERE_MODEL` | `command-a-plus-05-2026` | Cohere model override |
+| `XAI_API_KEY` | unset | xAI API key |
+| `XAI_MODEL` | `grok-4.7` | xAI model override |
 | `SMTP_HOST` | unset | Enables email delivery |
 | `SMTP_PORT` | `587` | SMTP server port |
 | `SMTP_USERNAME` | unset | Optional SMTP authentication username |
@@ -262,6 +292,7 @@ contract_renewal_radar/
 - Human confirmation is a required workflow boundary, not an optional quality check.
 - SQLite is intended for a single service instance. Use a managed database and durable job queue before scaling horizontally.
 - This MVP does not implement user authentication, authorization, multi-tenant isolation, document retention policies, or legal advice. Put it behind an authenticated reverse proxy and follow your organization's contract-data policies before exposing it to a wider network.
+- When an external LLM provider is enabled, extracted contract text is sent to that provider's API. Review its data handling, retention, and contractual terms before processing confidential agreements.
 - The reminder runner sends the first notification on or after the calculated task date. Run it on a reliable schedule to avoid missed notifications.
 
 ## Contributing
