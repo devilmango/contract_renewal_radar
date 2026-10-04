@@ -1,0 +1,10 @@
+{
+  "id": "ambiguous-renewal-language",
+  "contract_text": "[PROVIDER] Managed Services Agreement. Start Date: September 1, 2025. Expiration Date: August 31, 2026. This Agreement does not automatically renew. Any extension must be agreed in a signed writing. Termination notice period: 30 days.",
+  "expected": {
+    "start_date": "2025-09-01",
+    "expiration_date": "2026-08-31",
+    "auto_renew": false,
+    "termination_notice": "30 days"
+  }
+}

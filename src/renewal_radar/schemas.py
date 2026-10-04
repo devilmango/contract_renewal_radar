@@ -22,10 +22,16 @@ class ContractData(BaseModel):
     start_date: date | None = None
     expiration_date: date | None = None
     renewal_notice_days: int | None = Field(default=None, ge=0, le=3650)
+    notice_day_type: Literal["calendar", "business"] = "calendar"
+    notice_timezone: str = "UTC"
+    notice_holidays: list[date] = Field(default_factory=list)
+    notice_method: str | None = Field(default=None, max_length=250)
+    notice_recipient: str | None = Field(default=None, max_length=500)
     auto_renew: bool | None = None
     termination_notice: str | None = Field(default=None, max_length=250)
     owner_name: str | None = Field(default=None, max_length=150)
     owner_email: str | None = Field(default=None, max_length=320)
+    supersedes_contract_id: str | None = Field(default=None, max_length=100)
     evidence: list[Evidence] = Field(default_factory=list)
 
     @field_validator("owner_email")
@@ -45,12 +51,13 @@ class ContractData(BaseModel):
 class ContractRecord(BaseModel):
     id: str
     filename: str
-    status: Literal["pending_review", "active", "rejected"]
+    status: Literal["pending_review", "active", "rejected", "superseded"]
     extraction_provider: str
     extracted: ContractData
     confirmed: ContractData | None = None
     created_at: datetime
     confirmed_at: datetime | None = None
+    tenant_id: str = "default"
 
 
 class ConfirmationRequest(BaseModel):
@@ -78,6 +85,10 @@ class ReminderTask(BaseModel):
     reminder_sent_at: datetime | None
     escalated_at: datetime | None
     created_at: datetime
+    tenant_id: str = "default"
+    notice_day_type: Literal["calendar", "business"] = "calendar"
+    notice_timezone: str = "UTC"
+    notice_holidays: list[date] = Field(default_factory=list)
 
 
 class ResolveTaskRequest(BaseModel):

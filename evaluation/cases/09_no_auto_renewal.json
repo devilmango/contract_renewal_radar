@@ -1,0 +1,9 @@
+{
+  "id": "consulting-fixed-term",
+  "contract_text": "[CLIENT] Consulting Agreement. Commencement date: May 1, 2025. The initial term expires on April 30, 2026. This Agreement will not automatically renew. No renewal notice is required. Either party may terminate for convenience on 20 days written notice.",
+  "expected": {
+    "start_date": "2025-05-01",
+    "expiration_date": "2026-04-30",
+    "auto_renew": false
+  }
+}

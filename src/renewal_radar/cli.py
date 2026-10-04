@@ -29,11 +29,14 @@ def main() -> int:
     create_token.add_argument("--actor", required=True, help="Identity recorded in the audit trail")
     create_token.add_argument("--role", required=True, choices=sorted(SUPPORTED_ROLES), action="append", help="Role to grant; may be repeated")
     create_token.add_argument("--email", help="Email used to scope owner tasks and receive notifications")
+    create_token.add_argument("--tenant-id", default="default", help="Organization/tenant isolation key")
 
     evaluate = subparsers.add_parser("evaluate", help="Measure extraction accuracy on the included redacted contract set")
     evaluate.add_argument("--provider", choices=PROVIDERS, default="auto", help="Provider to evaluate, or 'all' configured providers plus rules baseline")
     evaluate.add_argument("--dataset", type=Path, default=Path("evaluation/cases"), help="Directory containing JSON evaluation cases")
     evaluate.add_argument("--output", type=Path, help="Optional path for the JSON report")
+    evaluate.add_argument("--min-exact-accuracy", type=float, help="Exit non-zero when any evaluated provider is below this exact-case accuracy")
+    evaluate.add_argument("--min-field-accuracy", type=float, help="Exit non-zero when any scored field is below this accuracy")
 
     args = parser.parse_args()
 
@@ -48,7 +51,7 @@ def main() -> int:
         return 0
 
     if args.command == "create-token":
-        token, user_entry = create_token_config(args.actor, args.role, args.email)
+        token, user_entry = create_token_config(args.actor, args.role, args.email, args.tenant_id)
         print("Bearer token (copy it now; Radar stores only its SHA-256 digest):")
         print(token)
         print("\nAdd this object to the RADAR_AUTH_USERS_JSON array:")
@@ -74,6 +77,19 @@ def main() -> int:
             report = evaluate_extractor(extractor, cases)
             report["status"] = "partial" if report["errors"] else "ok"
             failed = failed or bool(report["errors"])
+            gate_failures = []
+            if args.min_exact_accuracy is not None:
+                score = report["exact_case_match"]["accuracy"]
+                if score is None or score < args.min_exact_accuracy:
+                    gate_failures.append(f"exact_case_match={score} < {args.min_exact_accuracy}")
+            if args.min_field_accuracy is not None:
+                below = [name for name, values in report["fields"].items()
+                         if values["accuracy"] is None or values["accuracy"] < args.min_field_accuracy]
+                gate_failures.extend(f"{name} below {args.min_field_accuracy}" for name in below)
+            if gate_failures:
+                report["status"] = "gate_failed"
+                report["gate_failures"] = gate_failures
+                failed = True
         except Exception as exc:
             report = {"provider": provider, "status": "error", "error": str(exc)}
             failed = True

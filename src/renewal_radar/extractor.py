@@ -29,6 +29,7 @@ class ContractExtractionOutput(BaseModel):
     start_date: date | None
     expiration_date: date | None
     renewal_notice_days: int | None
+    notice_day_type: str
     auto_renew: bool | None
     termination_notice: str | None
     evidence: list[Evidence]
@@ -55,38 +56,40 @@ class RulesExtractor:
             evidence.append(Evidence(field="contract", quote=title_match.group(0)[:1000], confidence=0.7))
 
         date_pattern = r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{4}|[A-Z][a-z]+\s+\d{1,2},?\s+\d{4})\b"
-        date_hits: list[tuple[date, str, str]] = []
+        date_hits: list[tuple[date, str, str, int, int]] = []
         for match in re.finditer(date_pattern, text):
             parsed = _parse_date(match.group(0))
             if parsed:
-                context = text[max(0, match.start() - 100): min(len(text), match.end() + 100)]
-                date_hits.append((parsed, match.group(0), context))
+                context_start = max(0, match.start() - 100)
+                context = text[context_start: min(len(text), match.end() + 100)]
+                date_hits.append((parsed, match.group(0), context, match.start() - context_start, context_start))
 
-        for parsed, _raw, context in date_hits:
-            lower = context.lower()
-            field = None
-            if any(term in lower for term in ("effective date", "commencement", "start date", "beginning on")):
-                field = "start_date"
-            elif any(term in lower for term in ("expiration", "expires", "expiry", "end date", "initial term ends")):
-                field = "expiration_date"
+        start_terms = re.compile(r"effective date|commencement|start date|beginning on|takes effect", re.IGNORECASE)
+        end_terms = re.compile(r"expiration|expire|expiry|end date|term ends|term through", re.IGNORECASE)
+        for parsed, _raw, context, date_offset, _context_start in date_hits:
+            nearby = []
+            for pattern, field in ((start_terms, "start_date"), (end_terms, "expiration_date")):
+                nearby.extend((abs(hit.start() - date_offset), field) for hit in pattern.finditer(context))
+            field = min(nearby)[1] if nearby else None
             if field and field not in result:
                 result[field] = parsed
                 evidence.append(Evidence(field=field, quote=context.strip()[:1000], confidence=0.72))
 
         notice = re.search(
-            r"(?:at least\s+)?(\d{1,4})\s*(?:\(\s*\d+\s*\))?\s*"
+            r"(?:(?:at least|no later than|not later than)\s+)?(\d{1,4})\s*(?:\(\s*[\w-]+\s*\))?\s*"
             r"(?:calendar\s+|business\s+)?days?\s+(?:prior|before|in advance of)\s+"
-            r"(?:the\s+)?(?:expiration|expiry|end of (?:the )?term|renewal)",
+            r"(?:the\s+)?(?:expiration|expiry|end of (?:the\s+)?(?:then-current\s+)?term|renewal|end date)",
             normalized,
             re.IGNORECASE,
         ) or re.search(
-            r"(?:renewal|non-?renewal|termination) notice(?: period)?\s*(?:of|:)?\s*(\d{1,4})\s*days?",
+            r"(?:renewal|non-?renewal|termination) notice(?: period)?\s*(?:is|of|:)?\s*(\d{1,4})\s*days?",
             normalized,
             re.IGNORECASE,
         )
         if notice:
             result["renewal_notice_days"] = int(notice.group(1))
             evidence.append(Evidence(field="renewal_notice_days", quote=notice.group(0), confidence=0.78))
+            result["notice_day_type"] = "business" if re.search(r"business\s+days?", notice.group(0), re.IGNORECASE) else "calendar"
 
         negative_auto_renew = re.search(
             r"(?:will not|does not|shall not)\s+(?:automatically\s+)?renew|no automatic renewal",
@@ -98,14 +101,14 @@ class RulesExtractor:
             evidence.append(Evidence(field="auto_renew", quote=negative_auto_renew.group(0), confidence=0.8))
         else:
             positive_auto_renew = re.search(
-                r"auto(?:matically)?\s+renew|automatically\s+extend",
+                r"auto(?:matically)?\s+renew(?:s|ed)?|renew(?:s|ed)?\s+automatically|automatically\s+extend",
                 normalized,
                 re.IGNORECASE,
             )
             if positive_auto_renew:
                 result["auto_renew"] = True
                 match = re.search(
-                    r".{0,70}(?:auto(?:matically)?\s+renew|automatically\s+extend).{0,100}",
+                    r".{0,70}(?:auto(?:matically)?\s+renew(?:s|ed)?|renew(?:s|ed)?\s+automatically|automatically\s+extend).{0,100}",
                     normalized,
                     re.IGNORECASE,
                 )
@@ -132,12 +135,14 @@ class ProviderExtractor:
     model: str
     api_key: str
     name: str = ""
+    last_usage: dict[str, int] | None = None
 
     def __post_init__(self) -> None:
         self.name = self.provider
 
     def extract(self, text: str) -> ContractData:
         try:
+            self.last_usage = None
             payload = self._request(text)
             return ContractData.model_validate(payload)
         except ExtractionError:
@@ -166,6 +171,7 @@ class ProviderExtractor:
                 },
                 messages=[{"role": "system", "content": _SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
             )
+            self.last_usage = _usage_counts(getattr(response, "usage", None), "prompt_tokens", "completion_tokens")
             return _parse_json(response.choices[0].message.content or "")
 
         if self.provider == "anthropic":
@@ -184,6 +190,7 @@ class ProviderExtractor:
                 messages=[{"role": "user", "content": prompt}],
                 output_config={"format": {"type": "json_schema", "schema": schema}},
             )
+            self.last_usage = _usage_counts(getattr(response, "usage", None), "input_tokens", "output_tokens")
             content = "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
             return _parse_json(content)
 
@@ -202,6 +209,7 @@ class ProviderExtractor:
                     temperature=0,
                 ),
             )
+            self.last_usage = _usage_counts(getattr(response, "usage_metadata", None), "prompt_token_count", "candidates_token_count")
             return _parse_json(response.text or "")
 
         if self.provider == "mistral":
@@ -216,6 +224,7 @@ class ProviderExtractor:
                 max_tokens=2048,
                 temperature=0,
             )
+            self.last_usage = _usage_counts(getattr(response, "usage", None), "prompt_tokens", "completion_tokens")
             return _parse_json(response.choices[0].message.content or "")
 
         if self.provider == "cohere":
@@ -231,6 +240,9 @@ class ProviderExtractor:
                 ],
                 response_format={"type": "json_object", "schema": _contract_schema(nullable_as_any_of=True)},
             )
+            units = getattr(response, "usage", None)
+            billed = getattr(units, "billed_units", None) if units else None
+            self.last_usage = _usage_counts(billed, "input_tokens", "output_tokens")
             return _parse_json(response.message.content[0].text)
 
         raise ExtractionError(f"Unsupported LLM provider: {self.provider}")
@@ -238,6 +250,7 @@ class ProviderExtractor:
 
 _SYSTEM_PROMPT = (
     "Extract contract terms exactly as written. Return null when a value is not explicit. "
+    "For notice_day_type, return business only when the contract explicitly says business days; otherwise return calendar. "
     "Do not calculate dates or infer missing terms. For each extracted field, provide a short "
     "verbatim evidence quote from the document and a confidence from 0 to 1."
 )
@@ -260,6 +273,7 @@ def _contract_schema(*, nullable_as_any_of: bool = False) -> dict:
             "start_date": nullable("string", description="ISO date YYYY-MM-DD"),
             "expiration_date": nullable("string", description="ISO date YYYY-MM-DD"),
             "renewal_notice_days": nullable("integer"),
+            "notice_day_type": {"type": "string", "enum": ["calendar", "business"]},
             "auto_renew": nullable("boolean"),
             "termination_notice": nullable("string"),
             "evidence": {
@@ -276,7 +290,7 @@ def _contract_schema(*, nullable_as_any_of: bool = False) -> dict:
                 },
             },
         },
-        "required": ["contract", "start_date", "expiration_date", "renewal_notice_days", "auto_renew", "termination_notice", "evidence"],
+        "required": ["contract", "start_date", "expiration_date", "renewal_notice_days", "notice_day_type", "auto_renew", "termination_notice", "evidence"],
         "additionalProperties": False,
     }
 
@@ -289,6 +303,18 @@ def _parse_json(content: str) -> dict:
     if not isinstance(payload, dict):
         raise ExtractionError("The selected provider did not return a JSON object.")
     return payload
+
+
+def _usage_counts(usage, input_name: str, output_name: str) -> dict[str, int] | None:
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        input_tokens, output_tokens = usage.get(input_name), usage.get(output_name)
+    else:
+        input_tokens, output_tokens = getattr(usage, input_name, None), getattr(usage, output_name, None)
+    if not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
+        return None
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens}
 
 
 def _install_error(extra: str) -> ExtractionError:

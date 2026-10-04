@@ -6,6 +6,7 @@ import sqlite3
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .schemas import ContractData
 
@@ -44,7 +45,8 @@ class Store:
                     confirmed_json TEXT,
                     raw_text TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    confirmed_at TEXT
+                    confirmed_at TEXT,
+                    tenant_id TEXT NOT NULL DEFAULT 'default'
                 );
                 CREATE TABLE IF NOT EXISTS tasks (
                     id TEXT PRIMARY KEY,
@@ -57,7 +59,11 @@ class Store:
                     status TEXT NOT NULL DEFAULT 'open',
                     reminder_sent_at TEXT,
                     escalated_at TEXT,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    notice_day_type TEXT NOT NULL DEFAULT 'calendar',
+                    notice_timezone TEXT NOT NULL DEFAULT 'UTC',
+                    notice_holidays_json TEXT NOT NULL DEFAULT '[]',
+                    tenant_id TEXT NOT NULL DEFAULT 'default'
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,38 +71,62 @@ class Store:
                     event_type TEXT NOT NULL,
                     actor TEXT NOT NULL,
                     details_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT 'default'
+                );
+                CREATE TABLE IF NOT EXISTS calendar_events (
+                    task_id TEXT NOT NULL REFERENCES tasks(id),
+                    provider TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (task_id, provider, tenant_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_contract_status ON contracts(status);
                 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, due_date);
                 CREATE INDEX IF NOT EXISTS idx_audit_contract ON audit_events(contract_id, id);
                 """
             )
+            # Upgrade databases created by earlier versions without dropping data.
+            for table in ("contracts", "tasks", "audit_events"):
+                columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+                if "tenant_id" not in columns:
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
+                if table == "tasks" and "notice_day_type" not in columns:
+                    db.execute("ALTER TABLE tasks ADD COLUMN notice_day_type TEXT NOT NULL DEFAULT 'calendar'")
+                if table == "tasks" and "notice_timezone" not in columns:
+                    db.execute("ALTER TABLE tasks ADD COLUMN notice_timezone TEXT NOT NULL DEFAULT 'UTC'")
+                if table == "tasks" and "notice_holidays_json" not in columns:
+                    db.execute("ALTER TABLE tasks ADD COLUMN notice_holidays_json TEXT NOT NULL DEFAULT '[]'")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_contract_tenant ON contracts(tenant_id, status)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_task_tenant ON tasks(tenant_id, status, due_date)")
 
-    def save_contract(self, contract_id: str, filename: str, provider: str, data: ContractData, raw_text: str, actor: str) -> None:
+    def save_contract(self, contract_id: str, filename: str, provider: str, data: ContractData, raw_text: str, actor: str, tenant_id: str = "default") -> None:
         now = utc_now().isoformat()
         with self.connect() as db:
             db.execute(
-                "INSERT INTO contracts VALUES (?, ?, 'pending_review', ?, ?, NULL, ?, ?, NULL)",
-                (contract_id, filename, provider, data.model_dump_json(), raw_text, now),
+                "INSERT INTO contracts (id, filename, status, provider, extracted_json, confirmed_json, raw_text, created_at, confirmed_at, tenant_id) VALUES (?, ?, 'pending_review', ?, ?, NULL, ?, ?, NULL, ?)",
+                (contract_id, filename, provider, data.model_dump_json(), raw_text, now, tenant_id),
             )
-            self.add_audit(db, contract_id, "contract.ingested", actor, {"filename": filename, "provider": provider})
+            self.add_audit(db, contract_id, "contract.ingested", actor, {"filename": filename, "provider": provider}, tenant_id)
 
-    def get_contract(self, contract_id: str) -> sqlite3.Row | None:
+    def get_contract(self, contract_id: str, tenant_id: str | None = "default") -> sqlite3.Row | None:
         with self.connect() as db:
-            return db.execute("SELECT * FROM contracts WHERE id = ?", (contract_id,)).fetchone()
+            if tenant_id is None:
+                return db.execute("SELECT * FROM contracts WHERE id = ?", (contract_id,)).fetchone()
+            return db.execute("SELECT * FROM contracts WHERE id = ? AND tenant_id = ?", (contract_id, tenant_id)).fetchone()
 
-    def list_contracts(self, status: str | None = None) -> list[sqlite3.Row]:
+    def list_contracts(self, status: str | None = None, tenant_id: str = "default") -> list[sqlite3.Row]:
         with self.connect() as db:
             if status:
-                return db.execute("SELECT * FROM contracts WHERE status = ? ORDER BY created_at DESC", (status,)).fetchall()
-            return db.execute("SELECT * FROM contracts ORDER BY created_at DESC").fetchall()
+                return db.execute("SELECT * FROM contracts WHERE tenant_id=? AND status = ? ORDER BY created_at DESC", (tenant_id, status)).fetchall()
+            return db.execute("SELECT * FROM contracts WHERE tenant_id=? ORDER BY created_at DESC", (tenant_id,)).fetchall()
 
-    def confirm_contract(self, contract_id: str, data: ContractData, actor: str) -> str:
+    def confirm_contract(self, contract_id: str, data: ContractData, actor: str, tenant_id: str = "default") -> str:
         from uuid import uuid4
 
         with self.connect() as db:
-            row = db.execute("SELECT * FROM contracts WHERE id = ?", (contract_id,)).fetchone()
+            row = db.execute("SELECT * FROM contracts WHERE id = ? AND tenant_id = ?", (contract_id, tenant_id)).fetchone()
             if not row:
                 raise KeyError(contract_id)
             if row["status"] != "pending_review":
@@ -105,88 +135,162 @@ class Store:
                 raise ValueError("expiration_date is required before a contract can be activated")
             if data.auto_renew and data.renewal_notice_days is None:
                 raise ValueError("renewal_notice_days is required for an auto-renewing contract")
-            notice_days = data.renewal_notice_days or 0
-            due = date.fromordinal(data.expiration_date.toordinal() - notice_days)
+            due = calculate_notice_deadline(data.expiration_date, data.renewal_notice_days or 0, data.notice_day_type, set(data.notice_holidays))
+            try:
+                ZoneInfo(data.notice_timezone)
+            except ZoneInfoNotFoundError as exc:
+                raise ValueError(f"Unknown IANA timezone: {data.notice_timezone}") from exc
+            superseded = None
+            if data.supersedes_contract_id:
+                superseded = db.execute(
+                    "SELECT * FROM contracts WHERE id=? AND tenant_id=? AND status='active'",
+                    (data.supersedes_contract_id, tenant_id),
+                ).fetchone()
+                if not superseded:
+                    raise ValueError("supersedes_contract_id must reference an active contract in this organization")
             task_id = str(uuid4())
             now = utc_now().isoformat()
+            if superseded:
+                db.execute("UPDATE contracts SET status='superseded' WHERE id=?", (superseded["id"],))
+                db.execute("UPDATE tasks SET status='resolved' WHERE contract_id=? AND status='open'", (superseded["id"],))
+                self.add_audit(db, superseded["id"], "contract.superseded", actor, {"replacement_contract_id": contract_id}, tenant_id)
             db.execute(
                 "UPDATE contracts SET status='active', confirmed_json=?, confirmed_at=? WHERE id=?",
                 (data.model_dump_json(), now, contract_id),
             )
             db.execute(
-                "INSERT INTO tasks (id, contract_id, title, owner_name, owner_email, due_date, expiration_date, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)",
-                (task_id, contract_id, f"Review renewal: {data.contract or row['filename']}", data.owner_name, data.owner_email, due.isoformat(), data.expiration_date.isoformat(), now),
+                "INSERT INTO tasks (id, contract_id, title, owner_name, owner_email, due_date, expiration_date, status, created_at, tenant_id, notice_day_type, notice_timezone, notice_holidays_json) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
+                (task_id, contract_id, f"Review renewal: {data.contract or row['filename']}", data.owner_name, data.owner_email, due.isoformat(), data.expiration_date.isoformat(), now, tenant_id, data.notice_day_type, data.notice_timezone, json.dumps([d.isoformat() for d in data.notice_holidays])),
             )
-            self.add_audit(db, contract_id, "contract.confirmed", actor, {"contract": data.model_dump(mode="json"), "task_id": task_id})
-            self.add_audit(db, contract_id, "task.created", "system", {"task_id": task_id, "due_date": due.isoformat()})
+            self.add_audit(db, contract_id, "contract.confirmed", actor, {"contract": data.model_dump(mode="json"), "task_id": task_id}, tenant_id)
+            self.add_audit(db, contract_id, "task.created", "system", {"task_id": task_id, "due_date": due.isoformat(), "notice_day_type": data.notice_day_type, "notice_timezone": data.notice_timezone}, tenant_id)
             return task_id
 
-    def reject_contract(self, contract_id: str, actor: str) -> None:
+    def reject_contract(self, contract_id: str, actor: str, tenant_id: str = "default") -> None:
         with self.connect() as db:
-            row = db.execute("SELECT status FROM contracts WHERE id=?", (contract_id,)).fetchone()
+            row = db.execute("SELECT status FROM contracts WHERE id=? AND tenant_id=?", (contract_id, tenant_id)).fetchone()
             if not row:
                 raise KeyError(contract_id)
             if row["status"] != "pending_review":
                 raise ValueError("Only contracts pending review can be rejected")
             db.execute("UPDATE contracts SET status='rejected' WHERE id=?", (contract_id,))
-            self.add_audit(db, contract_id, "contract.rejected", actor, {})
+            self.add_audit(db, contract_id, "contract.rejected", actor, {}, tenant_id)
 
     @staticmethod
-    def add_audit(db: sqlite3.Connection, contract_id: str, event_type: str, actor: str, details: dict[str, Any]) -> None:
+    def add_audit(db: sqlite3.Connection, contract_id: str, event_type: str, actor: str, details: dict[str, Any], tenant_id: str = "default") -> None:
         db.execute(
-            "INSERT INTO audit_events (contract_id, event_type, actor, details_json, created_at) VALUES (?, ?, ?, ?, ?)",
-            (contract_id, event_type, actor, json.dumps(details, default=str), utc_now().isoformat()),
+            "INSERT INTO audit_events (contract_id, event_type, actor, details_json, created_at, tenant_id) VALUES (?, ?, ?, ?, ?, ?)",
+            (contract_id, event_type, actor, json.dumps(details, default=str), utc_now().isoformat(), tenant_id),
         )
 
-    def audit(self, contract_id: str) -> list[sqlite3.Row]:
+    def audit(self, contract_id: str, tenant_id: str = "default") -> list[sqlite3.Row]:
         with self.connect() as db:
-            return db.execute("SELECT * FROM audit_events WHERE contract_id=? ORDER BY id", (contract_id,)).fetchall()
+            return db.execute("SELECT * FROM audit_events WHERE contract_id=? AND tenant_id=? ORDER BY id", (contract_id, tenant_id)).fetchall()
 
-    def list_tasks(self, status: str | None = None, owner_email: str | None = None) -> list[sqlite3.Row]:
+    def list_tasks(self, status: str | None = None, owner_email: str | None = None, tenant_id: str = "default") -> list[sqlite3.Row]:
         with self.connect() as db:
             if owner_email is not None and status:
                 return db.execute(
-                    "SELECT * FROM tasks WHERE status=? AND lower(owner_email)=lower(?) ORDER BY due_date",
-                    (status, owner_email),
+                    "SELECT * FROM tasks WHERE tenant_id=? AND status=? AND lower(owner_email)=lower(?) ORDER BY due_date",
+                    (tenant_id, status, owner_email),
                 ).fetchall()
             if owner_email is not None:
                 return db.execute(
-                    "SELECT * FROM tasks WHERE lower(owner_email)=lower(?) ORDER BY due_date",
-                    (owner_email,),
+                    "SELECT * FROM tasks WHERE tenant_id=? AND lower(owner_email)=lower(?) ORDER BY due_date",
+                    (tenant_id, owner_email),
                 ).fetchall()
             if status:
-                return db.execute("SELECT * FROM tasks WHERE status=? ORDER BY due_date", (status,)).fetchall()
-            return db.execute("SELECT * FROM tasks ORDER BY due_date").fetchall()
+                return db.execute("SELECT * FROM tasks WHERE tenant_id=? AND status=? ORDER BY due_date", (tenant_id, status)).fetchall()
+            return db.execute("SELECT * FROM tasks WHERE tenant_id=? ORDER BY due_date", (tenant_id,)).fetchall()
 
-    def get_task(self, task_id: str) -> sqlite3.Row | None:
+    def get_task(self, task_id: str, tenant_id: str = "default") -> sqlite3.Row | None:
         with self.connect() as db:
-            return db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            return db.execute("SELECT * FROM tasks WHERE id=? AND tenant_id=?", (task_id, tenant_id)).fetchone()
 
-    def due_tasks(self, today: date) -> list[sqlite3.Row]:
+    def due_tasks(self, today: date | None = None, tenant_id: str | None = None) -> list[sqlite3.Row]:
         with self.connect() as db:
-            return db.execute("SELECT * FROM tasks WHERE status='open' AND due_date<=? ORDER BY due_date", (today.isoformat(),)).fetchall()
+            if today is None and tenant_id is None:
+                return db.execute("SELECT * FROM tasks WHERE status='open' ORDER BY due_date").fetchall()
+            if today is not None and tenant_id is None:
+                return db.execute("SELECT * FROM tasks WHERE status='open' AND due_date<=? ORDER BY due_date", (today.isoformat(),)).fetchall()
+            if today is None:
+                return db.execute("SELECT * FROM tasks WHERE tenant_id=? AND status='open' ORDER BY due_date", (tenant_id,)).fetchall()
+            return db.execute("SELECT * FROM tasks WHERE tenant_id=? AND status='open' AND due_date<=? ORDER BY due_date", (tenant_id, today.isoformat())).fetchall()
 
     def mark_notified(self, task_id: str, escalation: bool, channel: str) -> None:
         stamp = utc_now().isoformat()
         field = "escalated_at" if escalation else "reminder_sent_at"
         with self.connect() as db:
-            task = db.execute("SELECT contract_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+            task = db.execute("SELECT contract_id, tenant_id FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
                 return
             db.execute(f"UPDATE tasks SET {field}=? WHERE id=?", (stamp, task_id))
-            self.add_audit(db, task["contract_id"], "task.escalated" if escalation else "task.reminder_sent", "system", {"task_id": task_id, "channel": channel})
+            self.add_audit(db, task["contract_id"], "task.escalated" if escalation else "task.reminder_sent", "system", {"task_id": task_id, "channel": channel}, task["tenant_id"])
 
-    def open_for_escalation(self, cutoff: date) -> list[sqlite3.Row]:
+    def open_for_escalation(self, cutoff: date | None) -> list[sqlite3.Row]:
         with self.connect() as db:
+            if cutoff is None:
+                return db.execute("SELECT * FROM tasks WHERE status='open' AND reminder_sent_at IS NOT NULL AND escalated_at IS NULL").fetchall()
             return db.execute("SELECT * FROM tasks WHERE status='open' AND reminder_sent_at IS NOT NULL AND escalated_at IS NULL AND date(reminder_sent_at) <= ?", (cutoff.isoformat(),)).fetchall()
 
-    def resolve_task(self, task_id: str, actor: str, comment: str | None) -> sqlite3.Row | None:
+    def resolve_task(self, task_id: str, actor: str, comment: str | None, tenant_id: str = "default") -> sqlite3.Row | None:
         with self.connect() as db:
-            row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            row = db.execute("SELECT * FROM tasks WHERE id=? AND tenant_id=?", (task_id, tenant_id)).fetchone()
             if not row:
                 return None
             if row["status"] != "open":
                 raise ValueError("Task is already resolved")
             db.execute("UPDATE tasks SET status='resolved' WHERE id=?", (task_id,))
-            self.add_audit(db, row["contract_id"], "task.resolved", actor, {"task_id": task_id, "comment": comment})
+            self.add_audit(db, row["contract_id"], "task.resolved", actor, {"task_id": task_id, "comment": comment}, tenant_id)
             return row
+
+    def get_calendar_event(self, task_id: str, provider: str, tenant_id: str) -> sqlite3.Row | None:
+        with self.connect() as db:
+            return db.execute(
+                "SELECT * FROM calendar_events WHERE task_id=? AND provider=? AND tenant_id=?",
+                (task_id, provider, tenant_id),
+            ).fetchone()
+
+    def save_calendar_event(self, task_id: str, provider: str, event_id: str, tenant_id: str) -> None:
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO calendar_events (task_id, provider, event_id, tenant_id, updated_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(task_id, provider, tenant_id) DO UPDATE SET event_id=excluded.event_id, updated_at=excluded.updated_at",
+                (task_id, provider, event_id, tenant_id, utc_now().isoformat()),
+            )
+            task = db.execute("SELECT contract_id FROM tasks WHERE id=? AND tenant_id=?", (task_id, tenant_id)).fetchone()
+            if task:
+                self.add_audit(db, task["contract_id"], "calendar.event_synced", "system", {"task_id": task_id, "provider": provider, "event_id": event_id}, tenant_id)
+
+    def list_calendar_events(self, provider: str, tenant_id: str) -> list[sqlite3.Row]:
+        with self.connect() as db:
+            return db.execute(
+                "SELECT * FROM calendar_events WHERE provider=? AND tenant_id=?",
+                (provider, tenant_id),
+            ).fetchall()
+
+    def delete_calendar_event(self, task_id: str, provider: str, tenant_id: str) -> None:
+        with self.connect() as db:
+            task = db.execute("SELECT contract_id FROM tasks WHERE id=? AND tenant_id=?", (task_id, tenant_id)).fetchone()
+            db.execute(
+                "DELETE FROM calendar_events WHERE task_id=? AND provider=? AND tenant_id=?",
+                (task_id, provider, tenant_id),
+            )
+            if task:
+                self.add_audit(db, task["contract_id"], "calendar.event_removed", "system", {"task_id": task_id, "provider": provider}, tenant_id)
+
+
+def calculate_notice_deadline(expiration: date, notice_days: int, day_type: str, holidays: set[date] | None = None) -> date:
+    """Calculate the action deadline using the explicit contract counting convention."""
+    if day_type == "calendar":
+        return date.fromordinal(expiration.toordinal() - notice_days)
+    if day_type != "business":
+        raise ValueError("notice_day_type must be 'calendar' or 'business'")
+    current = expiration
+    holidays = holidays or set()
+    remaining = notice_days
+    while remaining:
+        current = date.fromordinal(current.toordinal() - 1)
+        if current.weekday() < 5 and current not in holidays:
+            remaining -= 1
+    return current

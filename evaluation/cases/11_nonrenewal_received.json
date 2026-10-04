@@ -1,0 +1,11 @@
+{
+  "id": "received-notice-condition",
+  "contract_text": "[CUSTOMER] Data Services Agreement. Effective Date: August 1, 2025. Expiration Date: July 31, 2026. The Agreement will automatically renew for successive one-year terms unless a written non-renewal notice is received by the other party no later than 45 days before expiration.",
+  "expected": {
+    "start_date": "2025-08-01",
+    "expiration_date": "2026-07-31",
+    "renewal_notice_days": 45,
+    "notice_day_type": "calendar",
+    "auto_renew": true
+  }
+}

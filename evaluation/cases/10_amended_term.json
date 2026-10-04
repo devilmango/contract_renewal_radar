@@ -1,0 +1,11 @@
+{
+  "id": "amendment-replaces-expiration",
+  "contract_text": "[VENDOR] Hosting Agreement Amendment No. 1. Effective Date: July 1, 2025. This amendment extends the agreement term through June 30, 2027. The agreement will automatically renew for one additional year unless either party gives notice at least 90 days prior to expiration.",
+  "expected": {
+    "start_date": "2025-07-01",
+    "expiration_date": "2027-06-30",
+    "renewal_notice_days": 90,
+    "notice_day_type": "calendar",
+    "auto_renew": true
+  }
+}

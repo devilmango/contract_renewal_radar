@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +15,7 @@ SCORED_FIELDS = (
     "start_date",
     "expiration_date",
     "renewal_notice_days",
+    "notice_day_type",
     "auto_renew",
     "termination_notice",
 )
@@ -41,20 +45,30 @@ def evaluate_extractor(extractor, cases: list[dict[str, Any]]) -> dict[str, Any]
     }
     case_count = exact_cases = 0
     evidence_total = evidence_grounded = 0
+    elapsed_seconds = 0.0
+    input_tokens = output_tokens = usage_cases = 0
     errors: list[dict[str, str]] = []
     case_results = []
 
     for case in cases:
         case_count += 1
+        started = time.perf_counter()
         try:
             extracted = extractor.extract(case["contract_text"])
         except Exception as exc:
+            elapsed_seconds += time.perf_counter() - started
             errors.append({"case": case["id"], "error": str(exc)})
             case_results.append({"case": case["id"], "exact_match": False, "error": str(exc)})
             for field in case["expected"]:
                 field_counts[field]["total"] += 1
                 field_counts[field]["missing"] += 1
             continue
+        elapsed_seconds += time.perf_counter() - started
+        usage = getattr(extractor, "last_usage", None)
+        if usage:
+            input_tokens += usage["input_tokens"]
+            output_tokens += usage["output_tokens"]
+            usage_cases += 1
 
         case_correct = True
         field_results = {}
@@ -89,19 +103,24 @@ def evaluate_extractor(extractor, cases: list[dict[str, Any]]) -> dict[str, Any]
             if grounded:
                 evidence_grounded += 1
             evidence_results.append({"field": evidence.field, "quote": evidence.quote, "grounded": grounded})
-        case_results.append({
+        case_result = {
             "case": case["id"],
             "exact_match": case_correct,
             "fields": field_results,
             "evidence": evidence_results,
-        })
+        }
+        if usage:
+            case_result["token_usage"] = usage
+        case_results.append(case_result)
 
     for counts in field_counts.values():
         counts["accuracy"] = _ratio(counts["correct"], counts["total"])
 
-    return {
+    report = {
         "provider": extractor.name,
         "model": getattr(extractor, "model", None),
+        "elapsed_seconds": round(elapsed_seconds, 4),
+        "average_case_seconds": round(elapsed_seconds / case_count, 4) if case_count else None,
         "dataset_cases": len(cases),
         "cases_scored": case_count,
         "exact_case_match": {"correct": exact_cases, "total": case_count, "accuracy": _ratio(exact_cases, case_count)},
@@ -114,6 +133,28 @@ def evaluate_extractor(extractor, cases: list[dict[str, Any]]) -> dict[str, Any]
         "case_results": case_results,
         "errors": errors,
     }
+    if usage_cases:
+        report["token_usage"] = {
+            "cases_with_usage": usage_cases,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+        input_rate = os.getenv("EVAL_INPUT_USD_PER_MILLION_TOKENS")
+        output_rate = os.getenv("EVAL_OUTPUT_USD_PER_MILLION_TOKENS")
+        if input_rate is not None and output_rate is not None:
+            try:
+                input_rate_value = float(input_rate)
+                output_rate_value = float(output_rate)
+                if not all(math.isfinite(rate) and rate >= 0 for rate in (input_rate_value, output_rate_value)):
+                    raise ValueError("Rates must be finite, non-negative numbers")
+                report["estimated_cost_usd"] = round(
+                    input_tokens * input_rate_value / 1_000_000
+                    + output_tokens * output_rate_value / 1_000_000,
+                    6,
+                )
+            except ValueError:
+                report["estimated_cost_usd"] = None
+    return report
 
 
 def _normalize(value: Any) -> str:

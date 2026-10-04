@@ -1,0 +1,19 @@
+name: Extraction evaluation
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  rules-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -e .
+      - name: Evaluate redacted fixtures with deterministic baseline
+        run: renewal-radar evaluate --provider rules --min-exact-accuracy 0.70 --min-field-accuracy 0.70

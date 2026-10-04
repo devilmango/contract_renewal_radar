@@ -1,0 +1,12 @@
+{
+  "id": "license-calendar-day-count",
+  "contract_text": "[PROVIDER] Software License Agreement. Start Date: April 15, 2025. Expiration Date: April 14, 2027. This license will automatically renew unless [CUSTOMER] gives notice of non-renewal at least 60 calendar days prior to expiration. Termination notice period: 30 days.",
+  "expected": {
+    "start_date": "2025-04-15",
+    "expiration_date": "2027-04-14",
+    "renewal_notice_days": 60,
+    "notice_day_type": "calendar",
+    "auto_renew": true,
+    "termination_notice": "30 days"
+  }
+}

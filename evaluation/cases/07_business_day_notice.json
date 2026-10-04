@@ -1,0 +1,11 @@
+{
+  "id": "implementation-business-day-count",
+  "contract_text": "[CUSTOMER] Implementation Services Agreement. Effective Date: March 1, 2025. Expiration Date: February 28, 2026. The agreement will automatically renew for one-year periods unless a party gives written non-renewal notice at least 15 business days before expiration.",
+  "expected": {
+    "start_date": "2025-03-01",
+    "expiration_date": "2026-02-28",
+    "renewal_notice_days": 15,
+    "notice_day_type": "business",
+    "auto_renew": true
+  }
+}

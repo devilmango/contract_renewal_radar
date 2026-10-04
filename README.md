@@ -34,9 +34,14 @@ An extraction is always a proposal. The service does not activate a contract or 
 - **Evidence-backed proposals:** Return extracted fields with supporting text and confidence values for reviewer context.
 - **Deterministic validation:** Validate date order, data types, notice-period ranges, and required terms before a contract can be activated.
 - **Human review:** Correct extracted fields, assign an owner, then confirm or reject each proposal.
-- **Renewal tasks:** Calculate the action date as `expiration_date - renewal_notice_days` and associate the task with its owner.
+- **Reviewer workspace:** Open `/review` for a side-by-side proposal, evidence quotes, extracted source text, editable terms, and confirmation or rejection actions.
+- **Renewal tasks:** Calculate the action date using calendar or business days, an IANA time zone, and reviewer-specified holiday dates.
+- **Amendment handling:** A confirmed amendment can supersede an active agreement and close its outstanding tasks with an audit record.
 - **Reminder and escalation runner:** Send one reminder when the task is due and one escalation if it remains open after the configured delay.
 - **Calendar export:** Download open tasks in iCalendar format.
+- **Live calendar sync:** Upsert renewal events in Microsoft 365 or Google Calendar and remove events for resolved tasks.
+- **Organization isolation:** Contract, task, source text, audit, and calendar records are scoped by tenant ID.
+- **OIDC token validation:** Verify signed RS256 or ES256 JWT access tokens against configured issuer, audience, and JWKS settings.
 - **Audit trail:** Record ingestion, confirmation, rejection, task creation, notifications, escalation, and resolution.
 - **Self-hosted storage:** Persist records in SQLite; run directly with Python or with Docker Compose.
 
@@ -178,7 +183,7 @@ curl -X POST http://127.0.0.1:8000/contracts/CONTRACT_ID/confirm \
   }'
 ```
 
-Confirmation creates one open task due on October 3, 2027. An expiration date is required. If `auto_renew` is true, the confirmation must also include a renewal notice period. The authenticated actor is written to the audit trail. To reject an unconfirmed proposal, call `POST /contracts/CONTRACT_ID/reject` with the same bearer header.
+Confirmation creates one open task due on October 3, 2027 for this 90 calendar-day example. For business-day clauses, set `notice_day_type` to `business`; weekends and explicitly supplied `notice_holidays` are skipped. Set `notice_timezone` to an IANA zone such as `America/New_York` so reminder eligibility and escalation use the contract's local date. An expiration date is required. If `auto_renew` is true, the confirmation must also include a renewal notice period. The authenticated actor is written to the audit trail. To reject an unconfirmed proposal, call `POST /contracts/CONTRACT_ID/reject` with the same bearer header.
 
 ### 4. Send due reminders
 
@@ -221,20 +226,24 @@ curl -H "Authorization: Bearer $RADAR_TOKEN" -o renewals.ics http://127.0.0.1:80
 curl -H "Authorization: Bearer $RADAR_TOKEN" http://127.0.0.1:8000/contracts/CONTRACT_ID/audit
 ```
 
+Open [the reviewer workspace](http://127.0.0.1:8000/review) in a browser, sign in with OIDC or paste a reviewer bearer token, and review the proposal beside its extracted contract text. OIDC uses a short-lived HttpOnly cookie; a manually entered token stays in tab session storage.
+
+To synchronize open tasks into a configured live calendar, call `POST /calendar/sync` with a reviewer or admin token.
+
 ## Authentication and roles
 
-The health endpoint and generated API documentation remain public. Contract, task, calendar, audit, and reminder operations require an `Authorization: Bearer <token>` header. Unknown tokens receive `401`; a valid token without the required role receives `403`. If no users are configured, protected endpoints fail closed with `503`.
+The health endpoint and generated API documentation remain public. Contract, task, calendar, audit, and reminder operations require an authorized bearer token or OIDC session. Unknown credentials receive `401`; a valid identity without the required role receives `403`. If neither static tokens nor OIDC are configured, protected endpoints fail closed with `503`.
 
 Generate a high-entropy bearer token and a corresponding SHA-256 configuration entry:
 
 ```bash
-renewal-radar create-token --actor contract-admin --role admin --email admin@example.com
+renewal-radar create-token --actor contract-admin --role admin --email admin@example.com --tenant-id acme
 ```
 
 The command prints the bearer token once and a JSON entry to add to `RADAR_AUTH_USERS_JSON`. Store the bearer token with the client or secret manager; configure only its digest in the service environment. Add multiple JSON entries to the array to provision multiple users. Example shape (replace the digest with the generated value):
 
 ```dotenv
-RADAR_AUTH_USERS_JSON='[{"actor":"contract-admin","token_sha256":"<64-character-sha256>","roles":["admin"],"email":"admin@example.com"}]'
+RADAR_AUTH_USERS_JSON='[{"actor":"contract-admin","token_sha256":"<64-character-sha256>","roles":["admin"],"email":"admin@example.com","tenant_id":"acme"}]'
 ```
 
 | Role | Permissions |
@@ -246,11 +255,21 @@ RADAR_AUTH_USERS_JSON='[{"actor":"contract-admin","token_sha256":"<64-character-
 
 The authenticated actor name, rather than a caller-supplied `X-Actor` or request-body field, is recorded in the audit history. Tokens are compared by digest and are not stored in SQLite. Rotate a token by generating a replacement, removing the old digest from `RADAR_AUTH_USERS_JSON`, and reloading the service.
 
-The built-in role configuration is intentionally small. An `owner` entry must include the same email address assigned to that owner's tasks. Deploy behind TLS, protect environment variables, and use short-lived upstream credentials or an OIDC-aware gateway if your organization requires SSO, centralized revocation, or fine-grained identity lifecycle management.
+The built-in role configuration is intentionally small. An `owner` entry must include the same email address assigned to that owner's tasks. Each static token can set `tenant_id` (default `default`); principals only see data in their tenant. Provision a distinct ID for each organization.
+
+For OIDC single sign-on, configure the issuer, JWKS URL, audience, authorization and token endpoints, client ID and secret, and an exact callback URI of `/auth/oidc/callback`. The login uses authorization code flow with state and nonce checks; the ID token is signature-validated and held in a short-lived, HttpOnly session cookie. Radar reads roles from `OIDC_ROLES_CLAIM` (default `roles`) and tenant from `OIDC_TENANT_CLAIM` (default `tenant_id`). The ID token must contain those claims and use `OIDC_AUDIENCE`. Configure the same callback URI in the IdP. `RADAR_COOKIE_SECURE=true` is correct behind HTTPS; set it to `false` only for local HTTP development. Deploy behind TLS and protect client credentials.
+
+Reviewer permissions include source-text access so the reviewer can verify extraction evidence. Keep reviewer tokens scoped and assign role and tenant claims intentionally.
+
+### Live calendar synchronization
+
+Set `CALENDAR_PROVIDER=microsoft` or `google`. Microsoft accepts a short-lived `MS_GRAPH_ACCESS_TOKEN` or client credentials (`MS_GRAPH_TENANT_ID`, `MS_GRAPH_CLIENT_ID`, `MS_GRAPH_CLIENT_SECRET`), plus `MS_GRAPH_USER_ID` and `MS_GRAPH_CALENDAR_ID`. Google uses `GOOGLE_CALENDAR_ACCESS_TOKEN` and `GOOGLE_CALENDAR_ID`; provide a current access token through a secret manager or token broker. Limit provider permissions to the intended calendar.
+
+Call `POST /calendar/sync` after configuration. Sync creates or updates open task events and removes events when tasks are resolved or superseded. Event IDs are retained in SQLite and synchronization actions are recorded in the contract audit trail. ICS export remains available for clients that do not need live updates.
 
 ## Extraction evaluation
 
-The `evaluation/cases/` directory contains fictional, redacted contract excerpts and expected fields for six cases. The evaluation CLI reports exact-match accuracy for start date, expiration date, renewal notice days, auto-renewal status, and termination notice, plus whether extracted evidence quotes occur in the source excerpt.
+The `evaluation/cases/` directory contains fictional, redacted excerpts for twelve cases, including amendments, ambiguous extensions, and calendar versus business-day notice terms. The evaluation CLI reports exact-match field and case accuracy, evidence grounding, latency, provider-reported token usage, and an optional cost estimate using configured per-token rates.
 
 Run the rules baseline locally:
 
@@ -270,6 +289,8 @@ Compare the rules baseline with every provider API key configured in the environ
 renewal-radar evaluate --provider all --output evaluation/reports/all-providers.json
 ```
 
+Use `--min-exact-accuracy` and `--min-field-accuracy` to make quality thresholds fail the command. GitHub Actions runs the rules baseline with a 0.70 threshold for pull requests and pushes to `main` or `master`.
+
 `all` always includes the rules baseline, then includes configured LLM providers in provider-selection order. Each provider receives the same fixture texts. LLM evaluations make external API requests and may incur provider charges. This small fixture set is a regression signal, not a statistically representative measure of legal extraction quality; review the cases and add organization-approved, de-identified examples before using scores to select a provider.
 
 See [evaluation/README.md](evaluation/README.md) for scoring details and fixture conventions.
@@ -280,8 +301,9 @@ See [evaluation/README.md](evaluation/README.md) for scoring details and fixture
 | --- | --- | --- |
 | `GET` | `/health` | Public health check |
 | `POST` | `/contracts` | `reviewer` or `admin`: upload and extract a PDF |
-| `GET` | `/contracts?status=pending_review\|active\|rejected` | `reviewer` or `admin`: list contracts |
+| `GET` | `/contracts?status=pending_review\|active\|rejected\|superseded` | `reviewer` or `admin`: list contracts |
 | `GET` | `/contracts/{contract_id}` | `reviewer` or `admin`: view proposal and confirmed terms |
+| `GET` | `/contracts/{contract_id}/source` | `reviewer` or `admin`: view extracted contract text |
 | `POST` | `/contracts/{contract_id}/confirm` | `reviewer` or `admin`: confirm terms and create a task |
 | `POST` | `/contracts/{contract_id}/reject` | `reviewer` or `admin`: reject a pending proposal |
 | `GET` | `/contracts/{contract_id}/audit` | `reviewer` or `admin`: read contract event history |
@@ -289,6 +311,8 @@ See [evaluation/README.md](evaluation/README.md) for scoring details and fixture
 | `POST` | `/tasks/{task_id}/resolve` | `reviewer` or `admin`: resolve any task; `owner`: resolve assigned tasks |
 | `POST` | `/reminders/run` | `scheduler` or `admin`: send due reminders and escalations |
 | `GET` | `/calendar.ics` | `reviewer` or `admin`: export all tasks; `owner`: export assigned tasks |
+| `POST` | `/calendar/sync` | `reviewer` or `admin`: sync open tasks to configured Microsoft or Google calendar |
+| `GET` | `/review` | Public UI shell; API calls require a reviewer token |
 
 OpenAPI and interactive request examples are available at `/docs` while the service is running.
 
@@ -298,6 +322,15 @@ OpenAPI and interactive request examples are available at `/docs` while the serv
 | --- | --- | --- |
 | `DATABASE_PATH` | `renewal_radar.db` | SQLite database location |
 | `RADAR_AUTH_USERS_JSON` | `[]` | Array of actor, token SHA-256 digest, role list, and optional email records |
+| `OIDC_JWKS_URL` | unset | Enables verification of upstream RS256/ES256 JWT access tokens |
+| `OIDC_ISSUER` / `OIDC_AUDIENCE` | unset | Required OIDC token issuer and API audience |
+| `OIDC_AUTHORIZATION_ENDPOINT` / `OIDC_TOKEN_ENDPOINT` | unset | OIDC authorization-code endpoints |
+| `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | unset | OIDC confidential client credentials |
+| `OIDC_REDIRECT_URI` | local callback example | Exact redirect URI registered at the IdP |
+| `OIDC_SCOPES` | `openid profile email` | Requested OIDC scopes |
+| `OIDC_ROLES_CLAIM` | `roles` | JWT claim containing Radar role names |
+| `OIDC_TENANT_CLAIM` | `tenant_id` | JWT claim used to scope organization data |
+| `RADAR_COOKIE_SECURE` | `true` | Mark the OIDC session cookie Secure; disable only for local HTTP |
 | `LLM_PROVIDER` | `auto` | Provider selection: `auto`, `rules`, `openai`, `anthropic`, `google`, `mistral`, `cohere`, or `xai` |
 | `LLM_MODEL` | provider default | Optional model override for the selected provider |
 | `OPENAI_API_KEY` | unset | OpenAI API key |
@@ -320,6 +353,9 @@ OpenAPI and interactive request examples are available at `/docs` while the serv
 | `SMTP_STARTTLS` | `true` | Start TLS before SMTP login and send |
 | `ESCALATION_EMAIL` | task owner | Optional escalation recipient |
 | `ESCALATION_AFTER_DAYS` | `7` | Days after the initial reminder before escalation |
+| `CALENDAR_PROVIDER` | unset | Optional live event sync target: `microsoft` or `google` |
+| `MS_GRAPH_*` | unset | Microsoft Graph access token or app credentials, user ID, and calendar ID |
+| `GOOGLE_CALENDAR_ACCESS_TOKEN` / `GOOGLE_CALENDAR_ID` | unset | Google Calendar access token and target calendar ID |
 
 Copy [.env.example](.env.example) to `.env` to start configuring local integrations. Do not commit real credentials.
 
@@ -335,12 +371,14 @@ contract_renewal_radar/
 │   ├── auth.py                # Bearer-token authentication and role scopes
 │   ├── api.py                 # FastAPI routes and request handling
 │   ├── calendar.py            # iCalendar export
+│   ├── calendar_sync.py       # Microsoft Graph and Google Calendar upserts
 │   ├── documents.py           # PDF text extraction and OCR
 │   ├── extractor.py            # Rules and optional LLM extraction
 │   ├── notifications.py       # SMTP and log notification delivery
 │   ├── reminders.py           # Reminder and escalation runner
 │   ├── schemas.py              # Typed request, response, and evidence models
-│   └── store.py                # SQLite persistence and audit events
+│   └── store.py                # Tenant-scoped SQLite persistence and audit events
+├── .github/workflows/         # Deterministic extraction quality gate
 ├── Dockerfile
 ├── docker-compose.yml
 ├── LICENSE
@@ -354,7 +392,10 @@ contract_renewal_radar/
 - The LLM path can misread contract language. Evidence quotes are provided to help the reviewer check each proposal against the source.
 - Human confirmation is a required workflow boundary, not an optional quality check.
 - SQLite is intended for a single service instance. Use a managed database and durable job queue before scaling horizontally.
-- Built-in bearer-token roles protect API operations, but the MVP does not implement SSO/OIDC, multi-tenant isolation, centralized credential lifecycle management, document retention policies, or legal advice. Put it behind TLS and follow your organization's contract-data policies before exposing it to a wider network.
+- OIDC login uses a short-lived ID-token session and does not refresh expired sessions or provision users. Configure role and tenant claims at the identity provider; users sign in again after token expiration.
+- Business-day counting skips weekends and reviewer-entered holidays. Holiday calendars vary by contract and jurisdiction; reviewers must enter applicable dates before confirming a business-day clause.
+- Calendar access tokens need rotation. Use a secret manager or token broker and least-privilege permissions for the target calendar.
+- Tenant isolation is enforced by application queries in SQLite. For regulated multi-customer deployments, review the hosting boundary and consider separate databases per organization.
 - When an external LLM provider is enabled, extracted contract text is sent to that provider's API. Review its data handling, retention, and contractual terms before processing confidential agreements.
 - The reminder runner sends the first notification on or after the calculated task date. Run it on a reliable schedule to avoid missed notifications.
 
