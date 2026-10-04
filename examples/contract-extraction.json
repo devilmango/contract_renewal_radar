@@ -1,0 +1,10 @@
+{
+  "contract": "AWS Enterprise Agreement",
+  "start_date": "2026-01-01",
+  "expiration_date": "2028-01-01",
+  "renewal_notice_days": 90,
+  "auto_renew": true,
+  "termination_notice": "90 days",
+  "owner_name": "Jane Legal",
+  "owner_email": "jane@example.com"
+}
