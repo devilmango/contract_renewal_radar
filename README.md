@@ -43,6 +43,9 @@ An extraction is always a proposal. The service does not activate a contract or 
 - **Cloud document intake:** Poll Google Drive and Microsoft Graph drive delta feeds for new or revised PDFs, with revision deduplication and source links.
 - **Renewal workflow:** Move tasks through review, change requests, approval, notice work, renewal, termination, and cancellation with permission checks and audit history.
 - **Notice preparation and delivery evidence:** Draft notice content, require reviewer approval, record dispatch details, and attach delivery confirmation evidence.
+- **Durable background jobs:** Persist reminder, calendar-sync, and retention work with deduplication keys, worker leases, bounded retries, and dead-letter recovery.
+- **Contract-data governance:** Enforce an LLM provider allowlist, record authenticated access history, support legal holds, and redact eligible contract records on demand or by retention policy.
+- **Evidence-quality evaluation:** Measure whether field values are supported by their evidence, track synthetic and OCR fixture results separately, and gate evidence quality in CI.
 - **Organization isolation:** Contract, task, source text, audit, and calendar records are scoped by tenant ID.
 - **OIDC token validation:** Verify signed RS256 or ES256 JWT access tokens against configured issuer, audience, and JWKS settings.
 - **Audit trail:** Record ingestion, confirmation, rejection, task creation, notifications, escalation, and resolution.
@@ -196,7 +199,9 @@ Schedule the runner daily with cron, a systemd timer, or your job scheduler:
 renewal-radar run-reminders
 ```
 
-The runner only processes confirmed contracts. It is safe to run repeatedly: it records each sent reminder and escalation to avoid resending them. With SMTP unset, it writes a notification to standard output and records the event in the audit trail.
+The command queues a durable, tenant-scoped reminder job and processes one job immediately. It is safe to repeat during the same day: the queue uses an idempotency key, and the task records reminder and escalation completion. With SMTP unset, it writes a notification to standard output and records the event in the audit trail.
+
+For a separate worker process, run `renewal-radar process-jobs --loop --limit 20` under your process supervisor. Queued work survives process restarts; expired worker leases can be reclaimed, transient errors retry with backoff, and jobs that exhaust `JOB_MAX_ATTEMPTS` move to `dead`. Inspect them with `GET /jobs`, and an administrator can requeue a dead job with `POST /jobs/{job_id}/retry`. Reminder and calendar API requests now return `202 Accepted` with a job record; run a worker to execute them. Stable calendar event identifiers and notification message IDs reduce duplicate side effects when a worker retries after a process interruption.
 
 Optional email configuration:
 
@@ -213,7 +218,7 @@ ESCALATION_AFTER_DAYS=7
 
 `ESCALATION_EMAIL` receives an unresolved-task escalation when configured; otherwise the task owner receives it. SMTP password handling should use your deployment's secret manager rather than a committed `.env` file.
 
-The service also exposes `POST /reminders/run` for a scheduler that triggers the run through HTTP. Use a token with the `scheduler` or `admin` role.
+The service also exposes `POST /reminders/run` for a scheduler that enqueues the run through HTTP. Use a token with the `scheduler` or `admin` role.
 
 ### 5. Resolve work, export dates, and review history
 
@@ -252,7 +257,7 @@ RADAR_AUTH_USERS_JSON='[{"actor":"contract-admin","token_sha256":"<64-character-
 | Role | Permissions |
 | --- | --- |
 | `admin` | All API operations |
-| `reviewer` | Upload and review contracts, view contract and audit records, and manage all tasks |
+| `reviewer` | Upload and review contracts, view contract/access history, manage all tasks, and place or release legal holds |
 | `owner` | View assigned tasks, request workflow changes, comment, prepare notice drafts, and resolve assigned tasks |
 | `scheduler` | Trigger the reminder/escalation runner and poll configured document sources |
 
@@ -269,7 +274,7 @@ Reviewers and administrators also manage assignments, workflow transitions, comm
 
 Set `CALENDAR_PROVIDER=microsoft` or `google`. Microsoft accepts a short-lived `MS_GRAPH_ACCESS_TOKEN` or client credentials (`MS_GRAPH_TENANT_ID`, `MS_GRAPH_CLIENT_ID`, `MS_GRAPH_CLIENT_SECRET`), plus `MS_GRAPH_USER_ID` and `MS_GRAPH_CALENDAR_ID`. Google uses `GOOGLE_CALENDAR_ACCESS_TOKEN` and `GOOGLE_CALENDAR_ID`; provide a current access token through a secret manager or token broker. Limit provider permissions to the intended calendar.
 
-Call `POST /calendar/sync` after configuration. Sync creates or updates open task events and removes events when tasks are resolved or superseded. Event IDs are retained in SQLite and synchronization actions are recorded in the contract audit trail. ICS export remains available for clients that do not need live updates.
+Call `POST /calendar/sync` after configuration to enqueue a sync job. The worker creates or updates open task events and removes events when tasks are resolved or superseded. Event IDs are retained in SQLite and synchronization actions are recorded in the contract audit trail. ICS export remains available for clients that do not need live updates.
 
 ### Cloud document intake
 
@@ -288,9 +293,23 @@ Confirmed renewal tasks start in `review`. Reviewers can assign an owner and tra
 
 Create a notice draft on a task with `POST /tasks/{task_id}/notices`, including a subject, human-reviewed body, recipient, and delivery method. A reviewer must approve it before dispatch can be recorded. `POST /notices/{notice_id}/dispatch` records the sent timestamp, reference, and optional note; it does not send email or submit the notice to a vendor. Record receipt evidence with `POST /notices/{notice_id}/delivery`. Legal content and actual delivery remain under human control while Radar provides a searchable audit record. List notices with `GET /tasks/{task_id}/notices`.
 
+### Durable jobs
+
+Reminder runs, live calendar synchronization, and retention sweeps are stored in the configured SQLite database as jobs. Enqueue operations return a job ID; workers claim jobs using a database transaction and expiring lease, persist outcomes, and retry failures with bounded exponential backoff. An expired lease makes interrupted work eligible for another worker. Exhausted jobs remain visible in the dead-letter state for review and administrator retry. Run a separate worker process under a supervisor with `renewal-radar process-jobs --loop --limit 20`.
+
+The queue is durable across process restarts and supports a separate worker process. SQLite still serializes writers and is intended for a single host; use a managed database and queue service before scaling workers across hosts. SMTP is at-least-once around process crashes: the stable message ID helps downstream deduplication, but SMTP itself does not guarantee exactly-once delivery.
+
+### Data governance
+
+Set `LLM_ALLOWED_PROVIDERS` to an explicit comma-separated list such as `rules,anthropic` to control which extraction providers may receive contract text. `rules` runs locally. The `.env.example` defaults this allowlist to `rules`; if the setting is omitted, existing deployments remain compatible and all configured providers are allowed. `LLM_PROVIDER=auto` and `renewal-radar evaluate --provider all` honor the allowlist too.
+
+Authenticated API requests are recorded in a tenant-scoped access history without storing response bodies. Reviewers and administrators can place or release legal holds; held contracts cannot be redacted. Administrators can redact a contract with `DELETE /contracts/{contract_id}`. Redaction removes source text, extracted and confirmed terms, notices, tasks, comments, external source links, and prior contract audit details while retaining a minimal redaction audit marker and access history.
+
+Set `CONTRACT_RETENTION_DAYS` to enable scheduled redaction of eligible old records, then run `renewal-radar run-retention` or call `POST /data-retention/run`; `0` disables retention runs. The retention job targets old rejected or superseded agreements and expired active agreements whose tasks are resolved. Pending-review agreements, upcoming active agreements, and all agreements under an active hold are excluded. Retention policy is organization-specific; confirm legal and regulatory schedules before enabling automatic redaction.
+
 ## Extraction evaluation
 
-The `evaluation/cases/` directory contains fictional, redacted excerpts for twelve cases, including amendments, ambiguous extensions, and calendar versus business-day notice terms. The evaluation CLI reports exact-match field and case accuracy, evidence grounding, latency, provider-reported token usage, and an optional cost estimate using configured per-token rates.
+The `evaluation/cases/` directory contains fictional, redacted contract excerpts and OCR-style text fixtures, including amendments, ambiguous extensions, explicit no-notice cases, and calendar versus business-day terms. The evaluator reports exact-match field and case accuracy, source-type breakdowns, evidence quote grounding, whether each extracted value is supported by its field evidence, latency, provider-reported token usage, and an optional cost estimate using configured per-token rates.
 
 Run the rules baseline locally:
 
@@ -310,9 +329,9 @@ Compare the rules baseline with every provider API key configured in the environ
 renewal-radar evaluate --provider all --output evaluation/reports/all-providers.json
 ```
 
-Use `--min-exact-accuracy` and `--min-field-accuracy` to make quality thresholds fail the command. GitHub Actions runs the rules baseline with a 0.70 threshold for pull requests and pushes to `main` or `master`.
+Use `--min-exact-accuracy`, `--min-field-accuracy`, and `--min-evidence-support` to make quality thresholds fail the command. GitHub Actions runs the rules baseline with 0.70 exact-case and field thresholds and a 0.90 evidence-support threshold for pull requests and pushes to `main` or `master`.
 
-`all` always includes the rules baseline, then includes configured LLM providers in provider-selection order. Each provider receives the same fixture texts. LLM evaluations make external API requests and may incur provider charges. This small fixture set is a regression signal, not a statistically representative measure of legal extraction quality; review the cases and add organization-approved, de-identified examples before using scores to select a provider.
+`all` always includes the rules baseline, then includes configured and allowlisted LLM providers in provider-selection order. Each provider receives the same fixture texts. LLM evaluations make external API requests and may incur provider charges. This small fixture set is a regression signal, not a statistically representative measure of legal extraction quality; review the cases and add organization-approved, de-identified examples before using scores to select a provider. See the evaluation guide for an approval/de-identification record format. Do not commit confidential contracts or identifiers to a public repository.
 
 See [evaluation/README.md](evaluation/README.md) for scoring details and fixture conventions.
 
@@ -322,17 +341,24 @@ See [evaluation/README.md](evaluation/README.md) for scoring details and fixture
 | --- | --- | --- |
 | `GET` | `/health` | Public health check |
 | `POST` | `/contracts` | `reviewer` or `admin`: upload and extract a PDF |
-| `GET` | `/contracts?status=pending_review\|active\|rejected\|superseded` | `reviewer` or `admin`: list contracts |
+| `GET` | `/contracts?status=pending_review\|active\|rejected\|superseded\|redacted` | `reviewer` or `admin`: list contracts |
 | `GET` | `/contracts/{contract_id}` | `reviewer` or `admin`: view proposal and confirmed terms |
+| `DELETE` | `/contracts/{contract_id}` | `admin`: redact contract data unless a legal hold is active |
+| `GET/POST` | `/contracts/{contract_id}/legal-holds` | `reviewer` or `admin`: list active holds or place a hold |
+| `POST` | `/legal-holds/{hold_id}/release` | `reviewer` or `admin`: release a hold |
+| `GET` | `/access-history` | `reviewer` or `admin`: read authenticated access events in the current tenant |
 | `GET` | `/contracts/{contract_id}/source` | `reviewer` or `admin`: view extracted contract text |
 | `POST` | `/contracts/{contract_id}/confirm` | `reviewer` or `admin`: confirm terms and create a task |
 | `POST` | `/contracts/{contract_id}/reject` | `reviewer` or `admin`: reject a pending proposal |
 | `GET` | `/contracts/{contract_id}/audit` | `reviewer` or `admin`: read contract event history |
 | `GET` | `/tasks?status=open\|resolved` | `reviewer` or `admin`: list all tasks; `owner`: list assigned tasks |
 | `POST` | `/tasks/{task_id}/resolve` | `reviewer` or `admin`: resolve any task; `owner`: resolve assigned tasks |
-| `POST` | `/reminders/run` | `scheduler` or `admin`: send due reminders and escalations |
+| `POST` | `/reminders/run` | `scheduler` or `admin`: enqueue a durable reminder job (202) |
+| `GET` | `/jobs` or `/jobs/{job_id}` | `reviewer`, `scheduler`, or `admin`: inspect tenant jobs |
+| `POST` | `/jobs/{job_id}/retry` | `admin`: requeue a dead job |
+| `POST` | `/data-retention/run` | `admin`: enqueue a configured retention sweep (202) |
 | `GET` | `/calendar.ics` | `reviewer` or `admin`: export all tasks; `owner`: export assigned tasks |
-| `POST` | `/calendar/sync` | `reviewer` or `admin`: sync open tasks to configured Microsoft or Google calendar |
+| `POST` | `/calendar/sync` | `reviewer` or `admin`: enqueue live calendar synchronization (202) |
 | `POST` | `/document-sources/sync` | `reviewer`, `admin`, or `scheduler`: poll configured cloud drives |
 | `POST` | `/tasks/{task_id}/assign` | `reviewer` or `admin`: assign a task owner |
 | `POST` | `/tasks/{task_id}/transition` | `reviewer` or `admin`: advance workflow; owners can request changes or submit notice work |
@@ -361,6 +387,7 @@ OpenAPI and interactive request examples are available at `/docs` while the serv
 | `OIDC_TENANT_CLAIM` | `tenant_id` | JWT claim used to scope organization data |
 | `RADAR_COOKIE_SECURE` | `true` | Mark the OIDC session cookie Secure; disable only for local HTTP |
 | `LLM_PROVIDER` | `auto` | Provider selection: `auto`, `rules`, `openai`, `anthropic`, `google`, `mistral`, `cohere`, or `xai` |
+| `LLM_ALLOWED_PROVIDERS` | `*` when unset | Comma-separated allowlist of extraction providers permitted to receive contract text; `rules` is local |
 | `LLM_MODEL` | provider default | Optional model override for the selected provider |
 | `OPENAI_API_KEY` | unset | OpenAI API key |
 | `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI model override |
@@ -382,6 +409,10 @@ OpenAPI and interactive request examples are available at `/docs` while the serv
 | `SMTP_STARTTLS` | `true` | Start TLS before SMTP login and send |
 | `ESCALATION_EMAIL` | task owner | Optional escalation recipient |
 | `ESCALATION_AFTER_DAYS` | `7` | Days after the initial reminder before escalation |
+| `JOB_MAX_ATTEMPTS` | `5` | Attempts before a background job moves to dead-letter status |
+| `JOB_RETRY_BASE_SECONDS` | `30` | Base exponential retry delay in seconds (capped at one hour) |
+| `JOB_LEASE_SECONDS` | `120` | Worker lease duration before interrupted work can be reclaimed |
+| `CONTRACT_RETENTION_DAYS` | `0` (disabled) | Age threshold for eligible contract-data redaction |
 | `CALENDAR_PROVIDER` | unset | Optional live event sync target: `microsoft` or `google` |
 | `MS_GRAPH_*` | unset | Microsoft Graph access token or app credentials, user ID, and calendar ID |
 | `GOOGLE_CALENDAR_ACCESS_TOKEN` / `GOOGLE_CALENDAR_ID` | unset | Google Calendar access token and target calendar ID |
@@ -407,6 +438,7 @@ contract_renewal_radar/
 │   ├── calendar_sync.py       # Microsoft Graph and Google Calendar upserts
 │   ├── documents.py           # PDF text extraction and OCR
 │   ├── extractor.py            # Rules and optional LLM extraction
+│   ├── jobs.py                 # Durable background-job enqueue and worker loop
 │   ├── notifications.py       # SMTP and log notification delivery
 │   ├── reminders.py           # Reminder and escalation runner
 │   ├── schemas.py              # Typed request, response, and evidence models
@@ -424,7 +456,7 @@ contract_renewal_radar/
 - The deterministic fallback uses patterns, not legal-language understanding. It will not reliably interpret every contract or extract every clause.
 - The LLM path can misread contract language. Evidence quotes are provided to help the reviewer check each proposal against the source.
 - Human confirmation is a required workflow boundary, not an optional quality check.
-- SQLite is intended for a single service instance. Use a managed database and durable job queue before scaling horizontally.
+- SQLite is intended for a single host. The job queue supports separate workers and lease recovery, but use a managed database and queue service before scaling across hosts.
 - OIDC login uses a short-lived ID-token session and does not refresh expired sessions or provision users. Configure role and tenant claims at the identity provider; users sign in again after token expiration.
 - Business-day counting skips weekends and reviewer-entered holidays. Holiday calendars vary by contract and jurisdiction; reviewers must enter applicable dates before confirming a business-day clause.
 - Calendar access tokens need rotation. Use a secret manager or token broker and least-privilege permissions for the target calendar.

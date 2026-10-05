@@ -13,17 +13,16 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from .auth import AuthRegistry, Principal
 from .calendar import export_ics
-from .calendar_sync import CalendarSyncError
-from .calendar_sync import sync_calendar
+from .jobs import enqueue_calendar_sync, enqueue_reminder_run, enqueue_retention_run, job_record
 from .documents import DocumentError
 from .drive_ingestion import DocumentSourceError, sync_document_sources
 from .extractor import ExtractionError
 from .ingestion import ingest_pdf_bytes
-from .reminders import run_reminders
 from .schemas import (
-    AuditEvent, ConfirmationRequest, ContractData, ContractRecord, NoticeCreateRequest,
-    NoticeDeliveryRequest, NoticeDispatchRequest, NoticeRecord, ReminderTask, ResolveTaskRequest,
-    TaskAssignmentRequest, TaskComment, TaskCommentRequest, TaskTransitionRequest,
+    AccessEvent, AuditEvent, ConfirmationRequest, ContractData, ContractRecord, JobRecord,
+    LegalHoldRecord, LegalHoldRequest, NoticeCreateRequest, NoticeDeliveryRequest,
+    NoticeDispatchRequest, NoticeRecord, ReminderTask, ResolveTaskRequest, TaskAssignmentRequest,
+    TaskComment, TaskCommentRequest, TaskTransitionRequest,
 )
 from .store import Store
 
@@ -62,6 +61,21 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
         if owner_only and (not principal.email or not row["owner_email"] or row["owner_email"].casefold() != principal.email.casefold()):
             raise HTTPException(status_code=403, detail="Owners can access only their assigned tasks.")
         return row
+
+    @app.middleware("http")
+    async def access_history_middleware(request, call_next):
+        response = await call_next(request)
+        if request.url.path not in {"/health", "/docs", "/openapi.json", "/redoc", "/review"}:
+            authorization = request.headers.get("authorization")
+            session = request.cookies.get("radar_session")
+            principal = auth.authenticate(authorization or (f"Bearer {session}" if session else None))
+            if principal:
+                parts = request.url.path.strip("/").split("/")
+                entity_type = parts[0] if parts else "api"
+                entity_id = parts[1] if len(parts) > 1 and parts[0] in {"contracts", "tasks", "notices", "jobs", "legal-holds"} else None
+                action = f"{request.method} {request.url.path} -> {response.status_code}"
+                db.record_access(principal.tenant_id, principal.actor, action, entity_type, entity_id)
+        return response
 
     @app.get("/health")
     def health() -> dict:
@@ -171,7 +185,7 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
 
     @app.get("/contracts", response_model=list[ContractRecord])
     def list_contracts(
-        status: str | None = Query(default=None, pattern="^(pending_review|active|rejected|superseded)$"),
+        status: str | None = Query(default=None, pattern="^(pending_review|active|rejected|superseded|redacted)$"),
         principal: Principal = Depends(authenticate),
     ) -> list[ContractRecord]:
         require_scope(principal, "contracts:read")
@@ -184,6 +198,48 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
         if not row:
             raise HTTPException(status_code=404, detail="Contract not found")
         return _contract_record(row)
+
+    @app.delete("/contracts/{contract_id}", status_code=204)
+    def redact_contract(contract_id: str, principal: Principal = Depends(authenticate)) -> Response:
+        require_scope(principal, "data:delete")
+        try:
+            redacted = db.redact_contract(contract_id, principal.tenant_id, principal.actor)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not redacted:
+            raise HTTPException(status_code=404, detail="Contract not found")
+        return Response(status_code=204)
+
+    @app.get("/contracts/{contract_id}/legal-holds", response_model=list[LegalHoldRecord])
+    def get_legal_holds(contract_id: str, principal: Principal = Depends(authenticate)) -> list[LegalHoldRecord]:
+        require_scope(principal, "data:hold")
+        if not db.get_contract(contract_id, principal.tenant_id):
+            raise HTTPException(status_code=404, detail="Contract not found")
+        return [_legal_hold_record(row) for row in db.list_legal_holds(contract_id, principal.tenant_id)]
+
+    @app.post("/contracts/{contract_id}/legal-holds", response_model=LegalHoldRecord, status_code=201)
+    def place_legal_hold(contract_id: str, request: LegalHoldRequest, principal: Principal = Depends(authenticate)) -> LegalHoldRecord:
+        require_scope(principal, "data:hold")
+        row = db.place_legal_hold(contract_id, principal.tenant_id, principal.actor, request.reason)
+        if not row:
+            raise HTTPException(status_code=404, detail="Contract not found")
+        return _legal_hold_record(row)
+
+    @app.post("/legal-holds/{hold_id}/release", response_model=LegalHoldRecord)
+    def release_legal_hold(hold_id: str, principal: Principal = Depends(authenticate)) -> LegalHoldRecord:
+        require_scope(principal, "data:hold")
+        try:
+            row = db.release_legal_hold(hold_id, principal.tenant_id, principal.actor)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not row:
+            raise HTTPException(status_code=404, detail="Legal hold not found")
+        return _legal_hold_record(row)
+
+    @app.get("/access-history", response_model=list[AccessEvent])
+    def access_history(limit: int = Query(default=100, ge=1, le=1000), principal: Principal = Depends(authenticate)) -> list[AccessEvent]:
+        require_scope(principal, "access:read")
+        return [AccessEvent(**dict(row)) for row in db.access_history(principal.tenant_id, limit)]
 
     @app.get("/contracts/{contract_id}/source")
     def get_contract_source(contract_id: str, principal: Principal = Depends(authenticate)) -> dict[str, str]:
@@ -276,18 +332,44 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
         content = export_ics(db, owner_email=principal.email if owner_only else None, tenant_id=principal.tenant_id)
         return Response(content, media_type="text/calendar", headers={"Content-Disposition": "attachment; filename=renewal-radar.ics"})
 
-    @app.post("/reminders/run")
-    def trigger_reminders(principal: Principal = Depends(authenticate)) -> dict[str, int]:
+    @app.post("/reminders/run", response_model=JobRecord, status_code=202)
+    def trigger_reminders(principal: Principal = Depends(authenticate)) -> JobRecord:
         require_scope(principal, "reminders:run")
-        return run_reminders(db)
+        return JobRecord(**job_record(enqueue_reminder_run(db, principal.tenant_id)))
 
-    @app.post("/calendar/sync")
-    def calendar_sync(principal: Principal = Depends(authenticate)) -> dict[str, int | str]:
+    @app.post("/calendar/sync", response_model=JobRecord, status_code=202)
+    def calendar_sync(principal: Principal = Depends(authenticate)) -> JobRecord:
         require_scope(principal, "calendar:sync")
-        try:
-            return sync_calendar(db, principal.tenant_id)
-        except CalendarSyncError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return JobRecord(**job_record(enqueue_calendar_sync(db, principal.tenant_id)))
+
+    @app.get("/jobs", response_model=list[JobRecord])
+    def list_jobs(limit: int = Query(default=100, ge=1, le=1000), principal: Principal = Depends(authenticate)) -> list[JobRecord]:
+        require_scope(principal, "jobs:read")
+        return [JobRecord(**job_record(row)) for row in db.list_jobs(principal.tenant_id, limit)]
+
+    @app.get("/jobs/{job_id}", response_model=JobRecord)
+    def get_job(job_id: str, principal: Principal = Depends(authenticate)) -> JobRecord:
+        require_scope(principal, "jobs:read")
+        row = db.get_job(job_id, principal.tenant_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return JobRecord(**job_record(row))
+
+    @app.post("/jobs/{job_id}/retry", response_model=JobRecord)
+    def retry_job(job_id: str, principal: Principal = Depends(authenticate)) -> JobRecord:
+        require_scope(principal, "jobs:retry")
+        row = db.retry_dead_job(job_id, principal.tenant_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Dead job not found")
+        return JobRecord(**job_record(row))
+
+    @app.post("/data-retention/run", response_model=JobRecord, status_code=202)
+    def trigger_retention(principal: Principal = Depends(authenticate)) -> JobRecord:
+        require_scope(principal, "data:delete")
+        retention_days = int(os.getenv("CONTRACT_RETENTION_DAYS", "0"))
+        if retention_days <= 0:
+            raise HTTPException(status_code=409, detail="Set CONTRACT_RETENTION_DAYS to a positive number first.")
+        return JobRecord(**job_record(enqueue_retention_run(db, principal.tenant_id, retention_days)))
 
     @app.post("/document-sources/sync")
     def document_source_sync(principal: Principal = Depends(authenticate)) -> dict:

@@ -18,4 +18,4 @@ jobs:
       - name: Run workflow and storage tests
         run: pytest -q
       - name: Evaluate redacted fixtures with deterministic baseline
-        run: renewal-radar evaluate --provider rules --min-exact-accuracy 0.70 --min-field-accuracy 0.70
+        run: renewal-radar evaluate --provider rules --min-exact-accuracy 0.70 --min-field-accuracy 0.70 --min-evidence-support 0.90

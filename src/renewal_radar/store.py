@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -131,6 +131,44 @@ class Store:
                     delivery_reference TEXT,
                     delivery_note TEXT
                 );
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    job_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 5,
+                    available_at TEXT NOT NULL,
+                    lease_owner TEXT,
+                    lease_expires_at TEXT,
+                    last_error TEXT,
+                    result_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    UNIQUE (tenant_id, idempotency_key)
+                );
+                CREATE TABLE IF NOT EXISTS legal_holds (
+                    id TEXT PRIMARY KEY,
+                    contract_id TEXT NOT NULL REFERENCES contracts(id),
+                    tenant_id TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    placed_by TEXT NOT NULL,
+                    placed_at TEXT NOT NULL,
+                    released_by TEXT,
+                    released_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS access_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    entity_id TEXT,
+                    accessed_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_contract_status ON contracts(status);
                 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, due_date);
                 CREATE INDEX IF NOT EXISTS idx_audit_contract ON audit_events(contract_id, id);
@@ -151,6 +189,8 @@ class Store:
                     db.execute("ALTER TABLE tasks ADD COLUMN workflow_state TEXT NOT NULL DEFAULT 'review'")
             db.execute("CREATE INDEX IF NOT EXISTS idx_contract_tenant ON contracts(tenant_id, status)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_task_tenant ON tasks(tenant_id, status, due_date)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_ready ON jobs(status, available_at, created_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_access_tenant ON access_events(tenant_id, accessed_at)")
 
     def save_contract(self, contract_id: str, filename: str, provider: str, data: ContractData, raw_text: str, actor: str, tenant_id: str = "default") -> None:
         now = utc_now().isoformat()
@@ -323,14 +363,19 @@ class Store:
             task = db.execute("SELECT contract_id, tenant_id FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
                 return
-            db.execute(f"UPDATE tasks SET {field}=? WHERE id=?", (stamp, task_id))
-            self.add_audit(db, task["contract_id"], "task.escalated" if escalation else "task.reminder_sent", "system", {"task_id": task_id, "channel": channel}, task["tenant_id"])
+            cursor = db.execute(f"UPDATE tasks SET {field}=? WHERE id=? AND {field} IS NULL", (stamp, task_id))
+            if cursor.rowcount:
+                self.add_audit(db, task["contract_id"], "task.escalated" if escalation else "task.reminder_sent", "system", {"task_id": task_id, "channel": channel}, task["tenant_id"])
 
-    def open_for_escalation(self, cutoff: date | None) -> list[sqlite3.Row]:
+    def open_for_escalation(self, cutoff: date | None, tenant_id: str | None = None) -> list[sqlite3.Row]:
         with self.connect() as db:
-            if cutoff is None:
+            if cutoff is None and tenant_id is None:
                 return db.execute("SELECT * FROM tasks WHERE status='open' AND reminder_sent_at IS NOT NULL AND escalated_at IS NULL").fetchall()
-            return db.execute("SELECT * FROM tasks WHERE status='open' AND reminder_sent_at IS NOT NULL AND escalated_at IS NULL AND date(reminder_sent_at) <= ?", (cutoff.isoformat(),)).fetchall()
+            if cutoff is None:
+                return db.execute("SELECT * FROM tasks WHERE tenant_id=? AND status='open' AND reminder_sent_at IS NOT NULL AND escalated_at IS NULL", (tenant_id,)).fetchall()
+            if tenant_id is None:
+                return db.execute("SELECT * FROM tasks WHERE status='open' AND reminder_sent_at IS NOT NULL AND escalated_at IS NULL AND date(reminder_sent_at) <= ?", (cutoff.isoformat(),)).fetchall()
+            return db.execute("SELECT * FROM tasks WHERE tenant_id=? AND status='open' AND reminder_sent_at IS NOT NULL AND escalated_at IS NULL AND date(reminder_sent_at) <= ?", (tenant_id, cutoff.isoformat())).fetchall()
 
     def resolve_task(self, task_id: str, actor: str, comment: str | None, tenant_id: str = "default") -> sqlite3.Row | None:
         with self.connect() as db:
@@ -504,6 +549,214 @@ class Store:
             )
             if task:
                 self.add_audit(db, task["contract_id"], "calendar.event_removed", "system", {"task_id": task_id, "provider": provider}, tenant_id)
+
+    def enqueue_job(
+        self, tenant_id: str, job_type: str, payload: dict[str, Any], idempotency_key: str,
+        *, max_attempts: int = 5, available_at: datetime | None = None,
+    ) -> sqlite3.Row:
+        now = utc_now().isoformat()
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO jobs (id, tenant_id, job_type, payload_json, idempotency_key, max_attempts, available_at, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(tenant_id, idempotency_key) DO NOTHING",
+                (str(uuid4()), tenant_id, job_type, json.dumps(payload), idempotency_key,
+                 max_attempts, (available_at or utc_now()).isoformat(), now, now),
+            )
+            return db.execute(
+                "SELECT * FROM jobs WHERE tenant_id=? AND idempotency_key=?", (tenant_id, idempotency_key),
+            ).fetchone()
+
+    def get_job(self, job_id: str, tenant_id: str) -> sqlite3.Row | None:
+        with self.connect() as db:
+            return db.execute("SELECT * FROM jobs WHERE id=? AND tenant_id=?", (job_id, tenant_id)).fetchone()
+
+    def list_jobs(self, tenant_id: str, limit: int = 100) -> list[sqlite3.Row]:
+        with self.connect() as db:
+            return db.execute(
+                "SELECT * FROM jobs WHERE tenant_id=? ORDER BY created_at DESC LIMIT ?", (tenant_id, limit),
+            ).fetchall()
+
+    def claim_job(self, worker_id: str, lease_seconds: int = 120, job_id: str | None = None) -> sqlite3.Row | None:
+        now = utc_now()
+        stamp = now.isoformat()
+        lease_until = datetime.fromtimestamp(now.timestamp() + lease_seconds, timezone.utc).isoformat()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "UPDATE jobs SET status='dead', last_error=COALESCE(last_error, 'Worker lease expired after max attempts'), "
+                "lease_owner=NULL, lease_expires_at=NULL, updated_at=?, completed_at=? "
+                "WHERE status='running' AND lease_expires_at<=? AND attempts>=max_attempts",
+                (stamp, stamp, stamp),
+            )
+            ready = "((status='queued' AND available_at<=?) OR (status='running' AND lease_expires_at<=? AND attempts<max_attempts))"
+            if job_id:
+                row = db.execute(
+                    f"SELECT * FROM jobs WHERE id=? AND {ready} ORDER BY available_at, created_at LIMIT 1",
+                    (job_id, stamp, stamp),
+                ).fetchone()
+            else:
+                row = db.execute(
+                    f"SELECT * FROM jobs WHERE {ready} ORDER BY available_at, created_at LIMIT 1", (stamp, stamp),
+                ).fetchone()
+            if not row:
+                return None
+            db.execute(
+                "UPDATE jobs SET status='running', attempts=attempts+1, lease_owner=?, lease_expires_at=?, updated_at=? WHERE id=?",
+                (worker_id, lease_until, stamp, row["id"]),
+            )
+            return db.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
+
+    def complete_job(self, job_id: str, worker_id: str, result: dict[str, Any]) -> bool:
+        stamp = utc_now().isoformat()
+        with self.connect() as db:
+            cursor = db.execute(
+                "UPDATE jobs SET status='succeeded', result_json=?, lease_owner=NULL, lease_expires_at=NULL, updated_at=?, completed_at=? "
+                "WHERE id=? AND status='running' AND lease_owner=?",
+                (json.dumps(result, default=str), stamp, stamp, job_id, worker_id),
+            )
+            return cursor.rowcount == 1
+
+    def fail_job(self, job_id: str, worker_id: str, error: str, retry_delay_seconds: int | None = None) -> bool:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT attempts, max_attempts FROM jobs WHERE id=? AND status='running' AND lease_owner=?",
+                (job_id, worker_id),
+            ).fetchone()
+            if not row:
+                return False
+            now = utc_now()
+            exhausted = row["attempts"] >= row["max_attempts"]
+            base_delay = max(1, int(os.getenv("JOB_RETRY_BASE_SECONDS", "30")))
+            delay = retry_delay_seconds if retry_delay_seconds is not None else min(base_delay * (2 ** (row["attempts"] - 1)), 3600)
+            next_state = "dead" if exhausted else "queued"
+            updated = now.isoformat()
+            available = (now + timedelta(seconds=max(0, delay))).isoformat()
+            db.execute(
+                "UPDATE jobs SET status=?, available_at=?, last_error=?, lease_owner=NULL, lease_expires_at=NULL, updated_at=?, completed_at=? WHERE id=?",
+                (next_state, available, error[:4000], updated, updated if exhausted else None, job_id),
+            )
+            return True
+
+    def retry_dead_job(self, job_id: str, tenant_id: str) -> sqlite3.Row | None:
+        stamp = utc_now().isoformat()
+        with self.connect() as db:
+            cursor = db.execute(
+                "UPDATE jobs SET status='queued', attempts=0, last_error=NULL, available_at=?, updated_at=?, completed_at=NULL "
+                "WHERE id=? AND tenant_id=? AND status='dead'",
+                (stamp, stamp, job_id, tenant_id),
+            )
+            return db.execute("SELECT * FROM jobs WHERE id=? AND tenant_id=?", (job_id, tenant_id)).fetchone() if cursor.rowcount else None
+
+    def record_access(self, tenant_id: str, actor: str, action: str, entity_type: str, entity_id: str | None) -> None:
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO access_events (tenant_id, actor, action, entity_type, entity_id, accessed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (tenant_id, actor, action, entity_type, entity_id, utc_now().isoformat()),
+            )
+
+    def access_history(self, tenant_id: str, limit: int = 100) -> list[sqlite3.Row]:
+        with self.connect() as db:
+            return db.execute(
+                "SELECT * FROM access_events WHERE tenant_id=? ORDER BY id DESC LIMIT ?", (tenant_id, limit),
+            ).fetchall()
+
+    def place_legal_hold(self, contract_id: str, tenant_id: str, actor: str, reason: str) -> sqlite3.Row | None:
+        hold_id = str(uuid4())
+        stamp = utc_now().isoformat()
+        with self.connect() as db:
+            contract = db.execute(
+                "SELECT id FROM contracts WHERE id=? AND tenant_id=? AND status!='redacted'", (contract_id, tenant_id),
+            ).fetchone()
+            if not contract:
+                return None
+            cursor = db.execute(
+                "INSERT INTO legal_holds (id, contract_id, tenant_id, reason, placed_by, placed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (hold_id, contract_id, tenant_id, reason, actor, stamp),
+            )
+            self.add_audit(db, contract_id, "contract.legal_hold_placed", actor, {"hold_id": hold_id, "reason": reason}, tenant_id)
+            return db.execute("SELECT * FROM legal_holds WHERE id=?", (hold_id,)).fetchone()
+
+    def release_legal_hold(self, hold_id: str, tenant_id: str, actor: str) -> sqlite3.Row | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM legal_holds WHERE id=? AND tenant_id=?", (hold_id, tenant_id)).fetchone()
+            if not row:
+                return None
+            if row["released_at"]:
+                raise ValueError("Legal hold is already released")
+            stamp = utc_now().isoformat()
+            db.execute("UPDATE legal_holds SET released_by=?, released_at=? WHERE id=?", (actor, stamp, hold_id))
+            self.add_audit(db, row["contract_id"], "contract.legal_hold_released", actor, {"hold_id": hold_id}, tenant_id)
+            return db.execute("SELECT * FROM legal_holds WHERE id=?", (hold_id,)).fetchone()
+
+    def active_legal_holds(self, contract_id: str, tenant_id: str) -> list[sqlite3.Row]:
+        with self.connect() as db:
+            return db.execute(
+                "SELECT * FROM legal_holds WHERE contract_id=? AND tenant_id=? AND released_at IS NULL ORDER BY placed_at",
+                (contract_id, tenant_id),
+            ).fetchall()
+
+    def list_legal_holds(self, contract_id: str, tenant_id: str) -> list[sqlite3.Row]:
+        with self.connect() as db:
+            return db.execute(
+                "SELECT * FROM legal_holds WHERE contract_id=? AND tenant_id=? ORDER BY placed_at",
+                (contract_id, tenant_id),
+            ).fetchall()
+
+    def retention_candidates(self, cutoff: datetime, tenant_id: str | None = None) -> list[sqlite3.Row]:
+        stamp = cutoff.isoformat()
+        with self.connect() as db:
+            query = (
+                "SELECT c.id, c.tenant_id FROM contracts c "
+                "WHERE c.created_at<=? AND (c.status IN ('rejected','superseded') OR "
+                "(c.status='active' AND EXISTS (SELECT 1 FROM tasks t WHERE t.contract_id=c.id) "
+                "AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.contract_id=c.id AND t.status='open') "
+                "AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.contract_id=c.id AND t.expiration_date>?))) "
+                "AND NOT EXISTS (SELECT 1 FROM legal_holds h WHERE h.contract_id=c.id AND h.tenant_id=c.tenant_id AND h.released_at IS NULL)"
+            )
+            parameters: tuple = (stamp, cutoff.date().isoformat())
+            if tenant_id is not None:
+                query += " AND c.tenant_id=?"
+                parameters += (tenant_id,)
+            return db.execute(query, parameters).fetchall()
+
+    def redact_contract(self, contract_id: str, tenant_id: str, actor: str) -> bool:
+        with self.connect() as db:
+            contract = db.execute(
+                "SELECT * FROM contracts WHERE id=? AND tenant_id=?", (contract_id, tenant_id),
+            ).fetchone()
+            if not contract:
+                return False
+            hold = db.execute(
+                "SELECT 1 FROM legal_holds WHERE contract_id=? AND tenant_id=? AND released_at IS NULL LIMIT 1",
+                (contract_id, tenant_id),
+            ).fetchone()
+            if hold:
+                raise ValueError("Contract is protected by an active legal hold")
+            tasks = db.execute("SELECT id FROM tasks WHERE contract_id=?", (contract_id,)).fetchall()
+            for task in tasks:
+                db.execute("DELETE FROM calendar_events WHERE task_id=?", (task["id"],))
+                db.execute("DELETE FROM task_comments WHERE task_id=?", (task["id"],))
+                db.execute("DELETE FROM notices WHERE task_id=?", (task["id"],))
+            db.execute("DELETE FROM tasks WHERE contract_id=?", (contract_id,))
+            db.execute("DELETE FROM external_documents WHERE contract_id=?", (contract_id,))
+            db.execute("DELETE FROM audit_events WHERE contract_id=? AND tenant_id=?", (contract_id, tenant_id))
+            db.execute(
+                "UPDATE contracts SET filename='redacted.pdf', status='redacted', provider='redacted', extracted_json='{}', "
+                "confirmed_json=NULL, raw_text='', confirmed_at=NULL WHERE id=? AND tenant_id=?",
+                (contract_id, tenant_id),
+            )
+            self.add_audit(db, contract_id, "contract.data_redacted", actor, {}, tenant_id)
+            return True
+
+    def redact_expired_contracts(self, retention_days: int, actor: str = "system", tenant_id: str | None = None) -> int:
+        if retention_days <= 0:
+            return 0
+        cutoff = utc_now() - timedelta(days=retention_days)
+        candidates = self.retention_candidates(cutoff, tenant_id)
+        redacted = 0
+        for row in candidates:
+            redacted += int(self.redact_contract(row["id"], row["tenant_id"], actor))
+        return redacted
 
 
 def calculate_notice_deadline(expiration: date, notice_days: int, day_type: str, holidays: set[date] | None = None) -> date:

@@ -1,0 +1,12 @@
+{
+  "id": "ocr-line-wrapped-terms",
+  "source_type": "ocr",
+  "contract_text": "[VENDOR] Managed Services Agreement\nEffective Date:\nApril 1, 2025\nExpiration Date:\nMarch 31, 2026\nThis agreement will automatically renew for additional one-year terms unless either party gives written notice at least 60 calendar days before expiration.",
+  "expected": {
+    "start_date": "2025-04-01",
+    "expiration_date": "2026-03-31",
+    "renewal_notice_days": 60,
+    "notice_day_type": "calendar",
+    "auto_renew": true
+  }
+}

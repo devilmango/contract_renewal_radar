@@ -51,7 +51,7 @@ class ContractData(BaseModel):
 class ContractRecord(BaseModel):
     id: str
     filename: str
-    status: Literal["pending_review", "active", "rejected", "superseded"]
+    status: Literal["pending_review", "active", "rejected", "superseded", "redacted"]
     extraction_provider: str
     extracted: ContractData
     confirmed: ContractData | None = None
@@ -161,3 +161,41 @@ class NoticeRecord(BaseModel):
     delivered_at: datetime | None
     delivery_reference: str | None
     delivery_note: str | None
+
+
+class JobRecord(BaseModel):
+    id: str
+    tenant_id: str
+    job_type: str
+    status: Literal["queued", "running", "succeeded", "dead"]
+    attempts: int
+    max_attempts: int
+    available_at: datetime
+    last_error: str | None
+    result: dict | None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+
+
+class LegalHoldRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class LegalHoldRecord(BaseModel):
+    id: str
+    contract_id: str
+    reason: str
+    placed_by: str
+    placed_at: datetime
+    released_by: str | None
+    released_at: datetime | None
+
+
+class AccessEvent(BaseModel):
+    id: int
+    actor: str
+    action: str
+    entity_type: str
+    entity_id: str | None
+    accessed_at: datetime

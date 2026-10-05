@@ -8,12 +8,12 @@ from .notifications import send_notification
 from .store import Store
 
 
-def run_reminders(store: Store, today: date | None = None) -> dict[str, int]:
+def run_reminders(store: Store, today: date | None = None, tenant_id: str | None = None) -> dict[str, int]:
     """Send once when the renewal window opens, then escalate once if still open."""
     supplied_today = today
     sent = escalated = 0
     now = datetime.now(timezone.utc)
-    for task in store.due_tasks(today):
+    for task in store.due_tasks(today, tenant_id=tenant_id):
         local_today = supplied_today or now.astimezone(ZoneInfo(task["notice_timezone"] or "UTC")).date()
         if date.fromisoformat(task["due_date"]) > local_today:
             continue
@@ -24,7 +24,7 @@ def run_reminders(store: Store, today: date | None = None) -> dict[str, int]:
 
     delay = max(0, int(os.getenv("ESCALATION_AFTER_DAYS", "7")))
     cutoff = supplied_today - timedelta(days=delay) if supplied_today is not None else None
-    for task in store.open_for_escalation(cutoff):
+    for task in store.open_for_escalation(cutoff, tenant_id=tenant_id):
         if supplied_today is None:
             zone = ZoneInfo(task["notice_timezone"] or "UTC")
             sent_at = datetime.fromisoformat(task["reminder_sent_at"])

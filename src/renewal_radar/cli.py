@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 from .auth import SUPPORTED_ROLES, create_token_config
 from .drive_ingestion import DocumentSourceError, sync_document_sources
 from .evaluation import evaluate_extractor, load_cases
 from .extractor import configured_llm_providers, get_extractor
-from .reminders import run_reminders
+from .jobs import enqueue_reminder_run, enqueue_retention_run, job_record, process_jobs
 from .store import Store
 
 
@@ -24,7 +26,17 @@ def main() -> int:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", default=8000, type=int)
 
-    subparsers.add_parser("run-reminders", help="Send due renewal reminders and escalations once")
+    run_reminder = subparsers.add_parser("run-reminders", help="Queue and process one tenant-scoped reminder run")
+    run_reminder.add_argument("--tenant-id", default="default")
+
+    worker = subparsers.add_parser("process-jobs", help="Process due durable background jobs once")
+    worker.add_argument("--limit", type=int, default=20)
+    worker.add_argument("--worker-id")
+    worker.add_argument("--loop", action="store_true", help="Keep polling as a long-running worker")
+    worker.add_argument("--poll-interval", type=float, default=2.0, help="Idle sleep interval in seconds when --loop is enabled")
+
+    retention = subparsers.add_parser("run-retention", help="Queue and process a configured data-retention run")
+    retention.add_argument("--tenant-id", default="default")
 
     sync_documents = subparsers.add_parser("sync-documents", help="Poll configured Drive sources for new or changed PDFs")
     sync_documents.add_argument("--tenant-id", default="default", help="Organization whose configured Drive cursors to advance")
@@ -41,6 +53,7 @@ def main() -> int:
     evaluate.add_argument("--output", type=Path, help="Optional path for the JSON report")
     evaluate.add_argument("--min-exact-accuracy", type=float, help="Exit non-zero when any evaluated provider is below this exact-case accuracy")
     evaluate.add_argument("--min-field-accuracy", type=float, help="Exit non-zero when any scored field is below this accuracy")
+    evaluate.add_argument("--min-evidence-support", type=float, help="Exit non-zero when evidence does not support the extracted values often enough")
 
     args = parser.parse_args()
 
@@ -51,7 +64,38 @@ def main() -> int:
         return 0
 
     if args.command == "run-reminders":
-        print(json.dumps(run_reminders(Store()), indent=2))
+        store = Store()
+        job = enqueue_reminder_run(store, args.tenant_id)
+        worker_result = process_jobs(store, limit=1, job_id=job["id"])
+        current = store.get_job(job["id"], args.tenant_id)
+        print(json.dumps({"job": job_record(current) if current else job, "worker": worker_result}, indent=2))
+        return 0
+
+    if args.command == "process-jobs":
+        store = Store()
+        if args.loop:
+            try:
+                while True:
+                    result = process_jobs(store, limit=max(1, args.limit), worker_id=args.worker_id)
+                    if result["processed"]:
+                        print(json.dumps(result), flush=True)
+                    else:
+                        time.sleep(max(0.1, args.poll_interval))
+            except KeyboardInterrupt:
+                return 0
+        print(json.dumps(process_jobs(store, limit=max(0, args.limit), worker_id=args.worker_id), indent=2))
+        return 0
+
+    if args.command == "run-retention":
+        retention_days = int(os.getenv("CONTRACT_RETENTION_DAYS", "0"))
+        if retention_days <= 0:
+            print(json.dumps({"error": "Set CONTRACT_RETENTION_DAYS to a positive number first."}), file=sys.stderr)
+            return 2
+        store = Store()
+        job = enqueue_retention_run(store, args.tenant_id, retention_days)
+        worker_result = process_jobs(store, limit=1, job_id=job["id"])
+        current = store.get_job(job["id"], args.tenant_id)
+        print(json.dumps({"job": job_record(current) if current else job, "worker": worker_result}, indent=2))
         return 0
 
     if args.command == "sync-documents":
@@ -98,6 +142,10 @@ def main() -> int:
                 below = [name for name, values in report["fields"].items()
                          if values["accuracy"] is None or values["accuracy"] < args.min_field_accuracy]
                 gate_failures.extend(f"{name} below {args.min_field_accuracy}" for name in below)
+            if args.min_evidence_support is not None:
+                score = report["field_evidence_support"]["accuracy"]
+                if score is None or score < args.min_evidence_support:
+                    gate_failures.append(f"field_evidence_support={score} < {args.min_evidence_support}")
             if gate_failures:
                 report["status"] = "gate_failed"
                 report["gate_failures"] = gate_failures

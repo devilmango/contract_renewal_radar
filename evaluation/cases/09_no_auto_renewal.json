@@ -4,6 +4,7 @@
   "expected": {
     "start_date": "2025-05-01",
     "expiration_date": "2026-04-30",
+    "renewal_notice_days": null,
     "auto_renew": false
   }
 }

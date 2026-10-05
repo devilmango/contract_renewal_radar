@@ -88,7 +88,7 @@ class RulesExtractor:
             normalized,
             re.IGNORECASE,
         ) or re.search(
-            r"(?:renewal|non-?renewal|termination) notice(?: period)?\s*(?:is|of|:)?\s*(\d{1,4})\s*days?",
+            r"(?:renewal|non-?renewal) notice(?: period)?\s*(?:is|of|:)?\s*(\d{1,4})\s*days?",
             normalized,
             re.IGNORECASE,
         )
@@ -349,25 +349,40 @@ _PROVIDER_MODEL_ALIASES = {"google": ("GEMINI_MODEL",)}
 
 
 def configured_llm_providers() -> list[str]:
+    allowed = _allowed_llm_providers()
     return [
         name
         for name, env_names in _PROVIDER_KEYS.items()
-        if any(os.getenv(key) for key in env_names)
+        if name in allowed and any(os.getenv(key) for key in env_names)
     ]
+
+
+def _allowed_llm_providers() -> set[str]:
+    raw = os.getenv("LLM_ALLOWED_PROVIDERS", "*").strip().casefold()
+    if not raw or raw == "*":
+        return set(_PROVIDER_KEYS) | {"rules"}
+    allowed = {provider.strip() for provider in raw.split(",") if provider.strip()}
+    unknown = allowed - set(_PROVIDER_KEYS) - {"rules"}
+    if unknown:
+        raise ExtractionError(f"Unsupported LLM_ALLOWED_PROVIDERS entries: {', '.join(sorted(unknown))}.")
+    return allowed | {"rules"}
 
 
 def get_extractor(provider_override: str | None = None) -> Extractor:
     requested = (provider_override or os.getenv("LLM_PROVIDER", "auto")).strip().lower()
+    allowed = _allowed_llm_providers()
     if requested == "rules":
         return RulesExtractor()
     if requested == "auto":
         provider = next(
-            (name for name, env_names in _PROVIDER_KEYS.items() if any(os.getenv(key) for key in env_names)),
+            (name for name, env_names in _PROVIDER_KEYS.items() if name in allowed and any(os.getenv(key) for key in env_names)),
             None,
         )
         if provider is None:
             return RulesExtractor()
     elif requested in _PROVIDER_KEYS:
+        if requested not in allowed:
+            raise ExtractionError(f"Provider '{requested}' is blocked by LLM_ALLOWED_PROVIDERS.")
         provider = requested
     else:
         raise ExtractionError(f"Unsupported LLM_PROVIDER '{requested}'. Choose one of: rules, {', '.join(_PROVIDER_KEYS)}.")

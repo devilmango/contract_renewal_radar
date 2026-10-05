@@ -1,0 +1,11 @@
+{
+  "id": "ocr-page-artifacts",
+  "source_type": "ocr",
+  "contract_text": "[CUSTOMER] SOFTWARE LICENSE AGREEMENT\n--- PAGE 1 ---\nStart Date : May 1, 2025\nTerm End Date : April 30, 2027\nThe license does not automatically renew. A new signed order form is required to extend the term.\nRenewal notice period: 30 days.",
+  "expected": {
+    "start_date": "2025-05-01",
+    "expiration_date": "2027-04-30",
+    "renewal_notice_days": 30,
+    "auto_renew": false
+  }
+}

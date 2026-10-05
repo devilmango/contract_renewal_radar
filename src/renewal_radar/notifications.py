@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import smtplib
+import hashlib
 from email.message import EmailMessage
 from typing import Any
 
@@ -18,6 +19,7 @@ def send_notification(task: Any, escalation: bool) -> str:
     message["Subject"] = ("Escalation: " if escalation else "Action required: ") + task["title"]
     message["From"] = os.getenv("SMTP_FROM", "renewal-radar@example.com")
     message["To"] = recipient
+    message["Message-ID"] = f"<{hashlib.sha256((task['id'] + (':escalation' if escalation else ':reminder')).encode()).hexdigest()}@renewal-radar>"
     message.set_content(
         f"Contract renewal task: {task['title']}\n"
         f"Action date: {task['due_date']}\n"
