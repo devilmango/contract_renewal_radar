@@ -66,11 +66,17 @@ class RulesExtractor:
 
         start_terms = re.compile(r"effective date|commencement|start date|beginning on|takes effect", re.IGNORECASE)
         end_terms = re.compile(r"expiration|expire|expiry|end date|term ends|term through", re.IGNORECASE)
-        for parsed, _raw, context, date_offset, _context_start in date_hits:
-            nearby = []
+        for parsed, _raw, context, _date_offset, context_start in date_hits:
+            # Date labels conventionally precede the value. Looking both ways in a
+            # symmetric window can assign an effective date to a later expiration
+            # label (for example, "effective date is X and expiration date is Y").
+            label_start = max(0, context_start + len(context) - 200)
+            prior: list[tuple[int, str]] = []
             for pattern, field in ((start_terms, "start_date"), (end_terms, "expiration_date")):
-                nearby.extend((abs(hit.start() - date_offset), field) for hit in pattern.finditer(context))
-            field = min(nearby)[1] if nearby else None
+                prior.extend((label_start + hit.end(), field) for hit in pattern.finditer(text[label_start:]))
+            date_position = context_start + _date_offset
+            prior = [(position, field) for position, field in prior if position <= date_position and date_position - position <= 80]
+            field = max(prior, key=lambda item: item[0])[1] if prior else None
             if field and field not in result:
                 result[field] = parsed
                 evidence.append(Evidence(field=field, quote=context.strip()[:1000], confidence=0.72))
@@ -78,7 +84,7 @@ class RulesExtractor:
         notice = re.search(
             r"(?:(?:at least|no later than|not later than)\s+)?(\d{1,4})\s*(?:\(\s*[\w-]+\s*\))?\s*"
             r"(?:calendar\s+|business\s+)?days?\s+(?:prior|before|in advance of)\s+"
-            r"(?:the\s+)?(?:expiration|expiry|end of (?:the\s+)?(?:then-current\s+)?term|renewal|end date)",
+            r"(?:to\s+)?(?:the\s+)?(?:expiration|expiry|end of (?:the\s+)?(?:then-current\s+)?term|renewal|end date)",
             normalized,
             re.IGNORECASE,
         ) or re.search(
@@ -115,7 +121,7 @@ class RulesExtractor:
                 evidence.append(Evidence(field="auto_renew", quote=match.group(0) if match else "Automatic renewal clause", confidence=0.8))
 
         termination = re.search(
-            r"termination notice(?: period)?\s*(?:of|:)?\s*([^.;\n]{1,80})",
+            r"termination notice(?: period)?\s*(?:is|of|:)?\s*([^.;\n]{1,80})",
             normalized,
             re.IGNORECASE,
         )

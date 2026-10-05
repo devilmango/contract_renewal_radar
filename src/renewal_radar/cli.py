@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from .auth import SUPPORTED_ROLES, create_token_config
+from .drive_ingestion import DocumentSourceError, sync_document_sources
 from .evaluation import evaluate_extractor, load_cases
 from .extractor import configured_llm_providers, get_extractor
 from .reminders import run_reminders
@@ -24,6 +25,9 @@ def main() -> int:
     serve.add_argument("--port", default=8000, type=int)
 
     subparsers.add_parser("run-reminders", help="Send due renewal reminders and escalations once")
+
+    sync_documents = subparsers.add_parser("sync-documents", help="Poll configured Drive sources for new or changed PDFs")
+    sync_documents.add_argument("--tenant-id", default="default", help="Organization whose configured Drive cursors to advance")
 
     create_token = subparsers.add_parser("create-token", help="Create a bearer token and hashed user configuration entry")
     create_token.add_argument("--actor", required=True, help="Identity recorded in the audit trail")
@@ -49,6 +53,14 @@ def main() -> int:
     if args.command == "run-reminders":
         print(json.dumps(run_reminders(Store()), indent=2))
         return 0
+
+    if args.command == "sync-documents":
+        try:
+            print(json.dumps(sync_document_sources(Store(), args.tenant_id), indent=2))
+            return 0
+        except DocumentSourceError as exc:
+            print(json.dumps({"error": str(exc)}), file=sys.stderr)
+            return 1
 
     if args.command == "create-token":
         token, user_entry = create_token_config(args.actor, args.role, args.email, args.tenant_id)

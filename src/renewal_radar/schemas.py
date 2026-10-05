@@ -89,7 +89,75 @@ class ReminderTask(BaseModel):
     notice_day_type: Literal["calendar", "business"] = "calendar"
     notice_timezone: str = "UTC"
     notice_holidays: list[date] = Field(default_factory=list)
+    workflow_state: Literal["review", "needs_changes", "pending_approval", "notice_in_progress", "renewed", "terminated", "cancelled", "resolved"] = "review"
 
 
 class ResolveTaskRequest(BaseModel):
     comment: str | None = Field(default=None, max_length=2000)
+
+
+class TaskTransitionRequest(BaseModel):
+    workflow_state: Literal["review", "needs_changes", "pending_approval", "notice_in_progress", "renewed", "terminated", "cancelled"]
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+class TaskAssignmentRequest(BaseModel):
+    owner_name: str | None = Field(default=None, max_length=150)
+    owner_email: str | None = Field(default=None, max_length=320)
+
+    @field_validator("owner_email")
+    @classmethod
+    def validate_owner_email(cls, value: str | None) -> str | None:
+        if value and ("@" not in value or value.startswith("@") or value.endswith("@")):
+            raise ValueError("owner_email must be a valid email address")
+        return value
+
+
+class TaskCommentRequest(BaseModel):
+    body: str = Field(min_length=1, max_length=10000)
+
+
+class TaskComment(BaseModel):
+    id: int
+    task_id: str
+    actor: str
+    body: str
+    created_at: datetime
+
+
+class NoticeCreateRequest(BaseModel):
+    subject: str = Field(min_length=1, max_length=300)
+    body: str = Field(min_length=1, max_length=50000)
+    recipient: str = Field(min_length=1, max_length=500)
+    delivery_method: Literal["email", "registered_mail", "courier", "portal", "other"]
+
+
+class NoticeDispatchRequest(BaseModel):
+    sent_at: datetime | None = None
+    delivery_reference: str = Field(min_length=1, max_length=500)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class NoticeDeliveryRequest(BaseModel):
+    delivered_at: datetime | None = None
+    delivery_reference: str | None = Field(default=None, max_length=500)
+    evidence_note: str = Field(min_length=1, max_length=5000)
+
+
+class NoticeRecord(BaseModel):
+    id: str
+    task_id: str
+    status: Literal["draft", "approved", "dispatched", "delivered", "cancelled"]
+    subject: str
+    body: str
+    recipient: str
+    delivery_method: Literal["email", "registered_mail", "courier", "portal", "other"]
+    created_by: str
+    created_at: datetime
+    approved_by: str | None
+    approved_at: datetime | None
+    dispatched_by: str | None
+    dispatched_at: datetime | None
+    delivered_at: datetime | None
+    delivery_reference: str | None
+    delivery_note: str | None

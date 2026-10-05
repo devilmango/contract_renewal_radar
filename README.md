@@ -40,6 +40,9 @@ An extraction is always a proposal. The service does not activate a contract or 
 - **Reminder and escalation runner:** Send one reminder when the task is due and one escalation if it remains open after the configured delay.
 - **Calendar export:** Download open tasks in iCalendar format.
 - **Live calendar sync:** Upsert renewal events in Microsoft 365 or Google Calendar and remove events for resolved tasks.
+- **Cloud document intake:** Poll Google Drive and Microsoft Graph drive delta feeds for new or revised PDFs, with revision deduplication and source links.
+- **Renewal workflow:** Move tasks through review, change requests, approval, notice work, renewal, termination, and cancellation with permission checks and audit history.
+- **Notice preparation and delivery evidence:** Draft notice content, require reviewer approval, record dispatch details, and attach delivery confirmation evidence.
 - **Organization isolation:** Contract, task, source text, audit, and calendar records are scoped by tenant ID.
 - **OIDC token validation:** Verify signed RS256 or ES256 JWT access tokens against configured issuer, audience, and JWKS settings.
 - **Audit trail:** Record ingestion, confirmation, rejection, task creation, notifications, escalation, and resolution.
@@ -250,8 +253,8 @@ RADAR_AUTH_USERS_JSON='[{"actor":"contract-admin","token_sha256":"<64-character-
 | --- | --- |
 | `admin` | All API operations |
 | `reviewer` | Upload and review contracts, view contract and audit records, and manage all tasks |
-| `owner` | View and resolve tasks assigned to the configured email address; export only those tasks to calendar |
-| `scheduler` | Trigger the reminder and escalation runner |
+| `owner` | View assigned tasks, request workflow changes, comment, prepare notice drafts, and resolve assigned tasks |
+| `scheduler` | Trigger the reminder/escalation runner and poll configured document sources |
 
 The authenticated actor name, rather than a caller-supplied `X-Actor` or request-body field, is recorded in the audit history. Tokens are compared by digest and are not stored in SQLite. Rotate a token by generating a replacement, removing the old digest from `RADAR_AUTH_USERS_JSON`, and reloading the service.
 
@@ -260,12 +263,30 @@ The built-in role configuration is intentionally small. An `owner` entry must in
 For OIDC single sign-on, configure the issuer, JWKS URL, audience, authorization and token endpoints, client ID and secret, and an exact callback URI of `/auth/oidc/callback`. The login uses authorization code flow with state and nonce checks; the ID token is signature-validated and held in a short-lived, HttpOnly session cookie. Radar reads roles from `OIDC_ROLES_CLAIM` (default `roles`) and tenant from `OIDC_TENANT_CLAIM` (default `tenant_id`). The ID token must contain those claims and use `OIDC_AUDIENCE`. Configure the same callback URI in the IdP. `RADAR_COOKIE_SECURE=true` is correct behind HTTPS; set it to `false` only for local HTTP development. Deploy behind TLS and protect client credentials.
 
 Reviewer permissions include source-text access so the reviewer can verify extraction evidence. Keep reviewer tokens scoped and assign role and tenant claims intentionally.
+Reviewers and administrators also manage assignments, workflow transitions, comments, and notice approval. Owners can read and create notices for assigned tasks; only reviewers or administrators can approve and record dispatch/delivery evidence.
 
 ### Live calendar synchronization
 
 Set `CALENDAR_PROVIDER=microsoft` or `google`. Microsoft accepts a short-lived `MS_GRAPH_ACCESS_TOKEN` or client credentials (`MS_GRAPH_TENANT_ID`, `MS_GRAPH_CLIENT_ID`, `MS_GRAPH_CLIENT_SECRET`), plus `MS_GRAPH_USER_ID` and `MS_GRAPH_CALENDAR_ID`. Google uses `GOOGLE_CALENDAR_ACCESS_TOKEN` and `GOOGLE_CALENDAR_ID`; provide a current access token through a secret manager or token broker. Limit provider permissions to the intended calendar.
 
 Call `POST /calendar/sync` after configuration. Sync creates or updates open task events and removes events when tasks are resolved or superseded. Event IDs are retained in SQLite and synchronization actions are recorded in the contract audit trail. ICS export remains available for clients that do not need live updates.
+
+### Cloud document intake
+
+Radar can poll a Google Drive folder or Microsoft Graph drive folder and ingest PDF files into the same extraction and human-review flow as direct uploads. Configure a provider in `.env`, then run `renewal-radar sync-documents --tenant-id acme` or call `POST /document-sources/sync` with an administrator, reviewer, or scheduler token. The poller stores provider cursors and source revisions in SQLite, so repeat runs do not create duplicate proposals. Google Drive uses its [changes feed](https://developers.google.com/workspace/drive/api/guides/manage-changes); Microsoft Graph uses [drive delta](https://learn.microsoft.com/graph/api/driveitem-delta).
+
+| Provider | Required settings | Optional folder setting |
+| --- | --- | --- |
+| Google Drive | `GOOGLE_DRIVE_ACCESS_TOKEN` | `GOOGLE_DRIVE_FOLDER_ID` (defaults to root) |
+| Microsoft Graph | `MS_GRAPH_DRIVE_ID` and either `MS_GRAPH_ACCESS_TOKEN` or client credentials | `MS_GRAPH_FOLDER_ITEM_ID` (defaults to drive root) |
+
+Use least-privilege read access for the selected drive. Schedule the CLI/API poll with your deployment scheduler to control sync frequency. Polling is the supported MVP intake mode; webhook subscriptions are not configured. Microsoft Graph supports [change notifications](https://learn.microsoft.com/en-us/graph/api/subscription-post-subscriptions?view=graph-rest-1.0) for a later push-based integration. PDF revisions become new proposals with source metadata; reviewers decide whether to confirm them as amendments.
+
+### Renewal workflow and notice tracking
+
+Confirmed renewal tasks start in `review`. Reviewers can assign an owner and transition tasks through `needs_changes`, `pending_approval`, and `notice_in_progress`, then record an outcome as `renewed`, `terminated`, or `cancelled`. Owners can request changes and submit notice work for approval. Every transition, assignment, and comment is written to the audit trail.
+
+Create a notice draft on a task with `POST /tasks/{task_id}/notices`, including a subject, human-reviewed body, recipient, and delivery method. A reviewer must approve it before dispatch can be recorded. `POST /notices/{notice_id}/dispatch` records the sent timestamp, reference, and optional note; it does not send email or submit the notice to a vendor. Record receipt evidence with `POST /notices/{notice_id}/delivery`. Legal content and actual delivery remain under human control while Radar provides a searchable audit record. List notices with `GET /tasks/{task_id}/notices`.
 
 ## Extraction evaluation
 
@@ -312,6 +333,14 @@ See [evaluation/README.md](evaluation/README.md) for scoring details and fixture
 | `POST` | `/reminders/run` | `scheduler` or `admin`: send due reminders and escalations |
 | `GET` | `/calendar.ics` | `reviewer` or `admin`: export all tasks; `owner`: export assigned tasks |
 | `POST` | `/calendar/sync` | `reviewer` or `admin`: sync open tasks to configured Microsoft or Google calendar |
+| `POST` | `/document-sources/sync` | `reviewer`, `admin`, or `scheduler`: poll configured cloud drives |
+| `POST` | `/tasks/{task_id}/assign` | `reviewer` or `admin`: assign a task owner |
+| `POST` | `/tasks/{task_id}/transition` | `reviewer` or `admin`: advance workflow; owners can request changes or submit notice work |
+| `GET/POST` | `/tasks/{task_id}/comments` | `reviewer`, `admin`, or assigned `owner`: list/add comments |
+| `GET/POST` | `/tasks/{task_id}/notices` | `reviewer`, `admin`, or assigned `owner`: list/prepare notice drafts |
+| `POST` | `/notices/{notice_id}/approve` | `reviewer` or `admin`: approve a draft |
+| `POST` | `/notices/{notice_id}/dispatch` | `reviewer` or `admin`: record dispatch of an approved notice |
+| `POST` | `/notices/{notice_id}/delivery` | `reviewer` or `admin`: record delivery evidence |
 | `GET` | `/review` | Public UI shell; API calls require a reviewer token |
 
 OpenAPI and interactive request examples are available at `/docs` while the service is running.
@@ -356,6 +385,10 @@ OpenAPI and interactive request examples are available at `/docs` while the serv
 | `CALENDAR_PROVIDER` | unset | Optional live event sync target: `microsoft` or `google` |
 | `MS_GRAPH_*` | unset | Microsoft Graph access token or app credentials, user ID, and calendar ID |
 | `GOOGLE_CALENDAR_ACCESS_TOKEN` / `GOOGLE_CALENDAR_ID` | unset | Google Calendar access token and target calendar ID |
+| `GOOGLE_DRIVE_ACCESS_TOKEN` | unset | Google Drive token with read access to the selected source |
+| `GOOGLE_DRIVE_FOLDER_ID` | unset | Optional Google Drive folder to poll; defaults to root |
+| `MS_GRAPH_DRIVE_ID` | unset | Microsoft Graph drive identifier to poll |
+| `MS_GRAPH_FOLDER_ITEM_ID` | unset | Optional Graph folder item to poll; defaults to drive root |
 
 Copy [.env.example](.env.example) to `.env` to start configuring local integrations. Do not commit real credentials.
 

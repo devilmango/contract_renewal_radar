@@ -21,11 +21,19 @@ ROLE_SCOPES = {
         "audit:read",
         "tasks:read",
         "tasks:resolve",
+        "tasks:workflow",
+        "tasks:assign",
+        "tasks:comment",
+        "notices:create",
+        "notices:read",
+        "notices:approve",
+        "notices:dispatch",
+        "integrations:sync",
         "calendar:read",
         "calendar:sync",
     },
-    "owner": {"tasks:read", "tasks:resolve", "calendar:read"},
-    "scheduler": {"reminders:run"},
+    "owner": {"tasks:read", "tasks:resolve", "tasks:workflow", "tasks:comment", "notices:create", "notices:read", "calendar:read"},
+    "scheduler": {"reminders:run", "integrations:sync"},
 }
 
 

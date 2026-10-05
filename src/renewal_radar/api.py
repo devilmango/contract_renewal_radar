@@ -3,11 +3,10 @@ from __future__ import annotations
 import json
 import os
 import secrets
-import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-from uuid import uuid4
 
 from fastapi import Cookie, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -16,10 +15,16 @@ from .auth import AuthRegistry, Principal
 from .calendar import export_ics
 from .calendar_sync import CalendarSyncError
 from .calendar_sync import sync_calendar
-from .documents import DocumentError, extract_pdf_text
-from .extractor import ExtractionError, get_extractor
+from .documents import DocumentError
+from .drive_ingestion import DocumentSourceError, sync_document_sources
+from .extractor import ExtractionError
+from .ingestion import ingest_pdf_bytes
 from .reminders import run_reminders
-from .schemas import AuditEvent, ConfirmationRequest, ContractData, ContractRecord, ReminderTask, ResolveTaskRequest
+from .schemas import (
+    AuditEvent, ConfirmationRequest, ContractData, ContractRecord, NoticeCreateRequest,
+    NoticeDeliveryRequest, NoticeDispatchRequest, NoticeRecord, ReminderTask, ResolveTaskRequest,
+    TaskAssignmentRequest, TaskComment, TaskCommentRequest, TaskTransitionRequest,
+)
 from .store import Store
 
 
@@ -48,6 +53,15 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
     def require_scope(principal: Principal, scope: str) -> None:
         if not principal.has_scope(scope):
             raise HTTPException(status_code=403, detail=f"The authenticated user lacks the '{scope}' permission.")
+
+    def task_for_principal(task_id: str, principal: Principal):
+        row = db.get_task(task_id, principal.tenant_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Task not found")
+        owner_only = "owner" in principal.roles and not (principal.is_admin or "reviewer" in principal.roles)
+        if owner_only and (not principal.email or not row["owner_email"] or row["owner_email"].casefold() != principal.email.casefold()):
+            raise HTTPException(status_code=403, detail="Owners can access only their assigned tasks.")
+        return row
 
     @app.get("/health")
     def health() -> dict:
@@ -146,25 +160,13 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
         filename = Path(file.filename or "contract.pdf").name
         if not filename.lower().endswith(".pdf"):
             raise HTTPException(status_code=415, detail="Only PDF files are supported")
-        content = await file.read()
+        content = await file.read(25 * 1024 * 1024 + 1)
         if len(content) > 25 * 1024 * 1024:
             raise HTTPException(status_code=413, detail="PDF must be 25 MB or smaller")
-        temp_path: Path | None = None
         try:
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temp:
-                temp.write(content)
-                temp_path = Path(temp.name)
-            text, used_ocr = extract_pdf_text(temp_path)
-            extractor = get_extractor()
-            extracted = extractor.extract(text)
+            contract_id, _created = ingest_pdf_bytes(db, content, filename, principal.actor, principal.tenant_id)
         except (DocumentError, ExtractionError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        finally:
-            if temp_path:
-                temp_path.unlink(missing_ok=True)
-        provider = extractor.name + ("+ocr" if used_ocr else "")
-        contract_id = str(uuid4())
-        db.save_contract(contract_id, filename, provider, extracted, text, principal.actor, principal.tenant_id)
         return _contract_record(db.get_contract(contract_id, principal.tenant_id))
 
     @app.get("/contracts", response_model=list[ContractRecord])
@@ -227,6 +229,7 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
     @app.get("/tasks", response_model=list[ReminderTask])
     def list_tasks(
         status: str | None = Query(default=None, pattern="^(open|resolved)$"),
+        workflow_state: str | None = Query(default=None, pattern="^(review|needs_changes|pending_approval|notice_in_progress|renewed|terminated|cancelled|resolved)$"),
         principal: Principal = Depends(authenticate),
     ) -> list[ReminderTask]:
         require_scope(principal, "tasks:read")
@@ -234,6 +237,8 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
         if owner_only and not principal.email:
             raise HTTPException(status_code=403, detail="An email address is required for owner-scoped task access.")
         rows = db.list_tasks(status, owner_email=principal.email if owner_only else None, tenant_id=principal.tenant_id)
+        if workflow_state:
+            rows = [row for row in rows if row["workflow_state"] == workflow_state]
         return [_task_record(row) for row in rows]
 
     @app.post("/tasks/{task_id}/resolve", response_model=ReminderTask)
@@ -284,6 +289,115 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
         except CalendarSyncError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    @app.post("/document-sources/sync")
+    def document_source_sync(principal: Principal = Depends(authenticate)) -> dict:
+        require_scope(principal, "integrations:sync")
+        try:
+            return sync_document_sources(db, principal.tenant_id)
+        except DocumentSourceError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/tasks/{task_id}/transition", response_model=ReminderTask)
+    def transition_task(task_id: str, request: TaskTransitionRequest, principal: Principal = Depends(authenticate)) -> ReminderTask:
+        require_scope(principal, "tasks:workflow")
+        existing = task_for_principal(task_id, principal)
+        is_reviewer = principal.is_admin or "reviewer" in principal.roles
+        if not is_reviewer:
+            allowed = {
+                ("review", "needs_changes"),
+                ("notice_in_progress", "pending_approval"),
+            }
+            if (existing["workflow_state"], request.workflow_state) not in allowed:
+                raise HTTPException(status_code=403, detail="Owners can request changes or submit notice work for approval.")
+        try:
+            row = db.transition_task(task_id, request.workflow_state, principal.actor, request.comment, principal.tenant_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _task_record(row)
+
+    @app.post("/tasks/{task_id}/assign", response_model=ReminderTask)
+    def assign_task(task_id: str, request: TaskAssignmentRequest, principal: Principal = Depends(authenticate)) -> ReminderTask:
+        require_scope(principal, "tasks:assign")
+        try:
+            row = db.assign_task(task_id, request.owner_name, request.owner_email, principal.actor, principal.tenant_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not row:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return _task_record(row)
+
+    @app.get("/tasks/{task_id}/comments", response_model=list[TaskComment])
+    def get_task_comments(task_id: str, principal: Principal = Depends(authenticate)) -> list[TaskComment]:
+        require_scope(principal, "tasks:comment")
+        task_for_principal(task_id, principal)
+        return [_comment_record(row) for row in db.list_task_comments(task_id, principal.tenant_id)]
+
+    @app.post("/tasks/{task_id}/comments", response_model=TaskComment, status_code=201)
+    def add_task_comment(task_id: str, request: TaskCommentRequest, principal: Principal = Depends(authenticate)) -> TaskComment:
+        require_scope(principal, "tasks:comment")
+        task_for_principal(task_id, principal)
+        row = db.add_task_comment(task_id, request.body, principal.actor, principal.tenant_id)
+        return _comment_record(row)
+
+    @app.get("/tasks/{task_id}/notices", response_model=list[NoticeRecord])
+    def get_notices(task_id: str, principal: Principal = Depends(authenticate)) -> list[NoticeRecord]:
+        require_scope(principal, "notices:read")
+        task_for_principal(task_id, principal)
+        return [_notice_record(row) for row in db.list_notices(task_id, principal.tenant_id)]
+
+    @app.post("/tasks/{task_id}/notices", response_model=NoticeRecord, status_code=201)
+    def create_notice(task_id: str, request: NoticeCreateRequest, principal: Principal = Depends(authenticate)) -> NoticeRecord:
+        require_scope(principal, "notices:create")
+        task_for_principal(task_id, principal)
+        if request.delivery_method == "email" and "@" not in request.recipient:
+            raise HTTPException(status_code=422, detail="Email notice recipient must be an email address.")
+        try:
+            row = db.create_notice(task_id, principal.tenant_id, principal.actor, request.subject, request.body, request.recipient, request.delivery_method)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Task not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _notice_record(row)
+
+    @app.post("/notices/{notice_id}/approve", response_model=NoticeRecord)
+    def approve_notice(notice_id: str, principal: Principal = Depends(authenticate)) -> NoticeRecord:
+        require_scope(principal, "notices:approve")
+        try:
+            row = db.approve_notice(notice_id, principal.tenant_id, principal.actor)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not row:
+            raise HTTPException(status_code=404, detail="Notice not found")
+        return _notice_record(row)
+
+    @app.post("/notices/{notice_id}/dispatch", response_model=NoticeRecord)
+    def dispatch_notice(notice_id: str, request: NoticeDispatchRequest, principal: Principal = Depends(authenticate)) -> NoticeRecord:
+        require_scope(principal, "notices:dispatch")
+        sent_at = request.sent_at or datetime.now(timezone.utc)
+        if sent_at.tzinfo is None:
+            raise HTTPException(status_code=422, detail="sent_at must include a timezone.")
+        try:
+            row = db.dispatch_notice(notice_id, principal.tenant_id, principal.actor, sent_at, request.delivery_reference, request.note)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not row:
+            raise HTTPException(status_code=404, detail="Notice not found")
+        return _notice_record(row)
+
+    @app.post("/notices/{notice_id}/delivery", response_model=NoticeRecord)
+    def mark_notice_delivery(notice_id: str, request: NoticeDeliveryRequest, principal: Principal = Depends(authenticate)) -> NoticeRecord:
+        require_scope(principal, "notices:dispatch")
+        delivered_at = request.delivered_at or datetime.now(timezone.utc)
+        if delivered_at.tzinfo is None:
+            raise HTTPException(status_code=422, detail="delivered_at must include a timezone.")
+        try:
+            row = db.mark_notice_delivered(notice_id, principal.tenant_id, principal.actor, delivered_at, request.delivery_reference, request.evidence_note)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not row:
+            raise HTTPException(status_code=404, detail="Notice not found")
+        return _notice_record(row)
+
     return app
 
 
@@ -311,6 +425,21 @@ def _task_record(row) -> ReminderTask:
         tenant_id=row["tenant_id"],
         notice_day_type=row["notice_day_type"], notice_timezone=row["notice_timezone"],
         notice_holidays=json.loads(row["notice_holidays_json"]),
+        workflow_state=row["workflow_state"],
+    )
+
+
+def _comment_record(row) -> TaskComment:
+    return TaskComment(id=row["id"], task_id=row["task_id"], actor=row["actor"], body=row["body"], created_at=row["created_at"])
+
+
+def _notice_record(row) -> NoticeRecord:
+    return NoticeRecord(
+        id=row["id"], task_id=row["task_id"], status=row["status"], subject=row["subject"],
+        body=row["body"], recipient=row["recipient"], delivery_method=row["delivery_method"],
+        created_by=row["created_by"], created_at=row["created_at"], approved_by=row["approved_by"],
+        approved_at=row["approved_at"], dispatched_by=row["dispatched_by"], dispatched_at=row["dispatched_at"],
+        delivered_at=row["delivered_at"], delivery_reference=row["delivery_reference"], delivery_note=row["delivery_note"],
     )
 
 

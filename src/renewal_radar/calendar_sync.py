@@ -21,7 +21,7 @@ def sync_calendar(store: Store, tenant_id: str) -> dict[str, int | str]:
     if provider not in {"microsoft", "google"}:
         raise CalendarSyncError("Set CALENDAR_PROVIDER to 'microsoft' or 'google' to enable live sync.")
     if provider == "microsoft":
-        token = _graph_token()
+        token = graph_access_token()
         calendar_id = os.getenv("MS_GRAPH_CALENDAR_ID", "").strip()
         user_id = os.getenv("MS_GRAPH_USER_ID", "").strip()
         if not calendar_id or not user_id:
@@ -34,7 +34,7 @@ def sync_calendar(store: Store, tenant_id: str) -> dict[str, int | str]:
     return _sync_google(store, tenant_id, token, calendar_id)
 
 
-def _graph_token() -> str:
+def graph_access_token() -> str:
     token = os.getenv("MS_GRAPH_ACCESS_TOKEN", "").strip()
     if token:
         return token
