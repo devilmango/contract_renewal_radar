@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import secrets
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from fastapi import Cookie, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 
 from .auth import AuthRegistry, Principal
 from .calendar import export_ics
-from .jobs import enqueue_calendar_sync, enqueue_reminder_run, enqueue_retention_run, job_record
+from .jobs import enqueue_calendar_sync, enqueue_document_source_sync, enqueue_reminder_run, enqueue_retention_run, job_record
 from .documents import DocumentError
 from .drive_ingestion import DocumentSourceError, sync_document_sources
 from .extractor import ExtractionError
@@ -84,6 +85,10 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
     @app.get("/review", response_class=HTMLResponse, include_in_schema=False)
     def reviewer_workspace() -> HTMLResponse:
         return HTMLResponse(_REVIEWER_HTML)
+
+    @app.get("/tasks/inbox", response_class=HTMLResponse, include_in_schema=False)
+    def task_inbox() -> HTMLResponse:
+        return HTMLResponse(_TASK_INBOX_HTML)
 
     @app.get("/auth/oidc/login", include_in_schema=False)
     def oidc_login() -> RedirectResponse:
@@ -286,15 +291,18 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
     def list_tasks(
         status: str | None = Query(default=None, pattern="^(open|resolved)$"),
         workflow_state: str | None = Query(default=None, pattern="^(review|needs_changes|pending_approval|notice_in_progress|renewed|terminated|cancelled|resolved)$"),
+        due_before: date | None = Query(default=None),
+        unassigned: bool = Query(default=False),
         principal: Principal = Depends(authenticate),
     ) -> list[ReminderTask]:
         require_scope(principal, "tasks:read")
         owner_only = "owner" in principal.roles and not (principal.is_admin or "reviewer" in principal.roles)
         if owner_only and not principal.email:
             raise HTTPException(status_code=403, detail="An email address is required for owner-scoped task access.")
-        rows = db.list_tasks(status, owner_email=principal.email if owner_only else None, tenant_id=principal.tenant_id)
-        if workflow_state:
-            rows = [row for row in rows if row["workflow_state"] == workflow_state]
+        rows = db.list_tasks(
+            status, owner_email=principal.email if owner_only else None, tenant_id=principal.tenant_id,
+            workflow_state=workflow_state, due_before=due_before, unassigned=unassigned,
+        )
         return [_task_record(row) for row in rows]
 
     @app.post("/tasks/{task_id}/resolve", response_model=ReminderTask)
@@ -378,6 +386,46 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
             return sync_document_sources(db, principal.tenant_id)
         except DocumentSourceError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get("/webhooks/microsoft-graph", include_in_schema=False)
+    def graph_webhook_validation(validationToken: str = Query(...)) -> PlainTextResponse:
+        # Microsoft Graph validates a newly registered notification URL with this challenge.
+        return PlainTextResponse(validationToken, media_type="text/plain")
+
+    @app.post("/webhooks/microsoft-graph", status_code=202, include_in_schema=False)
+    def graph_webhook(payload: dict) -> dict:
+        expected = os.getenv("MS_GRAPH_WEBHOOK_CLIENT_STATE", "").strip()
+        notifications = payload.get("value") if isinstance(payload, dict) else None
+        if not expected or not isinstance(notifications, list) or not notifications:
+            raise HTTPException(status_code=503 if not expected else 400, detail="Webhook secret or notification payload is missing.")
+        if any(
+            not isinstance(item, dict) or not isinstance(item.get("clientState"), str)
+            or not secrets.compare_digest(item["clientState"], expected)
+            for item in notifications
+        ):
+            raise HTTPException(status_code=401, detail="Microsoft Graph webhook clientState is invalid.")
+        event_key = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        job = enqueue_document_source_sync(
+            db, _webhook_tenant_id(), "microsoft_graph", event_key,
+        )
+        return {"accepted": True, "job_id": job["id"]}
+
+    @app.post("/webhooks/google-drive", status_code=202, include_in_schema=False)
+    def google_drive_webhook(
+        channel_token: str | None = Header(default=None, alias="X-Goog-Channel-Token"),
+        channel_id: str | None = Header(default=None, alias="X-Goog-Channel-ID"),
+        message_number: str | None = Header(default=None, alias="X-Goog-Message-Number"),
+    ) -> dict:
+        expected = os.getenv("GOOGLE_DRIVE_WEBHOOK_TOKEN", "").strip()
+        if not expected:
+            raise HTTPException(status_code=503, detail="Google Drive webhook secret is not configured.")
+        if not channel_token or not secrets.compare_digest(channel_token, expected):
+            raise HTTPException(status_code=401, detail="Google Drive webhook token is invalid.")
+        event_key = f"{channel_id or 'unknown'}:{message_number or secrets.token_urlsafe(12)}"
+        job = enqueue_document_source_sync(
+            db, _webhook_tenant_id(), "google_drive", event_key,
+        )
+        return {"accepted": True, "job_id": job["id"]}
 
     @app.post("/tasks/{task_id}/transition", response_model=ReminderTask)
     def transition_task(task_id: str, request: TaskTransitionRequest, principal: Principal = Depends(authenticate)) -> ReminderTask:
@@ -529,16 +577,35 @@ def _secure_cookies() -> bool:
     return os.getenv("RADAR_COOKIE_SECURE", "true").strip().casefold() not in {"0", "false", "no"}
 
 
+def _webhook_tenant_id() -> str:
+    return os.getenv("DOCUMENT_SOURCE_WEBHOOK_TENANT_ID", "default").strip() or "default"
+
+
 _REVIEWER_HTML = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Renewal Radar · Review</title>
 <style>
 :root{font:15px/1.5 system-ui,sans-serif;color:#182230;background:#f3f6fa}*{box-sizing:border-box}body{margin:0}header{background:#10243a;color:white;padding:20px 28px;display:flex;justify-content:space-between;align-items:center}header h1{font-size:20px;margin:0}.bar{padding:14px 28px;background:#fff;border-bottom:1px solid #dbe2ea;display:flex;gap:8px}.shell{display:grid;grid-template-columns:300px 1fr;min-height:calc(100vh - 110px)}aside{padding:18px;border-right:1px solid #dbe2ea;background:white}.item{display:block;width:100%;text-align:left;background:#fff;border:1px solid #dbe2ea;border-radius:8px;padding:12px;margin:0 0 9px;cursor:pointer}.item:hover,.item.selected{border-color:#1677c8;background:#f2f8ff}.item small{display:block;color:#64748b;margin-top:3px}main{padding:24px;display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:20px}.panel{background:#fff;border:1px solid #dbe2ea;border-radius:10px;padding:18px;min-width:0}.panel h2{font-size:17px;margin:0 0 14px}.field{margin:0 0 11px}.field label{display:block;font-size:12px;color:#526174;font-weight:650;margin-bottom:3px}.field input,.field select{width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:6px;font:inherit}.source{white-space:pre-wrap;max-height:68vh;overflow:auto;background:#f8fafc;padding:14px;border-radius:7px;font:13px/1.6 ui-monospace,monospace}.evidence{font-size:13px;border-left:3px solid #22a06b;padding:6px 10px;margin:8px 0;background:#f4fbf7}.actions{display:flex;gap:9px;margin-top:16px}.actions button,.bar button{border:0;border-radius:6px;padding:9px 14px;font:inherit;font-weight:650;cursor:pointer}.primary{background:#1677c8;color:white}.danger{background:#fff0ef;color:#b42318}.muted{color:#667085}.status{margin-left:auto;color:#9dd8ff}#notice{margin:0;padding:0 28px;color:#b42318}.empty{padding:32px;color:#667085;text-align:center}@media(max-width:850px){.shell{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid #dbe2ea}main{grid-template-columns:1fr;padding:14px}}
 </style></head><body>
 <header><h1>◈ Renewal Radar <span class="muted" style="color:#b7c7d9">/ contract review</span></h1><span id="who" class="status">Not connected</span></header>
-<div class="bar"><input id="token" type="password" placeholder="Bearer token (optional with SSO)" aria-label="Bearer token" style="flex:1;max-width:520px;padding:8px;border:1px solid #cbd5e1;border-radius:6px"><button class="primary" onclick="connect()">Connect</button><a href="/auth/oidc/login" style="align-self:center;color:#1677c8">Sign in with SSO</a><button onclick="disconnect()">Disconnect</button></div><p id="notice" role="status"></p>
+<div class="bar"><input id="token" type="password" placeholder="Bearer token (optional with SSO)" aria-label="Bearer token" style="flex:1;max-width:520px;padding:8px;border:1px solid #cbd5e1;border-radius:6px"><button class="primary" onclick="connect()">Connect</button><a href="/auth/oidc/login" style="align-self:center;color:#1677c8">Sign in with SSO</a><a href="/tasks/inbox" style="align-self:center;color:#1677c8">Renewal task inbox →</a><button onclick="disconnect()">Disconnect</button></div><p id="notice" role="status"></p>
 <div class="shell"><aside><h2>Pending review</h2><div id="queue" class="muted">Connect to load contracts.</div></aside><main><section class="panel"><h2>Extracted terms</h2><div id="fields" class="muted">Choose a contract to inspect its proposal.</div><div id="evidence"></div><div class="actions"><button class="primary" onclick="confirmContract()">Confirm terms</button><button class="danger" onclick="rejectContract()">Reject</button></div></section><section class="panel"><h2>Contract text</h2><div id="source" class="source muted">Source text appears here.</div></section></main></div>
 <script>
 const keys=['contract','start_date','expiration_date','renewal_notice_days','notice_day_type','notice_timezone','notice_holidays','notice_method','notice_recipient','auto_renew','termination_notice','owner_name','owner_email','supersedes_contract_id'];let selected=null,contracts=[];const $=id=>document.getElementById(id);function say(s){$('notice').textContent=s}function auth(){let t=$('token').value.trim();return t?{Authorization:'Bearer '+t}:{}}function disconnect(){sessionStorage.removeItem('radar-token');$('token').value='';fetch('/auth/logout',{method:'POST'});$('who').textContent='Not connected';$('queue').textContent='Connect to load contracts.';selected=null;contracts=[]}async function connect(){if($('token').value.trim())sessionStorage.setItem('radar-token',$('token').value.trim());try{let r=await fetch('/contracts?status=pending_review',{headers:auth()});if(!r.ok)throw Error((await r.json()).detail||r.status);contracts=await r.json();$('who').textContent='Connected · '+contracts.length+' awaiting review';say('');renderQueue();if(contracts.length)openContract(contracts[0].id)}catch(e){say('Could not connect: '+e.message)}}function renderQueue(){let q=$('queue');q.replaceChildren();if(!contracts.length){q.textContent='No contracts awaiting review.';return}contracts.forEach(c=>{let b=document.createElement('button');b.className='item'+(selected===c.id?' selected':'');b.onclick=()=>openContract(c.id);let title=document.createElement('strong');title.textContent=c.extracted.contract||c.filename;let meta=document.createElement('small');meta.textContent=c.filename+' · '+new Date(c.created_at).toLocaleDateString();b.append(title,meta);q.append(b)})}async function openContract(id){selected=id;renderQueue();let c=contracts.find(x=>x.id===id);let data=c.extracted;let fields=$('fields');fields.replaceChildren();keys.forEach(k=>{let wrap=document.createElement('div');wrap.className='field';let label=document.createElement('label');label.htmlFor='f-'+k;label.textContent=k.replaceAll('_',' ')+(k==='notice_holidays'?' (comma-separated ISO dates)':k==='supersedes_contract_id'?' (active contract ID to replace)':'');let input;if(k==='notice_day_type'||k==='auto_renew'){input=document.createElement('select');let options=k==='auto_renew'?[['','Unknown'],['true','Yes'],['false','No']]:[['calendar','Calendar days'],['business','Business days']];options.forEach(([v,t])=>{let o=document.createElement('option');o.value=v;o.textContent=t;input.append(o)})}else{input=document.createElement('input');input.type=k.endsWith('_date')?'date':k==='renewal_notice_days'?'number':'text';if(k==='renewal_notice_days')input.min='0'}input.id='f-'+k;let value=data[k];input.value=value===null||value===undefined?'':k==='auto_renew'?String(value):k==='notice_holidays'?value.join(', '):String(value);wrap.append(label,input);fields.append(wrap)});let e=$('evidence');e.replaceChildren();(data.evidence||[]).forEach(item=>{let div=document.createElement('div');div.className='evidence';div.textContent=item.field+': “'+item.quote+'” · confidence '+Math.round(item.confidence*100)+'%';e.append(div)});$('source').textContent='Loading…';try{let r=await fetch('/contracts/'+id+'/source',{headers:auth()});if(!r.ok)throw Error((await r.json()).detail||r.status);$('source').textContent=(await r.json()).text}catch(err){$('source').textContent='Source unavailable: '+err.message}}function formData(){let x={};keys.forEach(k=>{let v=$('f-'+k).value;x[k]=k==='notice_holidays'?v.split(',').map(x=>x.trim()).filter(Boolean):v===''?null:k==='renewal_notice_days'?Number(v):k==='auto_renew'?v==='true'?true:v==='false'?false:null:v});x.evidence=contracts.find(c=>c.id===selected).extracted.evidence;return x}async function action(path,body){if(!selected)return say('Select a contract first.');try{let r=await fetch('/contracts/'+selected+'/'+path,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok)throw Error((await r.json()).detail||r.status);say(path==='confirm'?'Contract confirmed and renewal task created.':'Contract rejected.');contracts=contracts.filter(c=>c.id!==selected);selected=null;renderQueue();$('fields').textContent='Choose a contract to inspect its proposal.';$('source').textContent='Source text appears here.';$('evidence').replaceChildren();if(contracts.length)openContract(contracts[0].id)}catch(e){say('Could not '+path+': '+e.message)}}function confirmContract(){action('confirm',{contract:formData()})}function rejectContract(){action('reject')}const saved=sessionStorage.getItem('radar-token');if(saved){$('token').value=saved;connect()}else{connect()}
+</script></body></html>'''
+
+
+_TASK_INBOX_HTML = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Renewal Radar · Task inbox</title>
+<style>
+:root{font:15px/1.5 system-ui,sans-serif;color:#182230;background:#f3f6fa}*{box-sizing:border-box}body{margin:0}header{background:#10243a;color:#fff;padding:18px 26px;display:flex;justify-content:space-between;align-items:center}header h1{font-size:20px;margin:0}a{color:#1677c8}.bar{padding:12px 26px;background:#fff;border-bottom:1px solid #dbe2ea;display:flex;gap:9px;align-items:center;flex-wrap:wrap}.bar input{flex:1;max-width:500px;padding:8px;border:1px solid #cbd5e1;border-radius:6px}.layout{display:grid;grid-template-columns:minmax(280px,360px) 1fr;min-height:calc(100vh - 108px)}aside{padding:18px;background:#fff;border-right:1px solid #dbe2ea}.filters{display:grid;gap:9px;margin-bottom:14px}.filters select{padding:8px;border:1px solid #cbd5e1;border-radius:6px;font:inherit}.filters label{font-size:13px;color:#526174}.task{display:block;width:100%;text-align:left;border:1px solid #dbe2ea;border-radius:8px;padding:11px;margin-bottom:8px;background:#fff;cursor:pointer}.task.selected,.task:hover{border-color:#1677c8;background:#f2f8ff}.task strong,.task small{display:block}.task small{color:#64748b;margin-top:3px}.pill{display:inline-block;border-radius:99px;padding:2px 8px;background:#e9eff6;font-size:12px}.overdue{color:#b42318;background:#fff0ef}.main{padding:20px;display:grid;grid-template-columns:minmax(280px,1.05fr) minmax(280px,.95fr);gap:14px;align-content:start}.panel{background:#fff;border:1px solid #dbe2ea;border-radius:10px;padding:17px;min-width:0}.panel h2{font-size:16px;margin:0 0 12px}.panel h3{font-size:14px;margin:16px 0 6px}.panel input,.panel select,.panel textarea{width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:6px;font:inherit;margin:4px 0 9px}.panel textarea{min-height:75px;resize:vertical}.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.actions{display:flex;gap:8px;flex-wrap:wrap}button{border:0;border-radius:6px;padding:8px 12px;font:inherit;font-weight:650;cursor:pointer}.primary{background:#1677c8;color:white}.secondary{background:#e9eff6;color:#182230}.event{border-left:3px solid #9bb3ca;padding:6px 9px;margin:7px 0;background:#f8fafc;font-size:13px}.muted{color:#667085}.status{color:#a9d8f5}.empty{padding:24px;color:#667085;text-align:center}#notice{padding:6px 26px;color:#b42318;margin:0}.check{display:flex;align-items:center;gap:7px}.check input{width:auto;margin:0}@media(max-width:850px){.layout{grid-template-columns:1fr}aside{border:0;border-bottom:1px solid #dbe2ea}.main{grid-template-columns:1fr;padding:12px}}
+</style></head><body>
+<header><h1>◈ Renewal Radar / task inbox</h1><span id="who" class="status">Not connected</span></header>
+<div class="bar"><input id="token" type="password" placeholder="Bearer token (optional with SSO)" aria-label="Bearer token"><button class="primary" onclick="loadTasks()">Connect / refresh</button><a href="/auth/oidc/login">Sign in with SSO</a><a href="/review">Extraction review</a></div><p id="notice" role="status"></p>
+<div class="layout"><aside><div class="filters"><label>Workflow state<select id="state"><option value="">All open work</option><option>review</option><option>needs_changes</option><option>pending_approval</option><option>notice_in_progress</option></select></label><label class="check"><input id="due" type="checkbox">Due or overdue today</label><label class="check"><input id="unassigned" type="checkbox">Unassigned only</label><button class="secondary" onclick="loadTasks()">Apply filters</button></div><div id="queue" class="muted">Connect to load renewal tasks.</div></aside>
+<main class="main"><section class="panel"><h2 id="title">Select a task</h2><div id="summary" class="muted">Review ownership, deadlines, and workflow state.</div><div id="controls" hidden><h3>Assignment</h3><div class="grid"><input id="ownerName" placeholder="Owner name"><input id="ownerEmail" type="email" placeholder="Owner email"></div><button class="secondary" onclick="assignTask()">Save assignment</button><h3>Workflow</h3><div class="grid"><select id="nextState"><option value="review">In review</option><option value="needs_changes">Needs changes</option><option value="pending_approval">Pending approval</option><option value="notice_in_progress">Notice in progress</option><option value="renewed">Renewed</option><option value="terminated">Terminated</option><option value="cancelled">Cancelled</option></select><input id="transitionComment" placeholder="Decision note (optional)"></div><div class="actions"><button class="primary" onclick="transitionTask()">Update workflow</button><button class="secondary" onclick="resolveTask()">Resolve task</button></div><h3>Comments</h3><div id="comments"></div><textarea id="commentBody" placeholder="Add a team comment"></textarea><button class="secondary" onclick="addComment()">Add comment</button></div></section>
+<section class="panel"><h2>Task history</h2><div id="history" class="muted">Audit events appear when a task is selected.</div><h3>Notice drafts</h3><div id="notices" class="muted">No task selected.</div></section></main></div>
+<script>
+let tasks=[],selected=null;const $=id=>document.getElementById(id);function say(s){$('notice').textContent=s}function auth(){const t=$('token').value.trim()||sessionStorage.getItem('radar-token')||'';return t?{Authorization:'Bearer '+t}:{}}async function api(path,options={}){const r=await fetch(path,{...options,headers:{...auth(),...(options.headers||{})}});if(!r.ok){let e={};try{e=await r.json()}catch{}throw Error(e.detail||r.status)}return r.status===204?null:r.json()}function localDate(){const d=new Date();return new Date(d.getTime()-d.getTimezoneOffset()*60000).toISOString().slice(0,10)}async function loadTasks(){try{if($('token').value.trim())sessionStorage.setItem('radar-token',$('token').value.trim());const q=new URLSearchParams({status:'open'});if($('state').value)q.set('workflow_state',$('state').value);if($('due').checked)q.set('due_before',localDate());if($('unassigned').checked)q.set('unassigned','true');tasks=await api('/tasks?'+q);$('who').textContent=tasks.length+' open task'+(tasks.length===1?'':'s');say('');renderQueue();if(selected&&tasks.some(t=>t.id===selected))openTask(selected);else if(tasks.length)openTask(tasks[0].id);else clearTask()}catch(e){say('Could not load tasks: '+e.message)}}function renderQueue(){const q=$('queue');q.replaceChildren();if(!tasks.length){q.textContent='No tasks match these filters.';q.className='empty';return}q.className='';for(const t of tasks){const b=document.createElement('button');b.className='task'+(t.id===selected?' selected':'');b.onclick=()=>openTask(t.id);const s=document.createElement('strong');s.textContent=t.title;const d=document.createElement('small');d.textContent='Due '+t.due_date+' · '+(t.owner_name||t.owner_email||'Unassigned');const p=document.createElement('span');p.className='pill'+(t.due_date<localDate()?' overdue':'');p.textContent=t.workflow_state.replaceAll('_',' ');b.append(s,d,p);q.append(b)}}function clearTask(){selected=null;$('title').textContent='Select a task';$('summary').textContent='No open tasks match these filters.';$('controls').hidden=true;$('history').textContent='';$('notices').textContent='';renderQueue()}async function openTask(id){selected=id;renderQueue();const t=tasks.find(x=>x.id===id);$('title').textContent=t.title;$('summary').textContent='Notice deadline '+t.due_date+' · Contract expiration '+t.expiration_date+' · '+(t.owner_email||'Unassigned');$('controls').hidden=false;$('ownerName').value=t.owner_name||'';$('ownerEmail').value=t.owner_email||'';$('nextState').value=t.workflow_state;$('transitionComment').value='';try{const [comments,notices]=await Promise.all([api('/tasks/'+id+'/comments'),api('/tasks/'+id+'/notices')]);let events=[];try{events=await api('/contracts/'+t.contract_id+'/audit')}catch{}renderEvents('comments',comments.map(c=>({title:c.actor+' · '+new Date(c.created_at).toLocaleString(),detail:c.body})));renderEvents('history',events.slice(-20).reverse().map(e=>({title:e.event_type.replaceAll('.',' · ')+' · '+e.actor+' · '+new Date(e.created_at).toLocaleString(),detail:JSON.stringify(e.details)})));renderEvents('notices',notices.map(n=>({title:n.status+' · '+n.subject,detail:n.recipient+' · '+n.delivery_method})));}catch(e){say('Could not load task history: '+e.message)}}function renderEvents(id,events){const el=$(id);el.replaceChildren();if(!events.length){el.textContent='No history yet.';el.className='muted';return}el.className='';for(const event of events){const div=document.createElement('div');div.className='event';const strong=document.createElement('strong');strong.textContent=event.title;const detail=document.createElement('div');detail.textContent=event.detail;div.append(strong,detail);el.append(div)}}async function assignTask(){try{await api('/tasks/'+selected+'/assign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({owner_name:$('ownerName').value||null,owner_email:$('ownerEmail').value||null})});say('Assignment saved.');await loadTasks()}catch(e){say('Could not assign task: '+e.message)}}async function transitionTask(){try{await api('/tasks/'+selected+'/transition',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workflow_state:$('nextState').value,comment:$('transitionComment').value||null})});say('Workflow updated.');selected=null;await loadTasks()}catch(e){say('Could not update workflow: '+e.message)}}async function resolveTask(){if(!confirm('Resolve this renewal task?'))return;try{await api('/tasks/'+selected+'/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({comment:$('transitionComment').value||null})});say('Task resolved.');selected=null;await loadTasks()}catch(e){say('Could not resolve task: '+e.message)}}async function addComment(){try{await api('/tasks/'+selected+'/comments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({body:$('commentBody').value})});$('commentBody').value='';say('Comment added.');await openTask(selected)}catch(e){say('Could not add comment: '+e.message)}}const saved=sessionStorage.getItem('radar-token');if(saved)$('token').value=saved;loadTasks();
 </script></body></html>'''
 
 

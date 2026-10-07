@@ -34,6 +34,21 @@ def test_tenant_scoped_contract_and_task_records(tmp_path):
     assert store.list_tasks(tenant_id="tenant-b") == []
 
 
+def test_task_inbox_filters_by_state_deadline_and_assignment(tmp_path):
+    store = Store(str(tmp_path / "radar.db"))
+    _, overdue_id = create_task(store, "acme")
+    store.assign_task(overdue_id, None, None, "reviewer", "acme")
+    _, later_id = create_task(store, "acme-later")
+    store.assign_task(later_id, "Legal Owner", "owner@example.com", "reviewer", "acme-later")
+
+    overdue = store.list_tasks(
+        status="open", tenant_id="acme", workflow_state="review", due_before=date(2026, 1, 1), unassigned=True,
+    )
+    assert [row["id"] for row in overdue] == [overdue_id]
+    assert store.list_tasks(status="open", tenant_id="acme", due_before=date(2025, 1, 1)) == []
+    assert store.list_tasks(status="open", tenant_id="acme-later", unassigned=True) == []
+
+
 def test_workflow_transitions_comments_and_assignment_are_audited(tmp_path):
     store = Store(str(tmp_path / "radar.db"))
     contract_id, task_id = create_task(store)

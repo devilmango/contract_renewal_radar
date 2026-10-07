@@ -18,12 +18,14 @@ class DocumentSourceError(RuntimeError):
     pass
 
 
-def sync_document_sources(store: Store, tenant_id: str) -> dict:
+def sync_document_sources(store: Store, tenant_id: str, provider: str | None = None) -> dict:
     """Poll configured Google Drive and Microsoft Graph delta feeds for PDF changes."""
     results = []
-    if os.getenv("GOOGLE_DRIVE_ACCESS_TOKEN"):
+    if provider not in {None, "google_drive", "microsoft_graph"}:
+        raise DocumentSourceError(f"Unsupported document source provider: {provider}")
+    if provider in {None, "google_drive"} and os.getenv("GOOGLE_DRIVE_ACCESS_TOKEN"):
         results.append(_sync_google_drive(store, tenant_id))
-    graph_configured = os.getenv("MS_GRAPH_DRIVE_ID") and any(
+    graph_configured = provider in {None, "microsoft_graph"} and os.getenv("MS_GRAPH_DRIVE_ID") and any(
         os.getenv(key) for key in ("MS_GRAPH_ACCESS_TOKEN", "MS_GRAPH_CLIENT_ID")
     )
     if graph_configured:

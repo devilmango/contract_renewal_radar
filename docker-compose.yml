@@ -6,7 +6,8 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_PATH: /data/renewal_radar.db
+      DATABASE_PATH: ${DATABASE_PATH:-/data/renewal_radar.db}
+      DATABASE_URL: ${DATABASE_URL:-}
     volumes:
       - renewal-radar-data:/data
 

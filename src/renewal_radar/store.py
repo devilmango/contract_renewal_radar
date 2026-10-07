@@ -20,14 +20,46 @@ def iso(value: datetime | date | None) -> str | None:
     return value.isoformat() if value else None
 
 
+class _PostgresConnection:
+    """Small DB-API adapter for the SQLite-shaped queries used by Store."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __enter__(self):
+        self.connection.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return self.connection.__exit__(exc_type, exc, traceback)
+
+    def execute(self, sql: str, params=()):
+        return self.connection.execute(sql.replace("?", "%s"), params)
+
+    def executescript(self, script: str) -> None:
+        for statement in script.split(";"):
+            if statement.strip():
+                self.execute(statement)
+
+
 class Store:
     def __init__(self, path: str | None = None):
-        self.path = path or os.getenv("DATABASE_PATH", "renewal_radar.db")
-        if self.path != ":memory:":
+        self.path = path or os.getenv("DATABASE_URL") or os.getenv("DATABASE_PATH", "renewal_radar.db")
+        self.is_postgres = self.path.startswith(("postgres://", "postgresql://"))
+        if not self.is_postgres and self.path != ":memory:":
             Path(self.path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
 
-    def connect(self) -> sqlite3.Connection:
+    def connect(self):
+        if self.is_postgres:
+            try:
+                import psycopg
+                from psycopg.rows import dict_row
+            except ImportError as exc:
+                raise RuntimeError(
+                    "PostgreSQL support requires the 'database' extra: pip install '.[database]'"
+                ) from exc
+            return _PostgresConnection(psycopg.connect(self.path, row_factory=dict_row))
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
@@ -35,8 +67,7 @@ class Store:
 
     def initialize(self) -> None:
         with self.connect() as db:
-            db.executescript(
-                """
+            schema = """
                 CREATE TABLE IF NOT EXISTS contracts (
                     id TEXT PRIMARY KEY,
                     filename TEXT NOT NULL,
@@ -173,20 +204,30 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, due_date);
                 CREATE INDEX IF NOT EXISTS idx_audit_contract ON audit_events(contract_id, id);
                 """
-            )
+            if self.is_postgres:
+                schema = schema.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+            db.executescript(schema)
             # Upgrade databases created by earlier versions without dropping data.
             for table in ("contracts", "tasks", "audit_events"):
-                columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
-                if "tenant_id" not in columns:
-                    db.execute(f"ALTER TABLE {table} ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
-                if table == "tasks" and "notice_day_type" not in columns:
-                    db.execute("ALTER TABLE tasks ADD COLUMN notice_day_type TEXT NOT NULL DEFAULT 'calendar'")
-                if table == "tasks" and "notice_timezone" not in columns:
-                    db.execute("ALTER TABLE tasks ADD COLUMN notice_timezone TEXT NOT NULL DEFAULT 'UTC'")
-                if table == "tasks" and "notice_holidays_json" not in columns:
-                    db.execute("ALTER TABLE tasks ADD COLUMN notice_holidays_json TEXT NOT NULL DEFAULT '[]'")
-                if table == "tasks" and "workflow_state" not in columns:
-                    db.execute("ALTER TABLE tasks ADD COLUMN workflow_state TEXT NOT NULL DEFAULT 'review'")
+                if self.is_postgres:
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default'")
+                    if table == "tasks":
+                        db.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS notice_day_type TEXT NOT NULL DEFAULT 'calendar'")
+                        db.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS notice_timezone TEXT NOT NULL DEFAULT 'UTC'")
+                        db.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS notice_holidays_json TEXT NOT NULL DEFAULT '[]'")
+                        db.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS workflow_state TEXT NOT NULL DEFAULT 'review'")
+                else:
+                    columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+                    if "tenant_id" not in columns:
+                        db.execute(f"ALTER TABLE {table} ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
+                    if table == "tasks" and "notice_day_type" not in columns:
+                        db.execute("ALTER TABLE tasks ADD COLUMN notice_day_type TEXT NOT NULL DEFAULT 'calendar'")
+                    if table == "tasks" and "notice_timezone" not in columns:
+                        db.execute("ALTER TABLE tasks ADD COLUMN notice_timezone TEXT NOT NULL DEFAULT 'UTC'")
+                    if table == "tasks" and "notice_holidays_json" not in columns:
+                        db.execute("ALTER TABLE tasks ADD COLUMN notice_holidays_json TEXT NOT NULL DEFAULT '[]'")
+                    if table == "tasks" and "workflow_state" not in columns:
+                        db.execute("ALTER TABLE tasks ADD COLUMN workflow_state TEXT NOT NULL DEFAULT 'review'")
             db.execute("CREATE INDEX IF NOT EXISTS idx_contract_tenant ON contracts(tenant_id, status)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_task_tenant ON tasks(tenant_id, status, due_date)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_ready ON jobs(status, available_at, created_at)")
@@ -326,21 +367,31 @@ class Store:
         with self.connect() as db:
             return db.execute("SELECT * FROM audit_events WHERE contract_id=? AND tenant_id=? ORDER BY id", (contract_id, tenant_id)).fetchall()
 
-    def list_tasks(self, status: str | None = None, owner_email: str | None = None, tenant_id: str = "default") -> list[sqlite3.Row]:
+    def list_tasks(
+        self, status: str | None = None, owner_email: str | None = None,
+        tenant_id: str = "default", workflow_state: str | None = None,
+        due_before: date | None = None, unassigned: bool = False,
+    ) -> list[sqlite3.Row]:
         with self.connect() as db:
-            if owner_email is not None and status:
-                return db.execute(
-                    "SELECT * FROM tasks WHERE tenant_id=? AND status=? AND lower(owner_email)=lower(?) ORDER BY due_date",
-                    (tenant_id, status, owner_email),
-                ).fetchall()
-            if owner_email is not None:
-                return db.execute(
-                    "SELECT * FROM tasks WHERE tenant_id=? AND lower(owner_email)=lower(?) ORDER BY due_date",
-                    (tenant_id, owner_email),
-                ).fetchall()
+            clauses = ["tenant_id=?"]
+            params: list[Any] = [tenant_id]
             if status:
-                return db.execute("SELECT * FROM tasks WHERE tenant_id=? AND status=? ORDER BY due_date", (tenant_id, status)).fetchall()
-            return db.execute("SELECT * FROM tasks WHERE tenant_id=? ORDER BY due_date", (tenant_id,)).fetchall()
+                clauses.append("status=?")
+                params.append(status)
+            if owner_email is not None:
+                clauses.append("lower(owner_email)=lower(?)")
+                params.append(owner_email)
+            if workflow_state:
+                clauses.append("workflow_state=?")
+                params.append(workflow_state)
+            if due_before:
+                clauses.append("due_date<=?")
+                params.append(due_before.isoformat())
+            if unassigned:
+                clauses.append("(owner_email IS NULL OR trim(owner_email)='')")
+            return db.execute(
+                f"SELECT * FROM tasks WHERE {' AND '.join(clauses)} ORDER BY due_date", tuple(params),
+            ).fetchall()
 
     def get_task(self, task_id: str, tenant_id: str = "default") -> sqlite3.Row | None:
         with self.connect() as db:
@@ -374,8 +425,8 @@ class Store:
             if cutoff is None:
                 return db.execute("SELECT * FROM tasks WHERE tenant_id=? AND status='open' AND reminder_sent_at IS NOT NULL AND escalated_at IS NULL", (tenant_id,)).fetchall()
             if tenant_id is None:
-                return db.execute("SELECT * FROM tasks WHERE status='open' AND reminder_sent_at IS NOT NULL AND escalated_at IS NULL AND date(reminder_sent_at) <= ?", (cutoff.isoformat(),)).fetchall()
-            return db.execute("SELECT * FROM tasks WHERE tenant_id=? AND status='open' AND reminder_sent_at IS NOT NULL AND escalated_at IS NULL AND date(reminder_sent_at) <= ?", (tenant_id, cutoff.isoformat())).fetchall()
+                return db.execute("SELECT * FROM tasks WHERE status='open' AND reminder_sent_at IS NOT NULL AND escalated_at IS NULL AND substr(reminder_sent_at,1,10) <= ?", (cutoff.isoformat(),)).fetchall()
+            return db.execute("SELECT * FROM tasks WHERE tenant_id=? AND status='open' AND reminder_sent_at IS NOT NULL AND escalated_at IS NULL AND substr(reminder_sent_at,1,10) <= ?", (tenant_id, cutoff.isoformat())).fetchall()
 
     def resolve_task(self, task_id: str, actor: str, comment: str | None, tenant_id: str = "default") -> sqlite3.Row | None:
         with self.connect() as db:
@@ -430,11 +481,12 @@ class Store:
             if not task:
                 return None
             cursor = db.execute(
-                "INSERT INTO task_comments (task_id, tenant_id, actor, body, created_at) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO task_comments (task_id, tenant_id, actor, body, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id",
                 (task_id, tenant_id, actor, body, utc_now().isoformat()),
             )
-            self.add_audit(db, task["contract_id"], "task.comment_added", actor, {"task_id": task_id, "comment_id": cursor.lastrowid}, tenant_id)
-            return db.execute("SELECT * FROM task_comments WHERE id=?", (cursor.lastrowid,)).fetchone()
+            comment_id = cursor.fetchone()["id"]
+            self.add_audit(db, task["contract_id"], "task.comment_added", actor, {"task_id": task_id, "comment_id": comment_id}, tenant_id)
+            return db.execute("SELECT * FROM task_comments WHERE id=?", (comment_id,)).fetchone()
 
     def list_task_comments(self, task_id: str, tenant_id: str) -> list[sqlite3.Row]:
         with self.connect() as db:
@@ -581,7 +633,10 @@ class Store:
         stamp = now.isoformat()
         lease_until = datetime.fromtimestamp(now.timestamp() + lease_seconds, timezone.utc).isoformat()
         with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
+            if self.is_postgres:
+                db.execute("BEGIN")
+            else:
+                db.execute("BEGIN IMMEDIATE")
             db.execute(
                 "UPDATE jobs SET status='dead', last_error=COALESCE(last_error, 'Worker lease expired after max attempts'), "
                 "lease_owner=NULL, lease_expires_at=NULL, updated_at=?, completed_at=? "
@@ -591,12 +646,14 @@ class Store:
             ready = "((status='queued' AND available_at<=?) OR (status='running' AND lease_expires_at<=? AND attempts<max_attempts))"
             if job_id:
                 row = db.execute(
-                    f"SELECT * FROM jobs WHERE id=? AND {ready} ORDER BY available_at, created_at LIMIT 1",
+                    f"SELECT * FROM jobs WHERE id=? AND {ready} ORDER BY available_at, created_at LIMIT 1"
+                    + (" FOR UPDATE SKIP LOCKED" if self.is_postgres else ""),
                     (job_id, stamp, stamp),
                 ).fetchone()
             else:
                 row = db.execute(
-                    f"SELECT * FROM jobs WHERE {ready} ORDER BY available_at, created_at LIMIT 1", (stamp, stamp),
+                    f"SELECT * FROM jobs WHERE {ready} ORDER BY available_at, created_at LIMIT 1"
+                    + (" FOR UPDATE SKIP LOCKED" if self.is_postgres else ""), (stamp, stamp),
                 ).fetchone()
             if not row:
                 return None

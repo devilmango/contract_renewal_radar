@@ -40,16 +40,17 @@ An extraction is always a proposal. The service does not activate a contract or 
 - **Reminder and escalation runner:** Send one reminder when the task is due and one escalation if it remains open after the configured delay.
 - **Calendar export:** Download open tasks in iCalendar format.
 - **Live calendar sync:** Upsert renewal events in Microsoft 365 or Google Calendar and remove events for resolved tasks.
-- **Cloud document intake:** Poll Google Drive and Microsoft Graph drive delta feeds for new or revised PDFs, with revision deduplication and source links.
+- **Cloud document intake:** Poll Google Drive and Microsoft Graph delta feeds or receive push notifications that queue delta reconciliation, with revision deduplication and source links.
 - **Renewal workflow:** Move tasks through review, change requests, approval, notice work, renewal, termination, and cancellation with permission checks and audit history.
 - **Notice preparation and delivery evidence:** Draft notice content, require reviewer approval, record dispatch details, and attach delivery confirmation evidence.
-- **Durable background jobs:** Persist reminder, calendar-sync, and retention work with deduplication keys, worker leases, bounded retries, and dead-letter recovery.
+- **Durable background jobs:** Persist reminder, calendar-sync, document-reconciliation, and retention work with deduplication keys, worker leases, bounded retries, and dead-letter recovery.
+- **Reviewer task inbox:** Filter upcoming work by workflow stage, deadline, and assignment; assign owners, update workflow, comment, resolve, and inspect contract history and notice drafts.
 - **Contract-data governance:** Enforce an LLM provider allowlist, record authenticated access history, support legal holds, and redact eligible contract records on demand or by retention policy.
 - **Evidence-quality evaluation:** Measure whether field values are supported by their evidence, track synthetic and OCR fixture results separately, and gate evidence quality in CI.
 - **Organization isolation:** Contract, task, source text, audit, and calendar records are scoped by tenant ID.
 - **OIDC token validation:** Verify signed RS256 or ES256 JWT access tokens against configured issuer, audience, and JWKS settings.
 - **Audit trail:** Record ingestion, confirmation, rejection, task creation, notifications, escalation, and resolution.
-- **Self-hosted storage:** Persist records in SQLite; run directly with Python or with Docker Compose.
+- **Self-hosted storage:** Persist records in SQLite for a single host or PostgreSQL for multi-instance API and worker deployments; run directly with Python or with Docker Compose.
 
 ## Example
 
@@ -274,18 +275,22 @@ Reviewers and administrators also manage assignments, workflow transitions, comm
 
 Set `CALENDAR_PROVIDER=microsoft` or `google`. Microsoft accepts a short-lived `MS_GRAPH_ACCESS_TOKEN` or client credentials (`MS_GRAPH_TENANT_ID`, `MS_GRAPH_CLIENT_ID`, `MS_GRAPH_CLIENT_SECRET`), plus `MS_GRAPH_USER_ID` and `MS_GRAPH_CALENDAR_ID`. Google uses `GOOGLE_CALENDAR_ACCESS_TOKEN` and `GOOGLE_CALENDAR_ID`; provide a current access token through a secret manager or token broker. Limit provider permissions to the intended calendar.
 
-Call `POST /calendar/sync` after configuration to enqueue a sync job. The worker creates or updates open task events and removes events when tasks are resolved or superseded. Event IDs are retained in SQLite and synchronization actions are recorded in the contract audit trail. ICS export remains available for clients that do not need live updates.
+Call `POST /calendar/sync` after configuration to enqueue a sync job. The worker creates or updates open task events and removes events when tasks are resolved or superseded. Event IDs are retained in the configured database and synchronization actions are recorded in the contract audit trail. ICS export remains available for clients that do not need live updates.
 
 ### Cloud document intake
 
-Radar can poll a Google Drive folder or Microsoft Graph drive folder and ingest PDF files into the same extraction and human-review flow as direct uploads. Configure a provider in `.env`, then run `renewal-radar sync-documents --tenant-id acme` or call `POST /document-sources/sync` with an administrator, reviewer, or scheduler token. The poller stores provider cursors and source revisions in SQLite, so repeat runs do not create duplicate proposals. Google Drive uses its [changes feed](https://developers.google.com/workspace/drive/api/guides/manage-changes); Microsoft Graph uses [drive delta](https://learn.microsoft.com/graph/api/driveitem-delta).
+Radar can poll a Google Drive folder or Microsoft Graph drive folder and ingest PDF files into the same extraction and human-review flow as direct uploads. Configure a provider in `.env`, then run `renewal-radar sync-documents --tenant-id acme` or call `POST /document-sources/sync` with an administrator, reviewer, or scheduler token. The poller stores provider cursors and source revisions in the configured database, so repeat runs do not create duplicate proposals. Google Drive uses its [changes feed](https://developers.google.com/workspace/drive/api/guides/manage-changes); Microsoft Graph uses [drive delta](https://learn.microsoft.com/graph/api/driveitem-delta).
 
 | Provider | Required settings | Optional folder setting |
 | --- | --- | --- |
 | Google Drive | `GOOGLE_DRIVE_ACCESS_TOKEN` | `GOOGLE_DRIVE_FOLDER_ID` (defaults to root) |
 | Microsoft Graph | `MS_GRAPH_DRIVE_ID` and either `MS_GRAPH_ACCESS_TOKEN` or client credentials | `MS_GRAPH_FOLDER_ITEM_ID` (defaults to drive root) |
 
-Use least-privilege read access for the selected drive. Schedule the CLI/API poll with your deployment scheduler to control sync frequency. Polling is the supported MVP intake mode; webhook subscriptions are not configured. Microsoft Graph supports [change notifications](https://learn.microsoft.com/en-us/graph/api/subscription-post-subscriptions?view=graph-rest-1.0) for a later push-based integration. PDF revisions become new proposals with source metadata; reviewers decide whether to confirm them as amendments.
+Use least-privilege read access for the selected drive. Polling remains supported and should be scheduled as a reconciliation safety net. To use push callbacks, register `/webhooks/google-drive` as a Google Drive watch channel address or `/webhooks/microsoft-graph` as a Microsoft Graph notification URL, and set `GOOGLE_DRIVE_WEBHOOK_TOKEN` or `MS_GRAPH_WEBHOOK_CLIENT_STATE` to the matching high-entropy shared secret. Configure `DOCUMENT_SOURCE_WEBHOOK_TENANT_ID` for the tenant whose provider credentials and delta cursors should be used. Microsoft Graph's validation challenge is handled by the callback URL; callback notifications are authenticated with `clientState`. Google callbacks validate `X-Goog-Channel-Token`. Valid notifications enqueue durable delta-feed reconciliation jobs; they do not contain contract content and are safe to retry. Run `renewal-radar process-jobs --loop` to process those jobs. Provider subscriptions and their expiration/renewal remain managed by your integration deployment; keep the scheduled poller enabled to recover after missed, expired, or delayed notifications. PDF revisions become new proposals with source metadata; reviewers decide whether to confirm them as amendments.
+
+### Reviewer task inbox
+
+Open `/tasks/inbox` to work from the renewal queue, or use the **Renewal task inbox** link in `/review`. The inbox supports workflow-state, due-today/overdue, and unassigned filters. Reviewers can assign owners, update workflow state, resolve tasks, add comments, and inspect the contract audit history and notice drafts. Owners see only tasks assigned to their authenticated email and can use the permitted comment/workflow actions. Filtering is also available through `GET /tasks` with `workflow_state`, `due_before=YYYY-MM-DD`, and `unassigned=true` query parameters.
 
 ### Renewal workflow and notice tracking
 
@@ -295,9 +300,9 @@ Create a notice draft on a task with `POST /tasks/{task_id}/notices`, including 
 
 ### Durable jobs
 
-Reminder runs, live calendar synchronization, and retention sweeps are stored in the configured SQLite database as jobs. Enqueue operations return a job ID; workers claim jobs using a database transaction and expiring lease, persist outcomes, and retry failures with bounded exponential backoff. An expired lease makes interrupted work eligible for another worker. Exhausted jobs remain visible in the dead-letter state for review and administrator retry. Run a separate worker process under a supervisor with `renewal-radar process-jobs --loop --limit 20`.
+Reminder runs, live calendar synchronization, document-source reconciliation, and retention sweeps are stored in the configured database as jobs. Enqueue operations return a job ID; workers claim jobs using a database transaction and expiring lease, persist outcomes, and retry failures with bounded exponential backoff. PostgreSQL workers claim jobs using `FOR UPDATE SKIP LOCKED` so multiple worker processes can safely share the queue. An expired lease makes interrupted work eligible for another worker. Exhausted jobs remain visible in the dead-letter state for review and administrator retry. Run a separate worker process under a supervisor with `renewal-radar process-jobs --loop --limit 20`.
 
-The queue is durable across process restarts and supports a separate worker process. SQLite still serializes writers and is intended for a single host; use a managed database and queue service before scaling workers across hosts. SMTP is at-least-once around process crashes: the stable message ID helps downstream deduplication, but SMTP itself does not guarantee exactly-once delivery.
+The queue is durable across process restarts and supports a separate worker process. SQLite still serializes writers and is intended for a single host. To use PostgreSQL, install `pip install -e '.[database]'` and set `DATABASE_URL` (for example, `postgresql://radar:secret@db:5432/radar`); it takes precedence over `DATABASE_PATH`. The service creates its schema idempotently and applies additive compatibility upgrades at startup. Use a managed PostgreSQL service, backups, and a tested restore procedure for production. SMTP is at-least-once around process crashes: the stable message ID helps downstream deduplication, but SMTP itself does not guarantee exactly-once delivery.
 
 ### Data governance
 
@@ -351,7 +356,7 @@ See [evaluation/README.md](evaluation/README.md) for scoring details and fixture
 | `POST` | `/contracts/{contract_id}/confirm` | `reviewer` or `admin`: confirm terms and create a task |
 | `POST` | `/contracts/{contract_id}/reject` | `reviewer` or `admin`: reject a pending proposal |
 | `GET` | `/contracts/{contract_id}/audit` | `reviewer` or `admin`: read contract event history |
-| `GET` | `/tasks?status=open\|resolved` | `reviewer` or `admin`: list all tasks; `owner`: list assigned tasks |
+| `GET` | `/tasks?status=open\|resolved` | `reviewer` or `admin`: list all tasks; `owner`: list assigned tasks; filter with `workflow_state`, `due_before`, or `unassigned` |
 | `POST` | `/tasks/{task_id}/resolve` | `reviewer` or `admin`: resolve any task; `owner`: resolve assigned tasks |
 | `POST` | `/reminders/run` | `scheduler` or `admin`: enqueue a durable reminder job (202) |
 | `GET` | `/jobs` or `/jobs/{job_id}` | `reviewer`, `scheduler`, or `admin`: inspect tenant jobs |
@@ -368,6 +373,9 @@ See [evaluation/README.md](evaluation/README.md) for scoring details and fixture
 | `POST` | `/notices/{notice_id}/dispatch` | `reviewer` or `admin`: record dispatch of an approved notice |
 | `POST` | `/notices/{notice_id}/delivery` | `reviewer` or `admin`: record delivery evidence |
 | `GET` | `/review` | Public UI shell; API calls require a reviewer token |
+| `GET` | `/tasks/inbox` | Public UI shell; API calls require task permissions |
+| `POST` | `/webhooks/google-drive` | Google Drive push callback; requires configured channel token |
+| `GET/POST` | `/webhooks/microsoft-graph` | Graph validation challenge and push callback; requires configured `clientState` |
 
 OpenAPI and interactive request examples are available at `/docs` while the service is running.
 
@@ -376,6 +384,7 @@ OpenAPI and interactive request examples are available at `/docs` while the serv
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DATABASE_PATH` | `renewal_radar.db` | SQLite database location |
+| `DATABASE_URL` | unset | PostgreSQL connection URL; overrides `DATABASE_PATH` and requires the `database` extra |
 | `RADAR_AUTH_USERS_JSON` | `[]` | Array of actor, token SHA-256 digest, role list, and optional email records |
 | `OIDC_JWKS_URL` | unset | Enables verification of upstream RS256/ES256 JWT access tokens |
 | `OIDC_ISSUER` / `OIDC_AUDIENCE` | unset | Required OIDC token issuer and API audience |
@@ -420,6 +429,9 @@ OpenAPI and interactive request examples are available at `/docs` while the serv
 | `GOOGLE_DRIVE_FOLDER_ID` | unset | Optional Google Drive folder to poll; defaults to root |
 | `MS_GRAPH_DRIVE_ID` | unset | Microsoft Graph drive identifier to poll |
 | `MS_GRAPH_FOLDER_ITEM_ID` | unset | Optional Graph folder item to poll; defaults to drive root |
+| `GOOGLE_DRIVE_WEBHOOK_TOKEN` | unset | Shared token expected in the Google Drive callback's `X-Goog-Channel-Token` header |
+| `MS_GRAPH_WEBHOOK_CLIENT_STATE` | unset | Shared `clientState` value required on every Graph notification |
+| `DOCUMENT_SOURCE_WEBHOOK_TENANT_ID` | `default` | Tenant whose configured source credentials and delta cursors are reconciled by webhook-triggered jobs |
 
 Copy [.env.example](.env.example) to `.env` to start configuring local integrations. Do not commit real credentials.
 
@@ -456,11 +468,11 @@ contract_renewal_radar/
 - The deterministic fallback uses patterns, not legal-language understanding. It will not reliably interpret every contract or extract every clause.
 - The LLM path can misread contract language. Evidence quotes are provided to help the reviewer check each proposal against the source.
 - Human confirmation is a required workflow boundary, not an optional quality check.
-- SQLite is intended for a single host. The job queue supports separate workers and lease recovery, but use a managed database and queue service before scaling across hosts.
+- SQLite is intended for a single host. PostgreSQL enables shared multi-instance API/worker storage, but production deployments still need managed database operations, backups, and restore testing.
 - OIDC login uses a short-lived ID-token session and does not refresh expired sessions or provision users. Configure role and tenant claims at the identity provider; users sign in again after token expiration.
 - Business-day counting skips weekends and reviewer-entered holidays. Holiday calendars vary by contract and jurisdiction; reviewers must enter applicable dates before confirming a business-day clause.
 - Calendar access tokens need rotation. Use a secret manager or token broker and least-privilege permissions for the target calendar.
-- Tenant isolation is enforced by application queries in SQLite. For regulated multi-customer deployments, review the hosting boundary and consider separate databases per organization.
+- Tenant isolation is enforced by application queries. For regulated multi-customer deployments, review the hosting boundary and consider separate databases per organization. Webhook receiver routes currently use one configured `DOCUMENT_SOURCE_WEBHOOK_TENANT_ID`; deploy separate callback configuration or add tenant-aware subscription provisioning before using a shared receiver for multiple organizations.
 - When an external LLM provider is enabled, extracted contract text is sent to that provider's API. Review its data handling, retention, and contractual terms before processing confidential agreements.
 - The reminder runner sends the first notification on or after the calculated task date. Run it on a reliable schedule to avoid missed notifications.
 

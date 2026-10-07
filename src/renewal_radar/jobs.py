@@ -43,6 +43,17 @@ def enqueue_retention_run(store: Store, tenant_id: str, retention_days: int) -> 
     return job_record(row)
 
 
+def enqueue_document_source_sync(store: Store, tenant_id: str, provider: str, event_key: str) -> dict:
+    """Queue delta reconciliation after a validated provider notification."""
+    row = store.enqueue_job(
+        tenant_id, "document_sources.sync", {"tenant_id": tenant_id, "provider": provider},
+        f"document-source:{provider}:{event_key}", max_attempts=_max_attempts(),
+    )
+    if row["status"] == "dead":
+        row = store.retry_dead_job(row["id"], tenant_id) or row
+    return job_record(row)
+
+
 def process_jobs(store: Store, limit: int = 20, worker_id: str | None = None, job_id: str | None = None) -> dict[str, int]:
     worker = worker_id or f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
     processed = succeeded = retried = dead = 0
@@ -60,6 +71,9 @@ def process_jobs(store: Store, limit: int = 20, worker_id: str | None = None, jo
                 result = sync_calendar(store, job["tenant_id"])
             elif job["job_type"] == "retention.purge":
                 result = {"contracts_redacted": store.redact_expired_contracts(int(payload["retention_days"]), tenant_id=job["tenant_id"])}
+            elif job["job_type"] == "document_sources.sync":
+                from .drive_ingestion import sync_document_sources
+                result = sync_document_sources(store, job["tenant_id"], provider=payload["provider"])
             else:
                 raise ValueError(f"Unsupported job type: {job['job_type']}")
             if store.complete_job(job["id"], worker, result):

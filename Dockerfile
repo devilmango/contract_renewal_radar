@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir '.[database]'
 
 RUN useradd --create-home --uid 10001 radar && mkdir -p /data && chown radar:radar /data
 USER radar
