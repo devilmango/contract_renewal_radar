@@ -18,12 +18,13 @@ from .jobs import enqueue_calendar_sync, enqueue_document_source_sync, enqueue_r
 from .documents import DocumentError
 from .drive_ingestion import DocumentSourceError, sync_document_sources
 from .extractor import ExtractionError
+from .evaluation import _evidence_supports, validate_approved_deidentified_text
 from .ingestion import ingest_pdf_bytes
 from .schemas import (
     AccessEvent, AuditEvent, ConfirmationRequest, ContractData, ContractRecord, JobRecord,
     LegalHoldRecord, LegalHoldRequest, NoticeCreateRequest, NoticeDeliveryRequest,
     NoticeDispatchRequest, NoticeRecord, ReminderTask, ResolveTaskRequest, TaskAssignmentRequest,
-    TaskComment, TaskCommentRequest, TaskTransitionRequest,
+    EvaluationFeedbackApprovalRequest, TaskComment, TaskCommentRequest, TaskTransitionRequest,
 )
 from .store import Store
 
@@ -89,6 +90,10 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
     @app.get("/tasks/inbox", response_class=HTMLResponse, include_in_schema=False)
     def task_inbox() -> HTMLResponse:
         return HTMLResponse(_TASK_INBOX_HTML)
+
+    @app.get("/operations", response_class=HTMLResponse, include_in_schema=False)
+    def operations_dashboard() -> HTMLResponse:
+        return HTMLResponse(_OPERATIONS_HTML)
 
     @app.get("/auth/oidc/login", include_in_schema=False)
     def oidc_login() -> RedirectResponse:
@@ -269,6 +274,78 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return _contract_record(db.get_contract(contract_id, principal.tenant_id))
 
+    @app.get("/contracts/{contract_id}/evaluation-feedback")
+    def get_evaluation_feedback(contract_id: str, principal: Principal = Depends(authenticate)) -> dict:
+        require_scope(principal, "contracts:review")
+        if not db.get_contract(contract_id, principal.tenant_id):
+            raise HTTPException(status_code=404, detail="Contract not found")
+        row = db.get_review_feedback(contract_id, principal.tenant_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="No reviewer feedback has been captured for this contract")
+        return _feedback_record(row)
+
+    @app.post("/contracts/{contract_id}/evaluation-feedback/approve")
+    def approve_evaluation_feedback(
+        contract_id: str, request: EvaluationFeedbackApprovalRequest,
+        principal: Principal = Depends(authenticate),
+    ) -> dict:
+        require_scope(principal, "evaluation:approve")
+        contract = db.get_contract(contract_id, principal.tenant_id)
+        if not contract:
+            raise HTTPException(status_code=404, detail="Contract not found")
+        if contract["status"] != "active":
+            raise HTTPException(status_code=409, detail="Only confirmed active contracts can be approved for evaluation feedback")
+        feedback = db.get_review_feedback(contract_id, principal.tenant_id)
+        if not feedback:
+            raise HTTPException(status_code=404, detail="Reviewer feedback was not found")
+        if feedback["status"] != "captured":
+            raise HTTPException(status_code=409, detail="Reviewer feedback has already been approved")
+        if len(set(request.fields)) != len(request.fields) or len(set(request.clause_categories)) != len(request.clause_categories):
+            raise HTTPException(status_code=422, detail="Fields and clause categories must not contain duplicates")
+        try:
+            validate_approved_deidentified_text(request.redacted_text, contract_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        reviewed = json.loads(feedback["reviewed_json"])
+        expected = {field: reviewed.get(field) for field in request.fields}
+        if any(value is None for value in expected.values()):
+            raise HTTPException(status_code=422, detail="Selected evaluation fields must have reviewer-confirmed values")
+        selected_evidence: dict[str, str] = {}
+        normalized_text = " ".join(request.redacted_text.split()).casefold()
+        for evidence in request.evidence:
+            if evidence.field not in expected:
+                raise HTTPException(status_code=422, detail=f"Evidence field '{evidence.field}' is not selected for evaluation")
+            if " ".join(evidence.quote.split()).casefold() not in normalized_text:
+                raise HTTPException(status_code=422, detail=f"Evidence for {evidence.field} must appear in the redacted contract text")
+            if not _evidence_supports(evidence.field, expected[evidence.field], evidence.quote):
+                raise HTTPException(status_code=422, detail=f"Evidence does not support the reviewer-confirmed value for {evidence.field}")
+            selected_evidence[evidence.field] = evidence.quote
+        missing_evidence = set(expected) - set(selected_evidence)
+        if missing_evidence:
+            raise HTTPException(status_code=422, detail=f"Add approved evidence for: {', '.join(sorted(missing_evidence))}")
+
+        case = {
+            "id": f"review-feedback-{feedback['id']}",
+            "source_type": "approved_deidentified",
+            "contract_text": request.redacted_text,
+            "expected": expected,
+            "clause_categories": request.clause_categories,
+            "provider_under_review": feedback["extraction_provider"],
+            "reviewed_evidence": [item.model_dump(mode="json") for item in request.evidence],
+            "governance": {
+                "approved": True, "deidentified": True,
+                "approval_reference": request.approval_reference,
+                "approved_by": principal.actor,
+            },
+        }
+        row = db.approve_review_feedback(
+            contract_id, principal.tenant_id, principal.actor, request.approval_reference,
+            request.clause_categories, case,
+        )
+        if not row:
+            raise HTTPException(status_code=409, detail="Reviewer feedback has already been approved")
+        return _feedback_record(row)
+
     @app.post("/contracts/{contract_id}/reject", response_model=ContractRecord)
     def reject_contract(contract_id: str, principal: Principal = Depends(authenticate)) -> ContractRecord:
         require_scope(principal, "contracts:review")
@@ -349,6 +426,29 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
     def calendar_sync(principal: Principal = Depends(authenticate)) -> JobRecord:
         require_scope(principal, "calendar:sync")
         return JobRecord(**job_record(enqueue_calendar_sync(db, principal.tenant_id)))
+
+    @app.get("/operations/health")
+    def operations_health(
+        stuck_after_minutes: int = Query(default=15, ge=1, le=1440),
+        principal: Principal = Depends(authenticate),
+    ) -> dict:
+        require_scope(principal, "jobs:read")
+        snapshot = db.operations_snapshot(principal.tenant_id, stuck_after_minutes)
+        alerts = []
+        jobs = snapshot["jobs"]
+        notifications = snapshot["notifications"]
+        dead_jobs = jobs["by_status"].get("dead", 0)
+        if dead_jobs:
+            alerts.append({"severity": "critical", "code": "dead_jobs", "count": dead_jobs, "message": f"{dead_jobs} job(s) are in the dead-letter state."})
+        if jobs["queued_stuck"]:
+            alerts.append({"severity": "warning", "code": "queued_jobs_stuck", "count": jobs["queued_stuck"], "message": f"{jobs['queued_stuck']} due job(s) have waited longer than {stuck_after_minutes} minutes."})
+        if jobs["expired_leases"]:
+            alerts.append({"severity": "warning", "code": "expired_job_leases", "count": jobs["expired_leases"], "message": f"{jobs['expired_leases']} running job lease(s) have expired."})
+        if notifications["failed_last_hour"] >= 3:
+            alerts.append({"severity": "critical", "code": "repeated_notification_failures", "count": notifications["failed_last_hour"], "message": f"{notifications['failed_last_hour']} notification delivery attempts failed in the last hour."})
+        snapshot["alerts"] = alerts
+        snapshot["status"] = "degraded" if alerts else "healthy"
+        return snapshot
 
     @app.get("/jobs", response_model=list[JobRecord])
     def list_jobs(limit: int = Query(default=100, ge=1, le=1000), principal: Principal = Depends(authenticate)) -> list[JobRecord]:
@@ -547,6 +647,19 @@ def _audit_record(row) -> AuditEvent:
     return AuditEvent(id=row["id"], contract_id=row["contract_id"], event_type=row["event_type"], actor=row["actor"], details=json.loads(row["details_json"]), created_at=row["created_at"])
 
 
+def _feedback_record(row) -> dict:
+    return {
+        "id": row["id"], "contract_id": row["contract_id"], "tenant_id": row["tenant_id"],
+        "provider": row["extraction_provider"], "status": row["status"],
+        "proposed": json.loads(row["proposed_json"]), "reviewed": json.loads(row["reviewed_json"]),
+        "corrections": json.loads(row["corrections_json"]),
+        "evaluation_case": json.loads(row["evaluation_case_json"]) if row["evaluation_case_json"] else None,
+        "approval_reference": row["approval_reference"], "clause_categories": json.loads(row["clause_categories_json"]) if row["clause_categories_json"] else [],
+        "captured_by": row["captured_by"], "captured_at": row["captured_at"],
+        "approved_by": row["approved_by"], "approved_at": row["approved_at"],
+    }
+
+
 def _task_record(row) -> ReminderTask:
     return ReminderTask(
         id=row["id"], contract_id=row["contract_id"], title=row["title"], owner_name=row["owner_name"], owner_email=row["owner_email"],
@@ -581,13 +694,27 @@ def _webhook_tenant_id() -> str:
     return os.getenv("DOCUMENT_SOURCE_WEBHOOK_TENANT_ID", "default").strip() or "default"
 
 
+_OPERATIONS_HTML = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Renewal Radar · Operations</title>
+<style>
+:root{font:15px/1.5 system-ui,sans-serif;color:#182230;background:#f3f6fa}*{box-sizing:border-box}body{margin:0}header{background:#10243a;color:#fff;padding:18px 26px;display:flex;justify-content:space-between;align-items:center}header h1{font-size:20px;margin:0}.bar{padding:12px 26px;background:#fff;border-bottom:1px solid #dbe2ea;display:flex;gap:9px;align-items:center;flex-wrap:wrap}.bar input{flex:1;max-width:500px;padding:8px;border:1px solid #cbd5e1;border-radius:6px}.bar a{color:#1677c8}.bar button,.refresh{border:0;border-radius:6px;padding:8px 12px;font:inherit;font-weight:650;cursor:pointer;background:#1677c8;color:#fff}.wrap{max-width:1400px;margin:auto;padding:20px}.grid{display:grid;grid-template-columns:repeat(5,minmax(130px,1fr));gap:12px}.card,.panel{background:#fff;border:1px solid #dbe2ea;border-radius:10px;padding:16px}.card span{display:block;color:#667085;font-size:13px}.card strong{display:block;font-size:26px;margin-top:3px}.panel{margin-top:15px}.panel h2{font-size:16px;margin:0 0 12px}.alerts{display:grid;gap:8px}.alert{padding:10px 12px;border-left:4px solid #d92d20;background:#fff2f0;border-radius:5px}.alert.warning{border-color:#dc6803;background:#fffaeb}.alert.ok{border-color:#039855;background:#ecfdf3}.columns{display:grid;grid-template-columns:1fr 1fr;gap:14px}.tablewrap{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:left;padding:8px;border-bottom:1px solid #e4e7ec;vertical-align:top}th{color:#667085}.error{color:#b42318}.muted{color:#667085}.healthy{color:#039855}.degraded{color:#b42318}@media(max-width:850px){.grid{grid-template-columns:repeat(2,1fr)}.columns{grid-template-columns:1fr}.wrap{padding:12px}}
+</style></head><body>
+<header><h1>◈ Renewal Radar / operations</h1><span id="health" class="muted">Not connected</span></header>
+<div class="bar"><input id="token" type="password" placeholder="Bearer token (optional with SSO)" aria-label="Bearer token"><button onclick="refresh()">Refresh</button><a href="/auth/oidc/login">Sign in with SSO</a><a href="/review">Extraction review</a><a href="/tasks/inbox">Task inbox</a><label>Stuck after <select id="threshold"><option value="15">15 min</option><option value="30">30 min</option><option value="60">60 min</option></select></label></div>
+<main class="wrap"><div id="notice" class="error" role="status"></div><section class="grid"><div class="card"><span>Queued jobs</span><strong id="queued">—</strong></div><div class="card"><span>Running jobs</span><strong id="running">—</strong></div><div class="card"><span>Dead letters</span><strong id="dead">—</strong></div><div class="card"><span>Retrying</span><strong id="retrying">—</strong></div><div class="card"><span>Failed notifications · 1h</span><strong id="failed">—</strong></div></section>
+<section class="panel"><h2>Alerts</h2><div id="alerts" class="muted">Connect to load operational health.</div></section><div class="columns"><section class="panel"><h2>Recent jobs · includes calendar syncs</h2><div id="jobs" class="tablewrap muted">No data loaded.</div></section><section class="panel"><h2>Notification delivery attempts</h2><div id="deliveries" class="tablewrap muted">No data loaded.</div></section></div><section class="panel"><h2>Notification channels</h2><div id="channels" class="tablewrap muted">No data loaded.</div></section></main>
+<script>
+const $=id=>document.getElementById(id);function auth(){const t=$('token').value.trim()||sessionStorage.getItem('radar-token')||'';return t?{Authorization:'Bearer '+t}:{}}async function request(path){const r=await fetch(path,{headers:auth()});if(!r.ok){let e={};try{e=await r.json()}catch{}throw Error(e.detail||r.status)}return r.json()}function table(headers,rows){const t=document.createElement('table'),thead=document.createElement('thead'),tr=document.createElement('tr');headers.forEach(h=>{const th=document.createElement('th');th.textContent=h;tr.append(th)});thead.append(tr);t.append(thead);const body=document.createElement('tbody');for(const values of rows){const row=document.createElement('tr');values.forEach(v=>{const td=document.createElement('td');td.textContent=v===null||v===undefined?'—':String(v);row.append(td)});body.append(row)}t.append(body);return t}function fillTable(id,headers,rows){const el=$(id);el.replaceChildren();if(!rows.length){el.textContent='No activity recorded.';el.className='muted';return}el.className='tablewrap';el.append(table(headers,rows))}async function refresh(){try{if($('token').value.trim())sessionStorage.setItem('radar-token',$('token').value.trim());const d=await request('/operations/health?stuck_after_minutes='+$('threshold').value);$('notice').textContent='';$('health').textContent=d.status+' · updated '+new Date(d.generated_at).toLocaleString();$('health').className=d.status;for(const key of ['queued','running','dead'])$(key).textContent=d.jobs.by_status[key]||0;$('retrying').textContent=d.jobs.retrying;$('failed').textContent=d.notifications.failed_last_hour;const alerts=$('alerts');alerts.replaceChildren();if(!d.alerts.length){const ok=document.createElement('div');ok.className='alert ok';ok.textContent='No stuck jobs, dead letters, or repeated notification failures detected.';alerts.append(ok)}else{for(const a of d.alerts){const item=document.createElement('div');item.className='alert'+(a.severity==='warning'?' warning':'');item.textContent=a.message;alerts.append(item)}}fillTable('jobs',['Type','State','Attempts','Updated','Outcome','Error'],d.jobs.recent.map(j=>[j.job_type,j.status,j.attempts+'/'+j.max_attempts,new Date(j.updated_at).toLocaleString(),j.result_json?JSON.stringify(JSON.parse(j.result_json)):'',j.last_error]));fillTable('deliveries',['Task','Type','Channel','State','Duration','Attempted','Error'],d.notifications.recent.map(n=>[n.task_id,n.notification_type,n.channel,n.status,n.duration_ms+' ms',new Date(n.attempted_at).toLocaleString(),n.error_message]));fillTable('channels',['Channel','Kind','State','Count'],d.notifications.by_channel.map(x=>[x.channel,x.notification_type,x.status,x.count]))}catch(e){$('health').textContent='Unavailable';$('health').className='degraded';$('notice').textContent='Could not load operations: '+e.message}}const saved=sessionStorage.getItem('radar-token');if(saved)$('token').value=saved;refresh();
+</script></body></html>'''
+
+
 _REVIEWER_HTML = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Renewal Radar · Review</title>
 <style>
 :root{font:15px/1.5 system-ui,sans-serif;color:#182230;background:#f3f6fa}*{box-sizing:border-box}body{margin:0}header{background:#10243a;color:white;padding:20px 28px;display:flex;justify-content:space-between;align-items:center}header h1{font-size:20px;margin:0}.bar{padding:14px 28px;background:#fff;border-bottom:1px solid #dbe2ea;display:flex;gap:8px}.shell{display:grid;grid-template-columns:300px 1fr;min-height:calc(100vh - 110px)}aside{padding:18px;border-right:1px solid #dbe2ea;background:white}.item{display:block;width:100%;text-align:left;background:#fff;border:1px solid #dbe2ea;border-radius:8px;padding:12px;margin:0 0 9px;cursor:pointer}.item:hover,.item.selected{border-color:#1677c8;background:#f2f8ff}.item small{display:block;color:#64748b;margin-top:3px}main{padding:24px;display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:20px}.panel{background:#fff;border:1px solid #dbe2ea;border-radius:10px;padding:18px;min-width:0}.panel h2{font-size:17px;margin:0 0 14px}.field{margin:0 0 11px}.field label{display:block;font-size:12px;color:#526174;font-weight:650;margin-bottom:3px}.field input,.field select{width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:6px;font:inherit}.source{white-space:pre-wrap;max-height:68vh;overflow:auto;background:#f8fafc;padding:14px;border-radius:7px;font:13px/1.6 ui-monospace,monospace}.evidence{font-size:13px;border-left:3px solid #22a06b;padding:6px 10px;margin:8px 0;background:#f4fbf7}.actions{display:flex;gap:9px;margin-top:16px}.actions button,.bar button{border:0;border-radius:6px;padding:9px 14px;font:inherit;font-weight:650;cursor:pointer}.primary{background:#1677c8;color:white}.danger{background:#fff0ef;color:#b42318}.muted{color:#667085}.status{margin-left:auto;color:#9dd8ff}#notice{margin:0;padding:0 28px;color:#b42318}.empty{padding:32px;color:#667085;text-align:center}@media(max-width:850px){.shell{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid #dbe2ea}main{grid-template-columns:1fr;padding:14px}}
 </style></head><body>
 <header><h1>◈ Renewal Radar <span class="muted" style="color:#b7c7d9">/ contract review</span></h1><span id="who" class="status">Not connected</span></header>
-<div class="bar"><input id="token" type="password" placeholder="Bearer token (optional with SSO)" aria-label="Bearer token" style="flex:1;max-width:520px;padding:8px;border:1px solid #cbd5e1;border-radius:6px"><button class="primary" onclick="connect()">Connect</button><a href="/auth/oidc/login" style="align-self:center;color:#1677c8">Sign in with SSO</a><a href="/tasks/inbox" style="align-self:center;color:#1677c8">Renewal task inbox →</a><button onclick="disconnect()">Disconnect</button></div><p id="notice" role="status"></p>
+<div class="bar"><input id="token" type="password" placeholder="Bearer token (optional with SSO)" aria-label="Bearer token" style="flex:1;max-width:520px;padding:8px;border:1px solid #cbd5e1;border-radius:6px"><button class="primary" onclick="connect()">Connect</button><a href="/auth/oidc/login" style="align-self:center;color:#1677c8">Sign in with SSO</a><a href="/tasks/inbox" style="align-self:center;color:#1677c8">Renewal task inbox →</a><a href="/operations" style="align-self:center;color:#1677c8">Operations →</a><button onclick="disconnect()">Disconnect</button></div><p id="notice" role="status"></p>
 <div class="shell"><aside><h2>Pending review</h2><div id="queue" class="muted">Connect to load contracts.</div></aside><main><section class="panel"><h2>Extracted terms</h2><div id="fields" class="muted">Choose a contract to inspect its proposal.</div><div id="evidence"></div><div class="actions"><button class="primary" onclick="confirmContract()">Confirm terms</button><button class="danger" onclick="rejectContract()">Reject</button></div></section><section class="panel"><h2>Contract text</h2><div id="source" class="source muted">Source text appears here.</div></section></main></div>
 <script>
 const keys=['contract','start_date','expiration_date','renewal_notice_days','notice_day_type','notice_timezone','notice_holidays','notice_method','notice_recipient','auto_renew','termination_notice','owner_name','owner_email','supersedes_contract_id'];let selected=null,contracts=[];const $=id=>document.getElementById(id);function say(s){$('notice').textContent=s}function auth(){let t=$('token').value.trim();return t?{Authorization:'Bearer '+t}:{}}function disconnect(){sessionStorage.removeItem('radar-token');$('token').value='';fetch('/auth/logout',{method:'POST'});$('who').textContent='Not connected';$('queue').textContent='Connect to load contracts.';selected=null;contracts=[]}async function connect(){if($('token').value.trim())sessionStorage.setItem('radar-token',$('token').value.trim());try{let r=await fetch('/contracts?status=pending_review',{headers:auth()});if(!r.ok)throw Error((await r.json()).detail||r.status);contracts=await r.json();$('who').textContent='Connected · '+contracts.length+' awaiting review';say('');renderQueue();if(contracts.length)openContract(contracts[0].id)}catch(e){say('Could not connect: '+e.message)}}function renderQueue(){let q=$('queue');q.replaceChildren();if(!contracts.length){q.textContent='No contracts awaiting review.';return}contracts.forEach(c=>{let b=document.createElement('button');b.className='item'+(selected===c.id?' selected':'');b.onclick=()=>openContract(c.id);let title=document.createElement('strong');title.textContent=c.extracted.contract||c.filename;let meta=document.createElement('small');meta.textContent=c.filename+' · '+new Date(c.created_at).toLocaleDateString();b.append(title,meta);q.append(b)})}async function openContract(id){selected=id;renderQueue();let c=contracts.find(x=>x.id===id);let data=c.extracted;let fields=$('fields');fields.replaceChildren();keys.forEach(k=>{let wrap=document.createElement('div');wrap.className='field';let label=document.createElement('label');label.htmlFor='f-'+k;label.textContent=k.replaceAll('_',' ')+(k==='notice_holidays'?' (comma-separated ISO dates)':k==='supersedes_contract_id'?' (active contract ID to replace)':'');let input;if(k==='notice_day_type'||k==='auto_renew'){input=document.createElement('select');let options=k==='auto_renew'?[['','Unknown'],['true','Yes'],['false','No']]:[['calendar','Calendar days'],['business','Business days']];options.forEach(([v,t])=>{let o=document.createElement('option');o.value=v;o.textContent=t;input.append(o)})}else{input=document.createElement('input');input.type=k.endsWith('_date')?'date':k==='renewal_notice_days'?'number':'text';if(k==='renewal_notice_days')input.min='0'}input.id='f-'+k;let value=data[k];input.value=value===null||value===undefined?'':k==='auto_renew'?String(value):k==='notice_holidays'?value.join(', '):String(value);wrap.append(label,input);fields.append(wrap)});let e=$('evidence');e.replaceChildren();(data.evidence||[]).forEach(item=>{let div=document.createElement('div');div.className='evidence';div.textContent=item.field+': “'+item.quote+'” · confidence '+Math.round(item.confidence*100)+'%';e.append(div)});$('source').textContent='Loading…';try{let r=await fetch('/contracts/'+id+'/source',{headers:auth()});if(!r.ok)throw Error((await r.json()).detail||r.status);$('source').textContent=(await r.json()).text}catch(err){$('source').textContent='Source unavailable: '+err.message}}function formData(){let x={};keys.forEach(k=>{let v=$('f-'+k).value;x[k]=k==='notice_holidays'?v.split(',').map(x=>x.trim()).filter(Boolean):v===''?null:k==='renewal_notice_days'?Number(v):k==='auto_renew'?v==='true'?true:v==='false'?false:null:v});x.evidence=contracts.find(c=>c.id===selected).extracted.evidence;return x}async function action(path,body){if(!selected)return say('Select a contract first.');try{let r=await fetch('/contracts/'+selected+'/'+path,{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok)throw Error((await r.json()).detail||r.status);say(path==='confirm'?'Contract confirmed and renewal task created.':'Contract rejected.');contracts=contracts.filter(c=>c.id!==selected);selected=null;renderQueue();$('fields').textContent='Choose a contract to inspect its proposal.';$('source').textContent='Source text appears here.';$('evidence').replaceChildren();if(contracts.length)openContract(contracts[0].id)}catch(e){say('Could not '+path+': '+e.message)}}function confirmContract(){action('confirm',{contract:formData()})}function rejectContract(){action('reject')}const saved=sessionStorage.getItem('radar-token');if(saved){$('token').value=saved;connect()}else{connect()}
@@ -600,7 +727,7 @@ _TASK_INBOX_HTML = r'''<!doctype html>
 :root{font:15px/1.5 system-ui,sans-serif;color:#182230;background:#f3f6fa}*{box-sizing:border-box}body{margin:0}header{background:#10243a;color:#fff;padding:18px 26px;display:flex;justify-content:space-between;align-items:center}header h1{font-size:20px;margin:0}a{color:#1677c8}.bar{padding:12px 26px;background:#fff;border-bottom:1px solid #dbe2ea;display:flex;gap:9px;align-items:center;flex-wrap:wrap}.bar input{flex:1;max-width:500px;padding:8px;border:1px solid #cbd5e1;border-radius:6px}.layout{display:grid;grid-template-columns:minmax(280px,360px) 1fr;min-height:calc(100vh - 108px)}aside{padding:18px;background:#fff;border-right:1px solid #dbe2ea}.filters{display:grid;gap:9px;margin-bottom:14px}.filters select{padding:8px;border:1px solid #cbd5e1;border-radius:6px;font:inherit}.filters label{font-size:13px;color:#526174}.task{display:block;width:100%;text-align:left;border:1px solid #dbe2ea;border-radius:8px;padding:11px;margin-bottom:8px;background:#fff;cursor:pointer}.task.selected,.task:hover{border-color:#1677c8;background:#f2f8ff}.task strong,.task small{display:block}.task small{color:#64748b;margin-top:3px}.pill{display:inline-block;border-radius:99px;padding:2px 8px;background:#e9eff6;font-size:12px}.overdue{color:#b42318;background:#fff0ef}.main{padding:20px;display:grid;grid-template-columns:minmax(280px,1.05fr) minmax(280px,.95fr);gap:14px;align-content:start}.panel{background:#fff;border:1px solid #dbe2ea;border-radius:10px;padding:17px;min-width:0}.panel h2{font-size:16px;margin:0 0 12px}.panel h3{font-size:14px;margin:16px 0 6px}.panel input,.panel select,.panel textarea{width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:6px;font:inherit;margin:4px 0 9px}.panel textarea{min-height:75px;resize:vertical}.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.actions{display:flex;gap:8px;flex-wrap:wrap}button{border:0;border-radius:6px;padding:8px 12px;font:inherit;font-weight:650;cursor:pointer}.primary{background:#1677c8;color:white}.secondary{background:#e9eff6;color:#182230}.event{border-left:3px solid #9bb3ca;padding:6px 9px;margin:7px 0;background:#f8fafc;font-size:13px}.muted{color:#667085}.status{color:#a9d8f5}.empty{padding:24px;color:#667085;text-align:center}#notice{padding:6px 26px;color:#b42318;margin:0}.check{display:flex;align-items:center;gap:7px}.check input{width:auto;margin:0}@media(max-width:850px){.layout{grid-template-columns:1fr}aside{border:0;border-bottom:1px solid #dbe2ea}.main{grid-template-columns:1fr;padding:12px}}
 </style></head><body>
 <header><h1>◈ Renewal Radar / task inbox</h1><span id="who" class="status">Not connected</span></header>
-<div class="bar"><input id="token" type="password" placeholder="Bearer token (optional with SSO)" aria-label="Bearer token"><button class="primary" onclick="loadTasks()">Connect / refresh</button><a href="/auth/oidc/login">Sign in with SSO</a><a href="/review">Extraction review</a></div><p id="notice" role="status"></p>
+<div class="bar"><input id="token" type="password" placeholder="Bearer token (optional with SSO)" aria-label="Bearer token"><button class="primary" onclick="loadTasks()">Connect / refresh</button><a href="/auth/oidc/login">Sign in with SSO</a><a href="/review">Extraction review</a><a href="/operations">Operations</a></div><p id="notice" role="status"></p>
 <div class="layout"><aside><div class="filters"><label>Workflow state<select id="state"><option value="">All open work</option><option>review</option><option>needs_changes</option><option>pending_approval</option><option>notice_in_progress</option></select></label><label class="check"><input id="due" type="checkbox">Due or overdue today</label><label class="check"><input id="unassigned" type="checkbox">Unassigned only</label><button class="secondary" onclick="loadTasks()">Apply filters</button></div><div id="queue" class="muted">Connect to load renewal tasks.</div></aside>
 <main class="main"><section class="panel"><h2 id="title">Select a task</h2><div id="summary" class="muted">Review ownership, deadlines, and workflow state.</div><div id="controls" hidden><h3>Assignment</h3><div class="grid"><input id="ownerName" placeholder="Owner name"><input id="ownerEmail" type="email" placeholder="Owner email"></div><button class="secondary" onclick="assignTask()">Save assignment</button><h3>Workflow</h3><div class="grid"><select id="nextState"><option value="review">In review</option><option value="needs_changes">Needs changes</option><option value="pending_approval">Pending approval</option><option value="notice_in_progress">Notice in progress</option><option value="renewed">Renewed</option><option value="terminated">Terminated</option><option value="cancelled">Cancelled</option></select><input id="transitionComment" placeholder="Decision note (optional)"></div><div class="actions"><button class="primary" onclick="transitionTask()">Update workflow</button><button class="secondary" onclick="resolveTask()">Resolve task</button></div><h3>Comments</h3><div id="comments"></div><textarea id="commentBody" placeholder="Add a team comment"></textarea><button class="secondary" onclick="addComment()">Add comment</button></div></section>
 <section class="panel"><h2>Task history</h2><div id="history" class="muted">Audit events appear when a task is selected.</div><h3>Notice drafts</h3><div id="notices" class="muted">No task selected.</div></section></main></div>

@@ -55,6 +55,12 @@ def main() -> int:
     evaluate.add_argument("--min-field-accuracy", type=float, help="Exit non-zero when any scored field is below this accuracy")
     evaluate.add_argument("--min-evidence-support", type=float, help="Exit non-zero when evidence does not support the extracted values often enough")
 
+    export_feedback = subparsers.add_parser(
+        "export-feedback", help="Export explicitly approved, de-identified reviewer cases for provider evaluation",
+    )
+    export_feedback.add_argument("--tenant-id", default="default")
+    export_feedback.add_argument("--output", type=Path, required=True, help="Evaluation cases directory to receive approved JSON fixtures")
+
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -112,6 +118,18 @@ def main() -> int:
         print(token)
         print("\nAdd this object to the RADAR_AUTH_USERS_JSON array:")
         print(json.dumps(user_entry, indent=2))
+        return 0
+
+    if args.command == "export-feedback":
+        rows = Store().list_review_feedback(args.tenant_id, status="approved")
+        args.output.mkdir(parents=True, exist_ok=True)
+        exported = 0
+        for row in rows:
+            case = json.loads(row["evaluation_case_json"])
+            case_path = args.output / f"{case['id']}.json"
+            case_path.write_text(json.dumps(case, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            exported += 1
+        print(json.dumps({"tenant_id": args.tenant_id, "exported": exported, "directory": str(args.output)}, indent=2))
         return 0
 
     try:

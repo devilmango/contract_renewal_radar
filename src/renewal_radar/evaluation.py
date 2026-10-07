@@ -43,14 +43,18 @@ def load_cases(directory: Path) -> list[dict[str, Any]]:
             governance = case.get("governance")
             if not isinstance(governance, dict) or governance.get("approved") is not True or governance.get("deidentified") is not True or not governance.get("approval_reference"):
                 raise ValueError(f"Approved de-identified fixture {path} needs governance.approved, governance.deidentified, and governance.approval_reference")
-            if re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|\b\d{3}[- .]?\d{2}[- .]?\d{4}\b", case["contract_text"]):
-                raise ValueError(f"Possible email address or government ID remains in evaluation fixture {path}")
+            validate_approved_deidentified_text(case["contract_text"], str(path))
         case["source_type"] = source_type
         case["fixture"] = path.name
         cases.append(case)
     if not cases:
         raise ValueError(f"No JSON evaluation cases found in {directory}")
     return cases
+
+
+def validate_approved_deidentified_text(text: str, label: str = "evaluation case") -> None:
+    if re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|\b\d{3}[- .]?\d{2}[- .]?\d{4}\b", text):
+        raise ValueError(f"Possible email address or government ID remains in {label}")
 
 
 def evaluate_extractor(extractor, cases: list[dict[str, Any]]) -> dict[str, Any]:

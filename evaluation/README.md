@@ -27,6 +27,17 @@ To add internal organization examples, obtain approval from the contract/data ow
 
 The loader rejects approved-deidentified fixtures without all three governance fields and performs a basic email/government-ID scan. This is a guardrail, not a substitute for a human privacy review. Preserve the approval record in the organization's controlled dataset rather than publishing sensitive source material.
 
+### Exporting reviewer feedback
+
+On each contract confirmation Radar captures proposed terms, reviewer-confirmed terms, the extraction provider, and the fields that changed. These captured records remain in the tenant database and are not sent to an LLM or exported automatically. A reviewer/admin can approve a case through `POST /contracts/{contract_id}/evaluation-feedback/approve` by submitting an explicitly redacted contract excerpt, approval reference, selected scored fields, clause categories, and evidence quotes that both appear in the excerpt and support the confirmed values. The API records the actor and approval and only approved records can be exported:
+
+```bash
+renewal-radar export-feedback --tenant-id acme --output evaluation/internal-cases
+renewal-radar evaluate --provider all --dataset evaluation/internal-cases
+```
+
+Treat the exported directory as controlled legal data even after de-identification. The automated scan catches common email and US government-ID patterns but does not establish complete anonymization. Contract redaction and retention delete the associated captured and approved feedback record.
+
 Run the deterministic baseline from the repository root:
 
 ```bash

@@ -64,6 +64,20 @@ class ConfirmationRequest(BaseModel):
     contract: ContractData
 
 
+class EvaluationFeedbackApprovalRequest(BaseModel):
+    redacted_text: str = Field(min_length=40, max_length=200000)
+    approval_reference: str = Field(min_length=1, max_length=200)
+    fields: list[Literal[
+        "start_date", "expiration_date", "renewal_notice_days", "notice_day_type", "auto_renew", "termination_notice",
+    ]] = Field(min_length=1, max_length=6)
+    clause_categories: list[Literal[
+        "effective_term", "expiration", "renewal", "auto_renewal", "notice_period", "termination",
+    ]] = Field(min_length=1, max_length=12)
+    evidence: list[Evidence] = Field(min_length=1, max_length=50)
+    attest_approved: Literal[True]
+    attest_deidentified: Literal[True]
+
+
 class AuditEvent(BaseModel):
     id: int
     contract_id: str

@@ -35,3 +35,8 @@ def send_notification(task: Any, escalation: bool) -> str:
             server.login(username, os.getenv("SMTP_PASSWORD", ""))
         server.send_message(message)
     return "email"
+
+
+def delivery_channel(task: Any, escalation: bool) -> str:
+    recipient = (os.getenv("ESCALATION_EMAIL") if escalation else None) or task["owner_email"]
+    return "email" if os.getenv("SMTP_HOST") and recipient else "log"

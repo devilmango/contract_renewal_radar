@@ -18,6 +18,7 @@ ROLE_SCOPES = {
         "contracts:source",
         "contracts:upload",
         "contracts:review",
+        "evaluation:approve",
         "audit:read",
         "tasks:read",
         "tasks:resolve",

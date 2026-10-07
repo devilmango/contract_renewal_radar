@@ -30,6 +30,9 @@ def test_postgres_schema_migrations_and_concurrent_worker_storage():
     comment = store.add_task_comment(task_id, "Review notice clause", "ci", tenant)
     assert comment["body"] == "Review notice clause"
     assert store.list_tasks(status="open", tenant_id=tenant, unassigned=True)[0]["id"] == task_id
+    assert store.get_review_feedback(contract_id, tenant)["status"] == "captured"
+    store.record_notification_delivery(task_id, "log", "reminder", "sent", 3)
+    assert store.operations_snapshot(tenant)["notifications"]["by_channel"][0]["count"] == 1
 
     job = store.enqueue_job(tenant, "calendar.sync", {"tenant_id": tenant}, f"sync:{uuid4()}")
     claimed = store.claim_job("ci-postgres-worker", job_id=job["id"])
@@ -39,3 +42,4 @@ def test_postgres_schema_migrations_and_concurrent_worker_storage():
     # Reopening exercises idempotent startup/schema upgrade behavior.
     reopened = Store(url)
     assert reopened.get_task(task_id, tenant)["contract_id"] == contract_id
+    assert reopened.get_review_feedback(contract_id, tenant)["status"] == "captured"

@@ -45,6 +45,8 @@ An extraction is always a proposal. The service does not activate a contract or 
 - **Notice preparation and delivery evidence:** Draft notice content, require reviewer approval, record dispatch details, and attach delivery confirmation evidence.
 - **Durable background jobs:** Persist reminder, calendar-sync, document-reconciliation, and retention work with deduplication keys, worker leases, bounded retries, and dead-letter recovery.
 - **Reviewer task inbox:** Filter upcoming work by workflow stage, deadline, and assignment; assign owners, update workflow, comment, resolve, and inspect contract history and notice drafts.
+- **Operations dashboard:** Inspect queue health, retries, dead letters, stuck work, calendar-sync jobs, and email/log notification delivery attempts with threshold-based alerts.
+- **Reviewer feedback evaluation:** Capture proposal-to-confirmed corrections, approve de-identified evidence-backed cases, and export them for repeatable provider comparison.
 - **Contract-data governance:** Enforce an LLM provider allowlist, record authenticated access history, support legal holds, and redact eligible contract records on demand or by retention policy.
 - **Evidence-quality evaluation:** Measure whether field values are supported by their evidence, track synthetic and OCR fixture results separately, and gate evidence quality in CI.
 - **Organization isolation:** Contract, task, source text, audit, and calendar records are scoped by tenant ID.
@@ -292,6 +294,10 @@ Use least-privilege read access for the selected drive. Polling remains supporte
 
 Open `/tasks/inbox` to work from the renewal queue, or use the **Renewal task inbox** link in `/review`. The inbox supports workflow-state, due-today/overdue, and unassigned filters. Reviewers can assign owners, update workflow state, resolve tasks, add comments, and inspect the contract audit history and notice drafts. Owners see only tasks assigned to their authenticated email and can use the permitted comment/workflow actions. Filtering is also available through `GET /tasks` with `workflow_state`, `due_before=YYYY-MM-DD`, and `unassigned=true` query parameters.
 
+### Operations and delivery health
+
+Open `/operations` or request `GET /operations/health` with a reviewer, scheduler, or administrator token. The dashboard summarizes queued/running/retrying/dead jobs, overdue queue items, expired leases, calendar-sync job results, and email/log notification attempts including their durations and failures. It raises alerts for dead letters, stuck jobs, expired leases, and three or more notification failures in the past hour. Set the `stuck_after_minutes` query parameter to adjust the queue-wait threshold (1–1440 minutes). Notification history stores task IDs and status diagnostics, not message bodies or recipient addresses. Delivery attempts are recorded before the reminder workflow marks the task notified; email remains at-least-once if a process stops after a successful send but before its state update.
+
 ### Renewal workflow and notice tracking
 
 Confirmed renewal tasks start in `review`. Reviewers can assign an owner and transition tasks through `needs_changes`, `pending_approval`, and `notice_in_progress`, then record an outcome as `renewed`, `terminated`, or `cancelled`. Owners can request changes and submit notice work for approval. Every transition, assignment, and comment is written to the audit trail.
@@ -340,6 +346,39 @@ Use `--min-exact-accuracy`, `--min-field-accuracy`, and `--min-evidence-support`
 
 See [evaluation/README.md](evaluation/README.md) for scoring details and fixture conventions.
 
+### Reviewer-corrected evaluation cases
+
+Every reviewer confirmation captures the proposed and confirmed scored terms plus the changed fields in the tenant database. Captured feedback is not automatically sent to evaluation providers or exported. A reviewer or administrator must separately approve a redacted sample with a legal approval reference, explicit de-identification/approval attestations, selected fields, clause categories, and evidence quotes that occur in the submitted redacted text and support the reviewed values.
+
+After confirming a contract, inspect `GET /contracts/CONTRACT_ID/evaluation-feedback`, then approve a case:
+
+```bash
+curl -X POST http://127.0.0.1:8000/contracts/CONTRACT_ID/evaluation-feedback/approve \
+  -H "Authorization: Bearer $RADAR_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "redacted_text":"[VENDOR] Services Agreement. Effective Date: January 1, 2025. Expiration Date: February 1, 2026.",
+    "approval_reference":"LEGAL-1234",
+    "fields":["start_date","expiration_date"],
+    "clause_categories":["effective_term","expiration"],
+    "evidence":[
+      {"field":"start_date","quote":"Effective Date: January 1, 2025"},
+      {"field":"expiration_date","quote":"Expiration Date: February 1, 2026"}
+    ],
+    "attest_approved":true,
+    "attest_deidentified":true
+  }'
+```
+
+Export only approved cases to an access-controlled evaluation directory, then compare all configured providers against the approved examples:
+
+```bash
+renewal-radar export-feedback --tenant-id acme --output evaluation/internal-cases
+renewal-radar evaluate --provider all --dataset evaluation/internal-cases --output evaluation/reports/internal-provider-comparison.json
+```
+
+The service rejects common email and US government-ID patterns and checks evidence grounding/value support. This automated scan is only a guardrail; the approving reviewer remains responsible for broader de-identification and governance. Contract redaction and retention also remove captured feedback for that contract.
+
 ## API reference
 
 | Method | Endpoint | Permission |
@@ -356,10 +395,13 @@ See [evaluation/README.md](evaluation/README.md) for scoring details and fixture
 | `POST` | `/contracts/{contract_id}/confirm` | `reviewer` or `admin`: confirm terms and create a task |
 | `POST` | `/contracts/{contract_id}/reject` | `reviewer` or `admin`: reject a pending proposal |
 | `GET` | `/contracts/{contract_id}/audit` | `reviewer` or `admin`: read contract event history |
+| `GET` | `/contracts/{contract_id}/evaluation-feedback` | `reviewer` or `admin`: inspect captured reviewer corrections and approval status |
+| `POST` | `/contracts/{contract_id}/evaluation-feedback/approve` | `reviewer` or `admin`: approve a de-identified evidence-backed evaluation case |
 | `GET` | `/tasks?status=open\|resolved` | `reviewer` or `admin`: list all tasks; `owner`: list assigned tasks; filter with `workflow_state`, `due_before`, or `unassigned` |
 | `POST` | `/tasks/{task_id}/resolve` | `reviewer` or `admin`: resolve any task; `owner`: resolve assigned tasks |
 | `POST` | `/reminders/run` | `scheduler` or `admin`: enqueue a durable reminder job (202) |
 | `GET` | `/jobs` or `/jobs/{job_id}` | `reviewer`, `scheduler`, or `admin`: inspect tenant jobs |
+| `GET` | `/operations/health` | `reviewer`, `scheduler`, or `admin`: inspect job and notification health with alerts |
 | `POST` | `/jobs/{job_id}/retry` | `admin`: requeue a dead job |
 | `POST` | `/data-retention/run` | `admin`: enqueue a configured retention sweep (202) |
 | `GET` | `/calendar.ics` | `reviewer` or `admin`: export all tasks; `owner`: export assigned tasks |
@@ -374,6 +416,7 @@ See [evaluation/README.md](evaluation/README.md) for scoring details and fixture
 | `POST` | `/notices/{notice_id}/delivery` | `reviewer` or `admin`: record delivery evidence |
 | `GET` | `/review` | Public UI shell; API calls require a reviewer token |
 | `GET` | `/tasks/inbox` | Public UI shell; API calls require task permissions |
+| `GET` | `/operations` | Public UI shell; health API calls require `jobs:read` |
 | `POST` | `/webhooks/google-drive` | Google Drive push callback; requires configured channel token |
 | `GET/POST` | `/webhooks/microsoft-graph` | Graph validation challenge and push callback; requires configured `clientState` |
 

@@ -45,5 +45,5 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: python -m pip install -e '.[test,database]'
-      - name: Verify PostgreSQL schema, task workflow, comments, and job claims
+      - name: Verify PostgreSQL schema, feedback, delivery history, and job claims
         run: pytest -q tests/test_postgres_store.py

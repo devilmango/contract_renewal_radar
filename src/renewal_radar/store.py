@@ -200,6 +200,35 @@ class Store:
                     entity_id TEXT,
                     accessed_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS notification_deliveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL REFERENCES tasks(id),
+                    channel TEXT NOT NULL,
+                    notification_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL,
+                    error_message TEXT,
+                    attempted_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS review_feedback (
+                    id TEXT PRIMARY KEY,
+                    contract_id TEXT NOT NULL REFERENCES contracts(id),
+                    tenant_id TEXT NOT NULL,
+                    extraction_provider TEXT NOT NULL,
+                    proposed_json TEXT NOT NULL,
+                    reviewed_json TEXT NOT NULL,
+                    corrections_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'captured',
+                    evaluation_case_json TEXT,
+                    approval_reference TEXT,
+                    clause_categories_json TEXT,
+                    captured_by TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    approved_by TEXT,
+                    approved_at TEXT,
+                    UNIQUE (contract_id, tenant_id)
+                );
                 CREATE INDEX IF NOT EXISTS idx_contract_status ON contracts(status);
                 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, due_date);
                 CREATE INDEX IF NOT EXISTS idx_audit_contract ON audit_events(contract_id, id);
@@ -232,6 +261,8 @@ class Store:
             db.execute("CREATE INDEX IF NOT EXISTS idx_task_tenant ON tasks(tenant_id, status, due_date)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_ready ON jobs(status, available_at, created_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_access_tenant ON access_events(tenant_id, accessed_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_notification_tenant ON notification_deliveries(tenant_id, attempted_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_feedback_tenant ON review_feedback(tenant_id, status, captured_at)")
 
     def save_contract(self, contract_id: str, filename: str, provider: str, data: ContractData, raw_text: str, actor: str, tenant_id: str = "default") -> None:
         now = utc_now().isoformat()
@@ -342,9 +373,59 @@ class Store:
                 "INSERT INTO tasks (id, contract_id, title, owner_name, owner_email, due_date, expiration_date, status, created_at, tenant_id, notice_day_type, notice_timezone, notice_holidays_json) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
                 (task_id, contract_id, f"Review renewal: {data.contract or row['filename']}", data.owner_name, data.owner_email, due.isoformat(), data.expiration_date.isoformat(), now, tenant_id, data.notice_day_type, data.notice_timezone, json.dumps([d.isoformat() for d in data.notice_holidays])),
             )
+            scored_fields = ("start_date", "expiration_date", "renewal_notice_days", "notice_day_type", "auto_renew", "termination_notice")
+            proposed_data = ContractData.model_validate_json(row["extracted_json"]).model_dump(mode="json")
+            reviewed_data = data.model_dump(mode="json")
+            proposed = {field: proposed_data.get(field) for field in scored_fields}
+            reviewed = {field: reviewed_data.get(field) for field in scored_fields}
+            corrections = {
+                field: {"proposed": proposed.get(field), "reviewed": reviewed.get(field)}
+                for field in scored_fields if proposed.get(field) != reviewed.get(field)
+            }
+            db.execute(
+                "INSERT INTO review_feedback (id, contract_id, tenant_id, extraction_provider, proposed_json, reviewed_json, corrections_json, captured_by, captured_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(uuid4()), contract_id, tenant_id, row["provider"], json.dumps(proposed), json.dumps(reviewed), json.dumps(corrections), actor, now),
+            )
             self.add_audit(db, contract_id, "contract.confirmed", actor, {"contract": data.model_dump(mode="json"), "task_id": task_id}, tenant_id)
             self.add_audit(db, contract_id, "task.created", "system", {"task_id": task_id, "due_date": due.isoformat(), "notice_day_type": data.notice_day_type, "notice_timezone": data.notice_timezone}, tenant_id)
             return task_id
+
+    def get_review_feedback(self, contract_id: str, tenant_id: str) -> sqlite3.Row | None:
+        with self.connect() as db:
+            return db.execute(
+                "SELECT * FROM review_feedback WHERE contract_id=? AND tenant_id=?", (contract_id, tenant_id),
+            ).fetchone()
+
+    def list_review_feedback(self, tenant_id: str, status: str = "approved", limit: int = 1000) -> list[sqlite3.Row]:
+        with self.connect() as db:
+            return db.execute(
+                "SELECT * FROM review_feedback WHERE tenant_id=? AND status=? ORDER BY captured_at LIMIT ?",
+                (tenant_id, status, limit),
+            ).fetchall()
+
+    def approve_review_feedback(
+        self, contract_id: str, tenant_id: str, actor: str, approval_reference: str,
+        clause_categories: list[str], evaluation_case: dict[str, Any],
+    ) -> sqlite3.Row | None:
+        now = utc_now().isoformat()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT id FROM review_feedback WHERE contract_id=? AND tenant_id=? AND status='captured'",
+                (contract_id, tenant_id),
+            ).fetchone()
+            if not row:
+                return None
+            db.execute(
+                "UPDATE review_feedback SET status='approved', evaluation_case_json=?, approval_reference=?, clause_categories_json=?, approved_by=?, approved_at=? "
+                "WHERE id=? AND tenant_id=? AND status='captured'",
+                (json.dumps(evaluation_case, ensure_ascii=False), approval_reference, json.dumps(clause_categories), actor, now, row["id"], tenant_id),
+            )
+            self.add_audit(db, contract_id, "evaluation_feedback.approved", actor, {
+                "feedback_id": row["id"], "approval_reference": approval_reference,
+                "clause_categories": clause_categories,
+            }, tenant_id)
+            return db.execute("SELECT * FROM review_feedback WHERE id=?", (row["id"],)).fetchone()
 
     def reject_contract(self, contract_id: str, actor: str, tenant_id: str = "default") -> None:
         with self.connect() as db:
@@ -417,6 +498,79 @@ class Store:
             cursor = db.execute(f"UPDATE tasks SET {field}=? WHERE id=? AND {field} IS NULL", (stamp, task_id))
             if cursor.rowcount:
                 self.add_audit(db, task["contract_id"], "task.escalated" if escalation else "task.reminder_sent", "system", {"task_id": task_id, "channel": channel}, task["tenant_id"])
+
+    def record_notification_delivery(
+        self, task_id: str, channel: str, notification_type: str, status: str,
+        duration_ms: int, error_message: str | None = None,
+    ) -> None:
+        stamp = utc_now().isoformat()
+        with self.connect() as db:
+            task = db.execute("SELECT contract_id, tenant_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if not task:
+                return
+            db.execute(
+                "INSERT INTO notification_deliveries (tenant_id, task_id, channel, notification_type, status, duration_ms, error_message, attempted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (task["tenant_id"], task_id, channel, notification_type, status, max(0, duration_ms), error_message[:1000] if error_message else None, stamp),
+            )
+            self.add_audit(db, task["contract_id"], f"notification.{status}", "system", {
+                "task_id": task_id, "channel": channel, "notification_type": notification_type,
+                "duration_ms": max(0, duration_ms),
+            }, task["tenant_id"])
+
+    def operations_snapshot(self, tenant_id: str, stuck_after_minutes: int = 15) -> dict[str, Any]:
+        now = utc_now()
+        cutoff = (now - timedelta(minutes=stuck_after_minutes)).isoformat()
+        hour_ago = (now - timedelta(hours=1)).isoformat()
+        with self.connect() as db:
+            counts = db.execute(
+                "SELECT job_type, status, COUNT(*) AS count FROM jobs WHERE tenant_id=? GROUP BY job_type, status ORDER BY job_type, status",
+                (tenant_id,),
+            ).fetchall()
+            queued_stuck = db.execute(
+                "SELECT COUNT(*) AS count FROM jobs WHERE tenant_id=? AND status='queued' AND available_at<=?",
+                (tenant_id, cutoff),
+            ).fetchone()["count"]
+            expired_leases = db.execute(
+                "SELECT COUNT(*) AS count FROM jobs WHERE tenant_id=? AND status='running' AND lease_expires_at<=?",
+                (tenant_id, now.isoformat()),
+            ).fetchone()["count"]
+            retrying = db.execute(
+                "SELECT COUNT(*) AS count FROM jobs WHERE tenant_id=? AND status IN ('queued','running') AND attempts>1",
+                (tenant_id,),
+            ).fetchone()["count"]
+            recent_jobs = db.execute(
+                "SELECT id, job_type, status, attempts, max_attempts, last_error, result_json, created_at, updated_at, completed_at "
+                "FROM jobs WHERE tenant_id=? ORDER BY updated_at DESC LIMIT 50", (tenant_id,),
+            ).fetchall()
+            deliveries = db.execute(
+                "SELECT channel, notification_type, status, COUNT(*) AS count "
+                "FROM notification_deliveries WHERE tenant_id=? GROUP BY channel, notification_type, status "
+                "ORDER BY channel, notification_type, status", (tenant_id,),
+            ).fetchall()
+            failed_deliveries_hour = db.execute(
+                "SELECT COUNT(*) AS count FROM notification_deliveries WHERE tenant_id=? AND status='failed' AND attempted_at>=?",
+                (tenant_id, hour_ago),
+            ).fetchone()["count"]
+            recent_deliveries = db.execute(
+                "SELECT task_id, channel, notification_type, status, duration_ms, error_message, attempted_at "
+                "FROM notification_deliveries WHERE tenant_id=? ORDER BY attempted_at DESC LIMIT 50", (tenant_id,),
+            ).fetchall()
+        by_status: dict[str, int] = {}
+        by_type: dict[str, dict[str, int]] = {}
+        for row in counts:
+            by_status[row["status"]] = by_status.get(row["status"], 0) + row["count"]
+            by_type.setdefault(row["job_type"], {})[row["status"]] = row["count"]
+        return {
+            "generated_at": now.isoformat(), "tenant_id": tenant_id,
+            "jobs": {"by_status": by_status, "by_type": by_type, "queued_stuck": queued_stuck,
+                     "expired_leases": expired_leases, "retrying": retrying,
+                     "recent": [dict(row) for row in recent_jobs]},
+            "notifications": {"by_channel": [dict(row) for row in deliveries],
+                               "failed_last_hour": failed_deliveries_hour,
+                               "recent": [dict(row) for row in recent_deliveries]},
+            "alerts": [],
+        }
 
     def open_for_escalation(self, cutoff: date | None, tenant_id: str | None = None) -> list[sqlite3.Row]:
         with self.connect() as db:
@@ -792,10 +946,12 @@ class Store:
             tasks = db.execute("SELECT id FROM tasks WHERE contract_id=?", (contract_id,)).fetchall()
             for task in tasks:
                 db.execute("DELETE FROM calendar_events WHERE task_id=?", (task["id"],))
+                db.execute("DELETE FROM notification_deliveries WHERE task_id=?", (task["id"],))
                 db.execute("DELETE FROM task_comments WHERE task_id=?", (task["id"],))
                 db.execute("DELETE FROM notices WHERE task_id=?", (task["id"],))
             db.execute("DELETE FROM tasks WHERE contract_id=?", (contract_id,))
             db.execute("DELETE FROM external_documents WHERE contract_id=?", (contract_id,))
+            db.execute("DELETE FROM review_feedback WHERE contract_id=? AND tenant_id=?", (contract_id, tenant_id))
             db.execute("DELETE FROM audit_events WHERE contract_id=? AND tenant_id=?", (contract_id, tenant_id))
             db.execute(
                 "UPDATE contracts SET filename='redacted.pdf', status='redacted', provider='redacted', extracted_json='{}', "
