@@ -64,6 +64,10 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
             raise HTTPException(status_code=403, detail="Owners can access only their assigned tasks.")
         return row
 
+    def enqueue_calendar_sync_if_configured(tenant_id: str) -> None:
+        if os.getenv("CALENDAR_PROVIDER", "").strip().casefold() in {"microsoft", "google"}:
+            enqueue_calendar_sync(db, tenant_id)
+
     @app.middleware("http")
     async def access_history_middleware(request, call_next):
         response = await call_next(request)
@@ -209,6 +213,14 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
             raise HTTPException(status_code=404, detail="Contract not found")
         return _contract_record(row)
 
+    @app.get("/contracts/{contract_id}/versions")
+    def get_contract_versions(contract_id: str, principal: Principal = Depends(authenticate)) -> dict:
+        """Show amendment lineage and deterministic term changes for this contract."""
+        require_scope(principal, "contracts:read")
+        if not db.get_contract(contract_id, principal.tenant_id):
+            raise HTTPException(status_code=404, detail="Contract not found")
+        return {"contract_id": contract_id, "versions": db.list_contract_versions(contract_id, principal.tenant_id)}
+
     @app.delete("/contracts/{contract_id}", status_code=204)
     def redact_contract(contract_id: str, principal: Principal = Depends(authenticate)) -> Response:
         require_scope(principal, "data:delete")
@@ -272,6 +284,7 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
             raise HTTPException(status_code=404, detail="Contract not found") from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        enqueue_calendar_sync_if_configured(principal.tenant_id)
         return _contract_record(db.get_contract(contract_id, principal.tenant_id))
 
     @app.get("/contracts/{contract_id}/evaluation-feedback")
@@ -406,6 +419,7 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
         if not row:
             raise HTTPException(status_code=404, detail="Task not found")
         updated = db.get_task(task_id, principal.tenant_id)
+        enqueue_calendar_sync_if_configured(principal.tenant_id)
         return _task_record(updated)
 
     @app.get("/calendar.ics")
@@ -543,6 +557,8 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
             row = db.transition_task(task_id, request.workflow_state, principal.actor, request.comment, principal.tenant_id)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if row["status"] == "resolved":
+            enqueue_calendar_sync_if_configured(principal.tenant_id)
         return _task_record(row)
 
     @app.post("/tasks/{task_id}/assign", response_model=ReminderTask)

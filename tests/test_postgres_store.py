@@ -34,6 +34,17 @@ def test_postgres_schema_migrations_and_concurrent_worker_storage():
     store.record_notification_delivery(task_id, "log", "reminder", "sent", 3)
     assert store.operations_snapshot(tenant)["notifications"]["by_channel"][0]["count"] == 1
 
+    amendment_id = f"amendment-{uuid4()}"
+    amendment = terms.model_copy(update={
+        "expiration_date": date(2027, 1, 1),
+        "supersedes_contract_id": contract_id,
+    })
+    store.save_contract(amendment_id, "amendment.pdf", "rules", amendment, "updated notice", "ci", tenant)
+    store.confirm_contract(amendment_id, amendment, "ci", tenant)
+    lineage = store.list_contract_versions(amendment_id, tenant)
+    assert [version["contract_id"] for version in lineage] == [contract_id, amendment_id]
+    assert lineage[1]["changes_from_previous"]["expiration_date"]["to"] == "2027-01-01"
+
     job = store.enqueue_job(tenant, "calendar.sync", {"tenant_id": tenant}, f"sync:{uuid4()}")
     claimed = store.claim_job("ci-postgres-worker", job_id=job["id"])
     assert claimed["id"] == job["id"]
@@ -43,3 +54,4 @@ def test_postgres_schema_migrations_and_concurrent_worker_storage():
     reopened = Store(url)
     assert reopened.get_task(task_id, tenant)["contract_id"] == contract_id
     assert reopened.get_review_feedback(contract_id, tenant)["status"] == "captured"
+    assert len(reopened.list_contract_versions(contract_id, tenant)) == 2

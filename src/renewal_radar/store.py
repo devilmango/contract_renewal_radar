@@ -229,6 +229,16 @@ class Store:
                     approved_at TEXT,
                     UNIQUE (contract_id, tenant_id)
                 );
+                CREATE TABLE IF NOT EXISTS contract_versions (
+                    contract_id TEXT NOT NULL REFERENCES contracts(id),
+                    prior_contract_id TEXT NOT NULL REFERENCES contracts(id),
+                    tenant_id TEXT NOT NULL,
+                    linked_by TEXT NOT NULL,
+                    linked_at TEXT NOT NULL,
+                    PRIMARY KEY (contract_id, tenant_id),
+                    UNIQUE (prior_contract_id, tenant_id),
+                    CHECK (contract_id <> prior_contract_id)
+                );
                 CREATE INDEX IF NOT EXISTS idx_contract_status ON contracts(status);
                 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, due_date);
                 CREATE INDEX IF NOT EXISTS idx_audit_contract ON audit_events(contract_id, id);
@@ -263,6 +273,7 @@ class Store:
             db.execute("CREATE INDEX IF NOT EXISTS idx_access_tenant ON access_events(tenant_id, accessed_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_notification_tenant ON notification_deliveries(tenant_id, attempted_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_feedback_tenant ON review_feedback(tenant_id, status, captured_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_contract_versions_prior ON contract_versions(tenant_id, prior_contract_id)")
 
     def save_contract(self, contract_id: str, filename: str, provider: str, data: ContractData, raw_text: str, actor: str, tenant_id: str = "default") -> None:
         now = utc_now().isoformat()
@@ -362,9 +373,14 @@ class Store:
             task_id = str(uuid4())
             now = utc_now().isoformat()
             if superseded:
+                db.execute(
+                    "INSERT INTO contract_versions (contract_id, prior_contract_id, tenant_id, linked_by, linked_at) VALUES (?, ?, ?, ?, ?)",
+                    (contract_id, superseded["id"], tenant_id, actor, now),
+                )
                 db.execute("UPDATE contracts SET status='superseded' WHERE id=?", (superseded["id"],))
                 db.execute("UPDATE tasks SET status='resolved', workflow_state='cancelled' WHERE contract_id=? AND status='open'", (superseded["id"],))
                 self.add_audit(db, superseded["id"], "contract.superseded", actor, {"replacement_contract_id": contract_id}, tenant_id)
+                self.add_audit(db, contract_id, "contract.version_linked", actor, {"prior_contract_id": superseded["id"]}, tenant_id)
             db.execute(
                 "UPDATE contracts SET status='active', confirmed_json=?, confirmed_at=? WHERE id=?",
                 (data.model_dump_json(), now, contract_id),
@@ -390,6 +406,77 @@ class Store:
             self.add_audit(db, contract_id, "contract.confirmed", actor, {"contract": data.model_dump(mode="json"), "task_id": task_id}, tenant_id)
             self.add_audit(db, contract_id, "task.created", "system", {"task_id": task_id, "due_date": due.isoformat(), "notice_day_type": data.notice_day_type, "notice_timezone": data.notice_timezone}, tenant_id)
             return task_id
+
+    def list_contract_versions(self, contract_id: str, tenant_id: str = "default") -> list[dict[str, Any]]:
+        """Return the complete amendment lineage with deterministic term deltas."""
+        with self.connect() as db:
+            target = db.execute(
+                "SELECT id FROM contracts WHERE id=? AND tenant_id=?", (contract_id, tenant_id),
+            ).fetchone()
+            if not target:
+                return []
+            links = db.execute(
+                "SELECT contract_id, prior_contract_id, linked_by, linked_at FROM contract_versions WHERE tenant_id=?",
+                (tenant_id,),
+            ).fetchall()
+            parent_by_child = {row["contract_id"]: row["prior_contract_id"] for row in links}
+            child_by_parent = {row["prior_contract_id"]: row["contract_id"] for row in links}
+            root = contract_id
+            visited: set[str] = set()
+            while root in parent_by_child and root not in visited:
+                visited.add(root)
+                root = parent_by_child[root]
+            chain = [root]
+            visited = {root}
+            while chain[-1] in child_by_parent:
+                child = child_by_parent[chain[-1]]
+                if child in visited:
+                    break
+                visited.add(child)
+                chain.append(child)
+            placeholders = ",".join("?" for _ in chain)
+            rows = db.execute(
+                f"SELECT * FROM contracts WHERE tenant_id=? AND id IN ({placeholders})",
+                (tenant_id, *chain),
+            ).fetchall()
+        by_id = {row["id"]: row for row in rows}
+        link_by_child = {row["contract_id"]: row for row in links}
+        result: list[dict[str, Any]] = []
+        previous_terms: dict[str, Any] | None = None
+        compared_fields = (
+            "contract", "start_date", "expiration_date", "renewal_notice_days", "notice_day_type",
+            "notice_timezone", "notice_holidays", "notice_method", "notice_recipient", "auto_renew",
+            "termination_notice",
+        )
+        for version_id in chain:
+            row = by_id.get(version_id)
+            if not row:
+                continue
+            terms_json = row["confirmed_json"] or row["extracted_json"]
+            terms = json.loads(terms_json)
+            current_terms = {field: terms.get(field) for field in compared_fields}
+            delta = {}
+            if previous_terms is not None:
+                delta = {
+                    field: {"from": previous_terms.get(field), "to": current_terms.get(field)}
+                    for field in compared_fields
+                    if previous_terms.get(field) != current_terms.get(field)
+                }
+            link = link_by_child.get(version_id)
+            result.append({
+                "contract_id": version_id,
+                "filename": row["filename"],
+                "status": row["status"],
+                "created_at": row["created_at"],
+                "confirmed_at": row["confirmed_at"],
+                "supersedes_contract_id": link["prior_contract_id"] if link else None,
+                "linked_by": link["linked_by"] if link else None,
+                "linked_at": link["linked_at"] if link else None,
+                "terms": current_terms,
+                "changes_from_previous": delta,
+            })
+            previous_terms = current_terms
+        return result
 
     def get_review_feedback(self, contract_id: str, tenant_id: str) -> sqlite3.Row | None:
         with self.connect() as db:

@@ -36,10 +36,11 @@ An extraction is always a proposal. The service does not activate a contract or 
 - **Human review:** Correct extracted fields, assign an owner, then confirm or reject each proposal.
 - **Reviewer workspace:** Open `/review` for a side-by-side proposal, evidence quotes, extracted source text, editable terms, and confirmation or rejection actions.
 - **Renewal tasks:** Calculate the action date using calendar or business days, an IANA time zone, and reviewer-specified holiday dates.
-- **Amendment handling:** A confirmed amendment can supersede an active agreement and close its outstanding tasks with an audit record.
+- **Amendment handling:** A confirmed amendment can supersede an active agreement, close its outstanding tasks, and expose version lineage with deterministic term-by-term differences.
 - **Reminder and escalation runner:** Send one reminder when the task is due and one escalation if it remains open after the configured delay.
 - **Calendar export:** Download open tasks in iCalendar format.
-- **Live calendar sync:** Upsert renewal events in Microsoft 365 or Google Calendar and remove events for resolved tasks.
+- **Live calendar sync:** Upsert renewal events in Microsoft 365 or Google Calendar, automatically enqueue updates when contracts are confirmed or tasks close, and remove events for resolved tasks.
+- **Email integrations:** Deliver reminders through SMTP, Microsoft Graph, or Gmail API with tracked attempts and bounded background retries.
 - **Cloud document intake:** Poll Google Drive and Microsoft Graph delta feeds or receive push notifications that queue delta reconciliation, with revision deduplication and source links.
 - **Renewal workflow:** Move tasks through review, change requests, approval, notice work, renewal, termination, and cancellation with permission checks and audit history.
 - **Notice preparation and delivery evidence:** Draft notice content, require reviewer approval, record dispatch details, and attach delivery confirmation evidence.
@@ -206,7 +207,7 @@ The command queues a durable, tenant-scoped reminder job and processes one job i
 
 For a separate worker process, run `renewal-radar process-jobs --loop --limit 20` under your process supervisor. Queued work survives process restarts; expired worker leases can be reclaimed, transient errors retry with backoff, and jobs that exhaust `JOB_MAX_ATTEMPTS` move to `dead`. Inspect them with `GET /jobs`, and an administrator can requeue a dead job with `POST /jobs/{job_id}/retry`. Reminder and calendar API requests now return `202 Accepted` with a job record; run a worker to execute them. Stable calendar event identifiers and notification message IDs reduce duplicate side effects when a worker retries after a process interruption.
 
-Optional email configuration:
+Optional email configuration (SMTP remains the default):
 
 ```dotenv
 SMTP_HOST=smtp.example.com
@@ -215,11 +216,14 @@ SMTP_USERNAME=renewal-radar
 SMTP_PASSWORD=replace-me
 SMTP_FROM=contracts@example.com
 SMTP_STARTTLS=true
+EMAIL_PROVIDER=smtp
 ESCALATION_EMAIL=legal-lead@example.com
 ESCALATION_AFTER_DAYS=7
 ```
 
-`ESCALATION_EMAIL` receives an unresolved-task escalation when configured; otherwise the task owner receives it. SMTP password handling should use your deployment's secret manager rather than a committed `.env` file.
+`EMAIL_PROVIDER` accepts `smtp`, `microsoft`, or `gmail`. Microsoft Graph email reuses `MS_GRAPH_TENANT_ID`, `MS_GRAPH_CLIENT_ID`, `MS_GRAPH_CLIENT_SECRET`, and `MS_GRAPH_USER_ID`; grant the app the Graph `Mail.Send` application permission with tenant admin consent. Gmail uses `GMAIL_ACCESS_TOKEN` from an OAuth token broker with the `gmail.send` scope. Set `SMTP_FROM` to a sender address verified for the selected provider. Microsoft and Gmail provider errors are recorded as failed notification attempts; the token itself is never written to the job or audit record. Keep provider credentials in a secret manager.
+
+`ESCALATION_EMAIL` receives an unresolved-task escalation when configured; otherwise the task owner receives it. Without the selected provider's credentials, notifications are recorded through the local log channel.
 
 The service also exposes `POST /reminders/run` for a scheduler that enqueues the run through HTTP. Use a token with the `scheduler` or `admin` role.
 
@@ -277,7 +281,11 @@ Reviewers and administrators also manage assignments, workflow transitions, comm
 
 Set `CALENDAR_PROVIDER=microsoft` or `google`. Microsoft accepts a short-lived `MS_GRAPH_ACCESS_TOKEN` or client credentials (`MS_GRAPH_TENANT_ID`, `MS_GRAPH_CLIENT_ID`, `MS_GRAPH_CLIENT_SECRET`), plus `MS_GRAPH_USER_ID` and `MS_GRAPH_CALENDAR_ID`. Google uses `GOOGLE_CALENDAR_ACCESS_TOKEN` and `GOOGLE_CALENDAR_ID`; provide a current access token through a secret manager or token broker. Limit provider permissions to the intended calendar.
 
-Call `POST /calendar/sync` after configuration to enqueue a sync job. The worker creates or updates open task events and removes events when tasks are resolved or superseded. Event IDs are retained in the configured database and synchronization actions are recorded in the contract audit trail. ICS export remains available for clients that do not need live updates.
+Call `POST /calendar/sync` after configuration to enqueue a sync job. Contract confirmation, amendment confirmation, and task resolution automatically enqueue a sync when `CALENDAR_PROVIDER` is configured. The worker creates or updates open task events and removes events when tasks are resolved or superseded. Event IDs are retained in the configured database and synchronization actions are recorded in the contract audit trail. ICS export remains available for clients that do not need live updates.
+
+### Amendments and contract versions
+
+When confirming a replacement or amendment, set `supersedes_contract_id` to the active contract ID in the review payload. Confirmation atomically links the new version, marks the earlier contract superseded, resolves its open task, creates the new task, and records the relationship in the audit trail. `GET /contracts/{contract_id}/versions` returns the complete tenant-scoped lineage from the earliest known version through the latest, including deterministic changes to dates, renewal terms, and notice instructions. The endpoint works when requested with any version in the chain. Imported document revisions remain proposals until a reviewer explicitly confirms them as an amendment.
 
 ### Cloud document intake
 
@@ -387,6 +395,7 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `POST` | `/contracts` | `reviewer` or `admin`: upload and extract a PDF |
 | `GET` | `/contracts?status=pending_review\|active\|rejected\|superseded\|redacted` | `reviewer` or `admin`: list contracts |
 | `GET` | `/contracts/{contract_id}` | `reviewer` or `admin`: view proposal and confirmed terms |
+| `GET` | `/contracts/{contract_id}/versions` | `reviewer` or `admin`: view amendment lineage and term changes |
 | `DELETE` | `/contracts/{contract_id}` | `admin`: redact contract data unless a legal hold is active |
 | `GET/POST` | `/contracts/{contract_id}/legal-holds` | `reviewer` or `admin`: list active holds or place a hold |
 | `POST` | `/legal-holds/{hold_id}/release` | `reviewer` or `admin`: release a hold |
@@ -454,11 +463,13 @@ OpenAPI and interactive request examples are available at `/docs` while the serv
 | `XAI_API_KEY` | unset | xAI API key |
 | `XAI_MODEL` | `grok-4.7` | xAI model override |
 | `SMTP_HOST` | unset | Enables email delivery |
+| `EMAIL_PROVIDER` | `smtp` | Email delivery adapter: `smtp`, `microsoft`, or `gmail` |
 | `SMTP_PORT` | `587` | SMTP server port |
 | `SMTP_USERNAME` | unset | Optional SMTP authentication username |
 | `SMTP_PASSWORD` | unset | Optional SMTP authentication password |
 | `SMTP_FROM` | `renewal-radar@example.com` | Sender address |
 | `SMTP_STARTTLS` | `true` | Start TLS before SMTP login and send |
+| `GMAIL_ACCESS_TOKEN` | unset | Gmail API OAuth access token with `gmail.send` scope |
 | `ESCALATION_EMAIL` | task owner | Optional escalation recipient |
 | `ESCALATION_AFTER_DAYS` | `7` | Days after the initial reminder before escalation |
 | `JOB_MAX_ATTEMPTS` | `5` | Attempts before a background job moves to dead-letter status |
