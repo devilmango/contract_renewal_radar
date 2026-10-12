@@ -81,7 +81,18 @@ class Store:
                     raw_text TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     confirmed_at TEXT,
-                    tenant_id TEXT NOT NULL DEFAULT 'default'
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    supplier_id TEXT
+                );
+                CREATE TABLE IF NOT EXISTS suppliers (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    normalized_name TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (tenant_id, normalized_name)
                 );
                 CREATE TABLE IF NOT EXISTS tasks (
                     id TEXT PRIMARY KEY,
@@ -100,6 +111,20 @@ class Store:
                     notice_holidays_json TEXT NOT NULL DEFAULT '[]',
                     workflow_state TEXT NOT NULL DEFAULT 'review',
                     tenant_id TEXT NOT NULL DEFAULT 'default'
+                );
+                CREATE TABLE IF NOT EXISTS renewal_outcomes (
+                    task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+                    tenant_id TEXT NOT NULL,
+                    contract_id TEXT NOT NULL REFERENCES contracts(id),
+                    outcome TEXT NOT NULL,
+                    actual_annual_value TEXT,
+                    annual_savings TEXT,
+                    currency TEXT,
+                    successor_contract_id TEXT REFERENCES contracts(id),
+                    actual_expiration_date TEXT,
+                    notes TEXT,
+                    recorded_by TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -297,6 +322,8 @@ class Store:
                     columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
                     if "tenant_id" not in columns:
                         db.execute(f"ALTER TABLE {table} ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
+                    if table == "contracts" and "supplier_id" not in columns:
+                        db.execute("ALTER TABLE contracts ADD COLUMN supplier_id TEXT")
                     if table == "tasks" and "notice_day_type" not in columns:
                         db.execute("ALTER TABLE tasks ADD COLUMN notice_day_type TEXT NOT NULL DEFAULT 'calendar'")
                     if table == "tasks" and "notice_timezone" not in columns:
@@ -305,6 +332,8 @@ class Store:
                         db.execute("ALTER TABLE tasks ADD COLUMN notice_holidays_json TEXT NOT NULL DEFAULT '[]'")
                     if table == "tasks" and "workflow_state" not in columns:
                         db.execute("ALTER TABLE tasks ADD COLUMN workflow_state TEXT NOT NULL DEFAULT 'review'")
+                if self.is_postgres and table == "contracts":
+                    db.execute("ALTER TABLE contracts ADD COLUMN IF NOT EXISTS supplier_id TEXT")
             db.execute("CREATE INDEX IF NOT EXISTS idx_contract_tenant ON contracts(tenant_id, status)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_task_tenant ON tasks(tenant_id, status, due_date)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_ready ON jobs(status, available_at, created_at)")
@@ -313,6 +342,8 @@ class Store:
             db.execute("CREATE INDEX IF NOT EXISTS idx_feedback_tenant ON review_feedback(tenant_id, status, captured_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_contract_versions_prior ON contract_versions(tenant_id, prior_contract_id)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_task_notification_tenant ON task_notification_state(tenant_id, sent_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_supplier_tenant ON suppliers(tenant_id, normalized_name)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_outcome_tenant_date ON renewal_outcomes(tenant_id, recorded_at)")
 
     def save_contract(self, contract_id: str, filename: str, provider: str, data: ContractData, raw_text: str, actor: str, tenant_id: str = "default") -> None:
         now = utc_now().isoformat()
@@ -382,6 +413,129 @@ class Store:
             if status:
                 return db.execute("SELECT * FROM contracts WHERE tenant_id=? AND status = ? ORDER BY created_at DESC", (tenant_id, status)).fetchall()
             return db.execute("SELECT * FROM contracts WHERE tenant_id=? ORDER BY created_at DESC", (tenant_id,)).fetchall()
+
+    @staticmethod
+    def _supplier_key(name: str) -> str:
+        return " ".join(name.casefold().split())
+
+    def create_supplier(self, name: str, actor: str, tenant_id: str) -> dict[str, Any]:
+        normalized = self._supplier_key(name)
+        now = utc_now().isoformat()
+        supplier_id = str(uuid4())
+        with self.connect() as db:
+            try:
+                db.execute(
+                    "INSERT INTO suppliers (id,tenant_id,name,normalized_name,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+                    (supplier_id, tenant_id, name.strip(), normalized, actor, now, now),
+                )
+            except Exception as exc:
+                if "unique" in str(exc).casefold() or "duplicate" in str(exc).casefold():
+                    raise ValueError("A supplier with this name already exists in this organization") from exc
+                raise
+            return dict(db.execute("SELECT * FROM suppliers WHERE id=? AND tenant_id=?", (supplier_id, tenant_id)).fetchone())
+
+    def assign_contract_supplier(self, contract_id: str, supplier_id: str, actor: str, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            contract = db.execute("SELECT id,supplier_id FROM contracts WHERE id=? AND tenant_id=?", (contract_id, tenant_id)).fetchone()
+            if not contract:
+                return None
+            supplier = db.execute("SELECT id FROM suppliers WHERE id=? AND tenant_id=?", (supplier_id, tenant_id)).fetchone()
+            if not supplier:
+                raise ValueError("Supplier not found in this organization")
+            db.execute("UPDATE contracts SET supplier_id=? WHERE id=? AND tenant_id=?", (supplier_id, contract_id, tenant_id))
+            db.execute("UPDATE suppliers SET updated_at=? WHERE id=? AND tenant_id=?", (utc_now().isoformat(), supplier_id, tenant_id))
+            self.add_audit(db, contract_id, "contract.supplier_assigned", actor, {"supplier_id": supplier_id}, tenant_id)
+            return dict(db.execute("SELECT * FROM contracts WHERE id=? AND tenant_id=?", (contract_id, tenant_id)).fetchone())
+
+    def list_suppliers(self, tenant_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            suppliers = db.execute("SELECT * FROM suppliers WHERE tenant_id=? ORDER BY normalized_name", (tenant_id,)).fetchall()
+            rows = db.execute(
+                "SELECT c.id,c.supplier_id,c.status,c.confirmed_json,c.extracted_json,t.id AS task_id,t.status AS task_status "
+                "FROM contracts c LEFT JOIN tasks t ON t.contract_id=c.id AND t.tenant_id=c.tenant_id "
+                "WHERE c.tenant_id=? AND c.supplier_id IS NOT NULL",
+                (tenant_id,),
+            ).fetchall()
+        by_supplier: dict[str, dict[str, Any]] = {}
+        for supplier in suppliers:
+            by_supplier[supplier["id"]] = {
+                **dict(supplier), "contract_count": 0, "active_contract_count": 0,
+                "open_renewal_count": 0, "annual_spend_at_risk": {},
+            }
+        seen_contracts: set[tuple[str, str]] = set()
+        for row in rows:
+            item = by_supplier.get(row["supplier_id"])
+            if not item:
+                continue
+            key = (row["supplier_id"], row["id"])
+            if key in seen_contracts:
+                continue
+            seen_contracts.add(key)
+            item["contract_count"] += 1
+            if row["status"] == "active":
+                item["active_contract_count"] += 1
+            if row["task_id"] and row["task_status"] == "open":
+                item["open_renewal_count"] += 1
+                terms = json.loads(row["confirmed_json"] or row["extracted_json"])
+                amount, currency = terms.get("annual_contract_value"), terms.get("currency")
+                if amount is not None and currency:
+                    item["annual_spend_at_risk"][currency] = str(
+                        Decimal(item["annual_spend_at_risk"].get(currency, "0")) + Decimal(str(amount))
+                    )
+        return list(by_supplier.values())
+
+    def record_renewal_outcome(self, task_id: str, request: dict[str, Any], actor: str, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            task = db.execute("SELECT * FROM tasks WHERE id=? AND tenant_id=?", (task_id, tenant_id)).fetchone()
+            if not task:
+                return None
+            if db.execute("SELECT 1 FROM renewal_outcomes WHERE task_id=?", (task_id,)).fetchone():
+                raise ValueError("A renewal outcome has already been recorded for this task")
+            if task["status"] != "open":
+                raise ValueError("Only open tasks can have a renewal outcome recorded")
+            successor_id = request.get("successor_contract_id")
+            if successor_id and not db.execute(
+                "SELECT 1 FROM contracts WHERE id=? AND tenant_id=?", (successor_id, tenant_id),
+            ).fetchone():
+                raise ValueError("Successor contract must belong to this organization")
+            outcome = request["outcome"]
+            workflow_state = "renewed" if outcome in {"renewed", "renegotiated"} else "cancelled" if outcome == "no_action" else "terminated"
+            now = utc_now().isoformat()
+            db.execute(
+                "INSERT INTO renewal_outcomes (task_id,tenant_id,contract_id,outcome,actual_annual_value,annual_savings,currency,successor_contract_id,actual_expiration_date,notes,recorded_by,recorded_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (task_id, tenant_id, task["contract_id"], outcome,
+                 str(request["actual_annual_value"]) if request.get("actual_annual_value") is not None else None,
+                 str(request["annual_savings"]) if request.get("annual_savings") is not None else None,
+                 request.get("currency"), successor_id, iso(request.get("actual_expiration_date")),
+                 request.get("notes"), actor, now),
+            )
+            db.execute("UPDATE tasks SET status='resolved',workflow_state=? WHERE id=?", (workflow_state, task_id))
+            details = {key: value for key, value in request.items() if key != "notes"}
+            details["task_id"] = task_id
+            self.add_audit(db, task["contract_id"], "renewal.outcome_recorded", actor, details, tenant_id)
+            return dict(db.execute("SELECT * FROM renewal_outcomes WHERE task_id=?", (task_id,)).fetchone())
+
+    def renewal_outcome_summary(self, tenant_id: str) -> dict[str, Any]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT outcome,currency,actual_annual_value,annual_savings,recorded_at FROM renewal_outcomes WHERE tenant_id=? ORDER BY recorded_at DESC",
+                (tenant_id,),
+            ).fetchall()
+        counts: dict[str, int] = {}
+        values: dict[str, Decimal] = {}
+        savings: dict[str, Decimal] = {}
+        for row in rows:
+            counts[row["outcome"]] = counts.get(row["outcome"], 0) + 1
+            currency = row["currency"]
+            if currency:
+                values[currency] = values.get(currency, Decimal(0)) + Decimal(row["actual_annual_value"] or "0")
+                savings[currency] = savings.get(currency, Decimal(0)) + Decimal(row["annual_savings"] or "0")
+        return {
+            "total": len(rows), "by_outcome": counts,
+            "actual_annual_value_by_currency": {key: str(value) for key, value in values.items()},
+            "annual_savings_by_currency": {key: str(value) for key, value in savings.items()},
+        }
 
     def confirm_contract(self, contract_id: str, data: ContractData, actor: str, tenant_id: str = "default") -> str:
         from uuid import uuid4

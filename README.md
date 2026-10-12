@@ -312,6 +312,8 @@ Call `POST /calendar/sync` after configuration to enqueue a sync job. Contract c
 
 Administrators can manage organization-specific provider settings through `GET /integrations/connections`, `PUT /integrations/connections/{calendar|email}`, `POST /integrations/connections/{calendar|email}/check`, and `DELETE /integrations/connections/{calendar|email}`. Reviewer accounts can read connection status; only administrators can save, check, or remove a connection. Supported providers are Google Calendar, Microsoft Calendar, SMTP, Microsoft Graph email, and Gmail. OAuth refresh tokens are used to request fresh short-lived access tokens when available. Saving a connection replaces its credential bundle; credentials are encrypted with AES-GCM and never returned by the API. Connection changes and removals are recorded in the integration audit table.
 
+Administrators can also use the `/integrations` setup page to configure calendar and email providers, view saved connection health, run read-only checks, and remove connections. Secret fields are cleared after save and never populated from stored credentials. Updating a connection replaces the full credential bundle; keep the original credential set available when rotating a provider setup.
+
 Set `INTEGRATION_ENCRYPTION_KEY` to a stable, deployment-managed 32-byte key (for example, generate one with `openssl rand -base64 32`) before saving connections. Back it up securely and keep it stable: losing or rotating the key without re-encrypting stored credentials makes those connections unreadable. Tenant credentials are used for that tenant's calendar sync and reminder email; legacy process-wide integration variables remain supported for tenants without a saved connection. The connection check performs a read-only provider request (or SMTP handshake/login) and records health without sending a message or calendar event.
 
 ### Amendments and contract versions
@@ -342,6 +344,10 @@ Open `/operations` or request `GET /operations/health` with a reviewer, schedule
 ### Renewal workflow and notice tracking
 
 Confirmed renewal tasks start in `review`. Reviewers can assign an owner and transition tasks through `needs_changes`, `pending_approval`, and `notice_in_progress`, then record an outcome as `renewed`, `terminated`, or `cancelled`. Owners can request changes and submit notice work for approval. Every transition, assignment, and comment is written to the audit trail.
+
+Reviewers can record a structured final outcome from the task inbox or `POST /tasks/{task_id}/outcome`. Supported outcomes are `renewed`, `renegotiated`, `terminated`, `expired`, and `no_action`. A renewal or renegotiation requires its actual expiration date; optional actual annual value and annual savings require a three-letter currency code. The record can also link a successor contract and retain decision notes. Recording an outcome closes the task and writes the outcome to the contract audit trail. `GET /renewal-outcomes/summary` reports counts and actual values/savings grouped by currency; values in different currencies are never combined.
+
+Supplier master records are tenant-scoped and canonicalized by case-folding and collapsing whitespace. Reviewers can create suppliers and associate contracts through the supplier workspace or API. The directory reports contract counts, active contracts, open renewals, and annual spend at risk by currency. Assigning a supplier is auditable, and one supplier can group multiple contracts. Use `/suppliers/workspace` for the directory and contract assignment controls.
 
 Create a notice draft on a task with `POST /tasks/{task_id}/notices`, including a subject, human-reviewed body, recipient, and delivery method. A reviewer must approve it before dispatch can be recorded. `POST /notices/{notice_id}/dispatch` records the sent timestamp, reference, and optional note; it does not send email or submit the notice to a vendor. Record receipt evidence with `POST /notices/{notice_id}/delivery`. Legal content and actual delivery remain under human control while Radar provides a searchable audit record. List notices with `GET /tasks/{task_id}/notices`.
 
@@ -448,6 +454,10 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `GET` | `/jobs` or `/jobs/{job_id}` | `reviewer`, `scheduler`, or `admin`: inspect tenant jobs |
 | `GET` | `/operations/health` | `reviewer`, `scheduler`, or `admin`: inspect job and notification health with alerts |
 | `GET` | `/renewal-risk/summary` | `reviewer` or `admin`: inspect tenant-scoped renewal risk metrics and backlog |
+| `POST` | `/tasks/{task_id}/outcome` | `reviewer` or `admin`: record a final outcome, actual value/savings, successor, and close the task |
+| `GET` | `/renewal-outcomes/summary` | `reviewer` or `admin`: summarize realized outcomes and monetary metrics by currency |
+| `GET` / `POST` | `/suppliers` | `reviewer` or `admin`: list supplier portfolio rollups or create a canonical supplier |
+| `PUT` | `/suppliers/{supplier_id}/contracts/{contract_id}` | `reviewer` or `admin`: associate a tenant contract with a supplier |
 | `GET` | `/integrations/connections` | `reviewer` or `admin`: list tenant provider connections and health without credentials |
 | `PUT` | `/integrations/connections/{calendar\|email}` | `admin`: create or replace a tenant provider connection |
 | `POST` | `/integrations/connections/{calendar\|email}/check` | `admin`: run a read-only connection health check |
@@ -468,6 +478,8 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `GET` | `/tasks/inbox` | Public UI shell; API calls require task permissions |
 | `GET` | `/operations` | Public UI shell; health API calls require `jobs:read` |
 | `GET` | `/renewal-risk` | Public UI shell; summary API calls require reviewer/admin contract and task read permissions |
+| `GET` | `/integrations` | Public UI shell; configuration and health APIs require administrator permissions |
+| `GET` | `/suppliers/workspace` | Public UI shell; data APIs require reviewer/admin contract permissions |
 | `POST` | `/webhooks/google-drive` | Google Drive push callback; requires configured channel token |
 | `GET/POST` | `/webhooks/microsoft-graph` | Graph validation challenge and push callback; requires configured `clientState` |
 

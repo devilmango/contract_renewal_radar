@@ -178,6 +178,35 @@ class TaskTransitionRequest(BaseModel):
     comment: str | None = Field(default=None, max_length=2000)
 
 
+class RenewalOutcomeRequest(BaseModel):
+    outcome: Literal["renewed", "renegotiated", "terminated", "expired", "no_action"]
+    actual_annual_value: Decimal | None = Field(default=None, ge=0, max_digits=16, decimal_places=2)
+    annual_savings: Decimal | None = Field(default=None, ge=0, max_digits=16, decimal_places=2)
+    currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
+    successor_contract_id: str | None = Field(default=None, max_length=100)
+    actual_expiration_date: date | None = None
+    notes: str | None = Field(default=None, max_length=5000)
+
+    @model_validator(mode="after")
+    def validate_amount_currency(self) -> "RenewalOutcomeRequest":
+        if (self.actual_annual_value is not None or self.annual_savings is not None) and not self.currency:
+            raise ValueError("currency is required when recording an actual value or savings")
+        if self.outcome in {"renewed", "renegotiated"} and self.actual_expiration_date is None:
+            raise ValueError("actual_expiration_date is required for renewed or renegotiated contracts")
+        return self
+
+
+class SupplierCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=250)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Supplier name cannot be blank")
+        return value.strip()
+
+
 class TaskAssignmentRequest(BaseModel):
     owner_name: str | None = Field(default=None, max_length=150)
     owner_email: str | None = Field(default=None, max_length=320)
