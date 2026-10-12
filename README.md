@@ -316,7 +316,9 @@ Set `INTEGRATION_ENCRYPTION_KEY` to a stable, deployment-managed 32-byte key (fo
 
 ### Amendments and contract versions
 
-When confirming a replacement or amendment, set `supersedes_contract_id` to the active contract ID in the review payload. Confirmation atomically links the new version, marks the earlier contract superseded, resolves its open task, creates the new task, and records the relationship in the audit trail. `GET /contracts/{contract_id}/versions` returns the complete tenant-scoped lineage from the earliest known version through the latest, including deterministic changes to dates, renewal terms, and notice instructions. The endpoint works when requested with any version in the chain. Imported document revisions remain proposals until a reviewer explicitly confirms them as an amendment.
+The reviewer workspace suggests active tenant contracts that resemble a pending upload's extracted contract name. Suggestions are ranked by normalized-name similarity and are only hints; a reviewer must select the intended prior contract. `GET /contracts/{contract_id}/amendment-candidates` returns the tenant-scoped suggestions and match reasons.
+
+Before confirmation, use `POST /contracts/{contract_id}/amendment-preview` with the proposed `ConfirmationRequest`. The preview validates the renewal terms and shows a field-by-field diff, the current open tasks that would be resolved, and the replacement task's owner and notice deadline. It is read-only. The review workspace requires a fresh preview of the current terms before enabling confirmation. Confirmation revalidates the selected `supersedes_contract_id`, atomically links the new version, marks the earlier contract superseded, resolves its open task, creates the new task, and records the relationship in the audit trail. `GET /contracts/{contract_id}/versions` returns the complete tenant-scoped lineage from the earliest known version through the latest, including deterministic changes to dates, renewal terms, and notice instructions. The endpoint works when requested with any version in the chain. Imported document revisions remain proposals until a reviewer explicitly confirms them as an amendment.
 
 ### Cloud document intake
 
@@ -427,6 +429,8 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `GET` | `/contracts?status=pending_review\|active\|rejected\|superseded\|redacted` | `reviewer` or `admin`: list contracts |
 | `GET` | `/contracts/{contract_id}` | `reviewer` or `admin`: view proposal and confirmed terms |
 | `GET` | `/contracts/{contract_id}/versions` | `reviewer` or `admin`: view amendment lineage and term changes |
+| `GET` | `/contracts/{contract_id}/amendment-candidates` | `reviewer` or `admin`: get tenant-scoped likely prior agreements for a pending upload |
+| `POST` | `/contracts/{contract_id}/amendment-preview` | `reviewer` or `admin`: preview term changes and task effects before confirmation |
 | `GET` / `PUT` | `/escalation-policy` | `reviewer`: read tenant policy; `admin`: update tenant policy |
 | `DELETE` | `/contracts/{contract_id}` | `admin`: redact contract data unless a legal hold is active |
 | `GET/POST` | `/contracts/{contract_id}/legal-holds` | `reviewer` or `admin`: list active holds or place a hold |

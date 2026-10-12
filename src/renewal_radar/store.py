@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
+from difflib import SequenceMatcher
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -443,6 +445,115 @@ class Store:
             self.add_audit(db, contract_id, "contract.confirmed", actor, {"contract": data.model_dump(mode="json"), "task_id": task_id}, tenant_id)
             self.add_audit(db, contract_id, "task.created", "system", {"task_id": task_id, "due_date": due.isoformat(), "notice_day_type": data.notice_day_type, "notice_timezone": data.notice_timezone}, tenant_id)
             return task_id
+
+    def amendment_candidates(self, contract_id: str, tenant_id: str = "default", limit: int = 5) -> list[dict[str, Any]]:
+        """Rank active tenant contracts by deterministic name similarity to a pending upload."""
+        with self.connect() as db:
+            proposal = db.execute(
+                "SELECT id,filename,extracted_json FROM contracts WHERE id=? AND tenant_id=? AND status='pending_review'",
+                (contract_id, tenant_id),
+            ).fetchone()
+            if not proposal:
+                return []
+            active = db.execute(
+                "SELECT id,filename,confirmed_json,extracted_json FROM contracts "
+                "WHERE tenant_id=? AND status='active' AND id<>? ORDER BY created_at DESC",
+                (tenant_id, contract_id),
+            ).fetchall()
+        proposed_terms = json.loads(proposal["extracted_json"])
+        proposed_name = proposed_terms.get("contract") or Path(proposal["filename"]).stem
+        proposed_key = _amendment_match_key(proposed_name)
+        candidates = []
+        for row in active:
+            terms = json.loads(row["confirmed_json"] or row["extracted_json"])
+            active_name = terms.get("contract") or Path(row["filename"]).stem
+            active_key = _amendment_match_key(active_name)
+            if not proposed_key or not active_key:
+                continue
+            proposed_tokens, active_tokens = set(proposed_key.split()), set(active_key.split())
+            token_similarity = len(proposed_tokens & active_tokens) / max(1, len(proposed_tokens | active_tokens))
+            name_similarity = SequenceMatcher(None, proposed_key, active_key).ratio()
+            score = max(name_similarity, token_similarity)
+            if score < 0.2:
+                continue
+            reasons = []
+            if proposed_key == active_key:
+                reasons.append("normalized_contract_name_match")
+            shared = sorted(proposed_tokens & active_tokens)
+            if shared:
+                reasons.append("shared_name_terms: " + ", ".join(shared))
+            candidates.append({
+                "contract_id": row["id"], "contract": active_name, "filename": row["filename"],
+                "expiration_date": terms.get("expiration_date"), "match_score": round(score, 3),
+                "match_reasons": reasons,
+            })
+        return sorted(candidates, key=lambda item: (-item["match_score"], item["contract"].casefold()))[:limit]
+
+    def preview_contract_confirmation(self, contract_id: str, data: ContractData, tenant_id: str) -> dict[str, Any]:
+        """Validate a proposed confirmation and describe its task/version effects without writing."""
+        with self.connect() as db:
+            proposal = db.execute(
+                "SELECT * FROM contracts WHERE id=? AND tenant_id=?", (contract_id, tenant_id),
+            ).fetchone()
+            if not proposal:
+                raise KeyError(contract_id)
+            if proposal["status"] != "pending_review":
+                raise ValueError("Only contracts pending review can be previewed")
+            if not data.expiration_date:
+                raise ValueError("expiration_date is required before a contract can be activated")
+            if data.auto_renew and data.renewal_notice_days is None:
+                raise ValueError("renewal_notice_days is required for an auto-renewing contract")
+            due = calculate_notice_deadline(
+                data.expiration_date, data.renewal_notice_days or 0,
+                data.notice_day_type, set(data.notice_holidays),
+            )
+            try:
+                ZoneInfo(data.notice_timezone)
+            except ZoneInfoNotFoundError as exc:
+                raise ValueError(f"Unknown IANA timezone: {data.notice_timezone}") from exc
+            previous = None
+            previous_tasks = []
+            if data.supersedes_contract_id:
+                previous = db.execute(
+                    "SELECT * FROM contracts WHERE id=? AND tenant_id=? AND status='active'",
+                    (data.supersedes_contract_id, tenant_id),
+                ).fetchone()
+                if not previous:
+                    raise ValueError("supersedes_contract_id must reference an active contract in this organization")
+                previous_tasks = [dict(row) for row in db.execute(
+                    "SELECT id,title,due_date,expiration_date,owner_email,workflow_state FROM tasks "
+                    "WHERE contract_id=? AND tenant_id=? AND status='open' ORDER BY due_date,id",
+                    (data.supersedes_contract_id, tenant_id),
+                ).fetchall()]
+
+        after = data.model_dump(mode="json")
+        before = json.loads(previous["confirmed_json"] or previous["extracted_json"]) if previous else {}
+        compared_fields = (
+            "contract", "start_date", "expiration_date", "renewal_notice_days", "notice_day_type",
+            "notice_timezone", "notice_holidays", "notice_method", "notice_recipient", "auto_renew",
+            "termination_notice", "owner_name", "owner_email", "annual_contract_value", "currency",
+        )
+        changes = {
+            field: {"before": before.get(field), "after": after.get(field)}
+            for field in compared_fields if previous and before.get(field) != after.get(field)
+        }
+        return {
+            "contract_id": contract_id,
+            "amendment": previous is not None,
+            "supersedes": ({
+                "contract_id": previous["id"], "filename": previous["filename"],
+                "contract": before.get("contract") or previous["filename"], "status_after_confirmation": "superseded",
+            } if previous else None),
+            "changes": changes,
+            "impact": {
+                "open_tasks_to_resolve": previous_tasks,
+                "new_task": {
+                    "title": f"Review renewal: {data.contract or proposal['filename']}",
+                    "due_date": due.isoformat(), "expiration_date": data.expiration_date.isoformat(),
+                    "owner_email": data.owner_email,
+                },
+            },
+        }
 
     def list_contract_versions(self, contract_id: str, tenant_id: str = "default") -> list[dict[str, Any]]:
         """Return the complete amendment lineage with deterministic term deltas."""
@@ -1307,6 +1418,12 @@ class Store:
         for row in candidates:
             redacted += int(self.redact_contract(row["id"], row["tenant_id"], actor))
         return redacted
+
+
+def _amendment_match_key(value: str) -> str:
+    ignored = {"agreement", "contract", "amendment", "addendum", "the", "and", "of"}
+    tokens = re.findall(r"[a-z0-9]+", value.casefold())
+    return " ".join(token for token in tokens if token not in ignored)
 
 
 def calculate_notice_deadline(expiration: date, notice_days: int, day_type: str, holidays: set[date] | None = None) -> date:
