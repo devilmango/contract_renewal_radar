@@ -349,6 +349,14 @@ Reviewers can record a structured final outcome from the task inbox or `POST /ta
 
 Supplier master records are tenant-scoped and canonicalized by case-folding and collapsing whitespace. Reviewers can create suppliers and associate contracts through the supplier workspace or API. The directory reports contract counts, active contracts, open renewals, and annual spend at risk by currency. Assigning a supplier is auditable, and one supplier can group multiple contracts. Use `/suppliers/workspace` for the directory and contract assignment controls.
 
+### Contract obligations beyond renewal
+
+The extraction schema and LLM prompt support dated obligations for price increases, insurance certificates, audit rights, and termination windows. The rules extractor proposes only obligations whose category and date occur in the same sentence; it does not invent a date or owner. Each proposal includes a source quote and can use either an explicit date or an explicit offset from the contract start or expiration. Reviewers can inspect proposals in `/obligations/workspace`, assign an owner, verify the schedule and evidence, then create a separate reminder task. The reminder engine, calendar sync, task inbox, and audit trail treat the obligation as assigned work. Resolve its task when complete. `GET /obligations` lists the tenant's obligations; `POST /contracts/{contract_id}/obligations` schedules a reviewer-approved obligation on an active contract. Owner assignment is required. Obligations are removed when their contract is redacted and their open reminder tasks are resolved when an amendment supersedes the contract.
+
+### Renewal planning and forecasting
+
+Open `/renewal-forecast` or call `POST /renewal-forecast` with `start_date`, `end_date`, `renewal_increase_pct`, and `renegotiation_savings_pct`. The deterministic report compares renew, renegotiate, and terminate scenarios across confirmed active contracts. It prorates annual values by calendar days, groups money by currency, and includes month-by-month projected costs, renewal notice deadlines, and expirations. Renewal growth defaults to 0%; renegotiation savings defaults to 10%. Termination includes spend through the current expiration date and no spend afterward. Contracts without confirmed annual value are listed as missing from monetary totals. The report is a planning aid; scenario assumptions do not change contract terms, task status, or provider calendars. The maximum planning period is five years.
+
 Create a notice draft on a task with `POST /tasks/{task_id}/notices`, including a subject, human-reviewed body, recipient, and delivery method. A reviewer must approve it before dispatch can be recorded. `POST /notices/{notice_id}/dispatch` records the sent timestamp, reference, and optional note; it does not send email or submit the notice to a vendor. Record receipt evidence with `POST /notices/{notice_id}/delivery`. Legal content and actual delivery remain under human control while Radar provides a searchable audit record. List notices with `GET /tasks/{task_id}/notices`.
 
 ### Durable jobs
@@ -458,6 +466,9 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `GET` | `/renewal-outcomes/summary` | `reviewer` or `admin`: summarize realized outcomes and monetary metrics by currency |
 | `GET` / `POST` | `/suppliers` | `reviewer` or `admin`: list supplier portfolio rollups or create a canonical supplier |
 | `PUT` | `/suppliers/{supplier_id}/contracts/{contract_id}` | `reviewer` or `admin`: associate a tenant contract with a supplier |
+| `GET` | `/obligations?status=open\|resolved` | `reviewer`, `admin`, or assigned `owner`: list scheduled obligations and evidence |
+| `POST` | `/contracts/{contract_id}/obligations` | `reviewer` or `admin`: schedule an evidence-backed obligation with an assigned owner |
+| `POST` | `/renewal-forecast` | `reviewer` or `admin`: compare tenant contract spend across planning scenarios |
 | `GET` | `/integrations/connections` | `reviewer` or `admin`: list tenant provider connections and health without credentials |
 | `PUT` | `/integrations/connections/{calendar\|email}` | `admin`: create or replace a tenant provider connection |
 | `POST` | `/integrations/connections/{calendar\|email}/check` | `admin`: run a read-only connection health check |
@@ -480,6 +491,8 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `GET` | `/renewal-risk` | Public UI shell; summary API calls require reviewer/admin contract and task read permissions |
 | `GET` | `/integrations` | Public UI shell; configuration and health APIs require administrator permissions |
 | `GET` | `/suppliers/workspace` | Public UI shell; data APIs require reviewer/admin contract permissions |
+| `GET` | `/obligations/workspace` | Public UI shell; data APIs require reviewer or assigned owner permissions |
+| `GET` | `/renewal-forecast` | Public UI shell; forecast API requires reviewer/admin contract and task read permissions |
 | `POST` | `/webhooks/google-drive` | Google Drive push callback; requires configured channel token |
 | `GET/POST` | `/webhooks/microsoft-graph` | Graph validation challenge and push callback; requires configured `clientState` |
 

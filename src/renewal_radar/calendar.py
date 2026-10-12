@@ -10,7 +10,10 @@ def export_ics(store: Store, owner_email: str | None = None, tenant_id: str = "d
     for task in store.list_tasks(status="open", owner_email=owner_email, tenant_id=tenant_id):
         due = task["due_date"].replace("-", "")
         title = task["title"].replace("\\", "\\\\").replace(",", "\\,").replace(";", "\\;").replace("\n", "\\n")
-        description = f"Review renewal before contract expiration on {task['expiration_date']}"
+        if task["task_kind"] == "obligation":
+            description = f"Complete the assigned contract obligation by {task['due_date']}"
+        else:
+            description = f"Review renewal before contract expiration on {task['expiration_date']}"
         description = description.replace("\\", "\\\\").replace(",", "\\,").replace(";", "\\;")
         lines.extend([
             "BEGIN:VEVENT",

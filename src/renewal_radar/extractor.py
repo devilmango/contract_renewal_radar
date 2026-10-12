@@ -7,9 +7,9 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from .schemas import ContractData, Evidence
+from .schemas import ContractData, ContractObligation, Evidence
 
 
 class ExtractionError(RuntimeError):
@@ -35,6 +35,7 @@ class ContractExtractionOutput(BaseModel):
     annual_contract_value: float | None
     currency: str | None
     evidence: list[Evidence]
+    obligations: list[ContractObligation] = Field(default_factory=list)
 
 
 @dataclass
@@ -143,6 +144,34 @@ class RulesExtractor:
             if currency:
                 result["currency"] = currency
             evidence.append(Evidence(field="annual_contract_value", quote=amount.group(0), confidence=0.65))
+
+        obligation_patterns = (
+            ("price_increase", re.compile(r"price increase|fee increase|rate increase|price adjustment|annual price escalation", re.I), "Price change"),
+            ("insurance_certificate", re.compile(r"certificate of insurance|insurance certificate|proof of insurance", re.I), "Insurance certificate"),
+            ("audit_right", re.compile(r"audit right|right to audit|audit the books|audit records", re.I), "Audit right"),
+            ("termination_window", re.compile(r"termination notice|non-?renewal notice|notice to terminate", re.I), "Termination notice"),
+        )
+        obligations: list[ContractObligation] = []
+        seen_obligations: set[tuple[str, date]] = set()
+        for parsed, raw_date, _context, _date_offset, _context_start in date_hits:
+            date_position = _context_start + _date_offset
+            prior_boundary = max(text.rfind(mark, 0, date_position) for mark in (".", "!", "?", "\n"))
+            following = [position for mark in (".", "!", "?", "\n") if (position := text.find(mark, date_position + len(raw_date))) >= 0]
+            window_start = prior_boundary + 1
+            window_end = min(following) + 1 if following else len(text)
+            excerpt = text[window_start:window_end].strip()
+            for category, pattern, label in obligation_patterns:
+                if not pattern.search(excerpt) or (category, parsed) in seen_obligations:
+                    continue
+                evidence_quote = excerpt[:1000]
+                obligations.append(ContractObligation(
+                    category=category, title=label, description=evidence_quote,
+                    due_date=parsed,
+                    evidence=Evidence(field=f"obligation:{category}", quote=evidence_quote, confidence=0.62),
+                ))
+                seen_obligations.add((category, parsed))
+        if obligations:
+            result["obligations"] = obligations
 
         if not result:
             raise ExtractionError("No contract terms could be identified in the PDF text.")
@@ -274,7 +303,10 @@ _SYSTEM_PROMPT = (
     "For notice_day_type, return business only when the contract explicitly says business days; otherwise return calendar. "
     "Do not calculate dates or infer missing terms. For each extracted field, provide a short "
     "verbatim evidence quote from the document and a confidence from 0 to 1. Extract annual_contract_value "
-    "and currency only when an annual amount and its currency are explicit; do not convert billing periods."
+    "and currency only when an annual amount and its currency are explicit; do not convert billing periods. "
+    "Also extract schedulable obligations for price increases, insurance certificates, audit rights, and termination windows. "
+    "For each obligation, include a verbatim evidence quote and either its explicit due_date or an explicit day offset from the contract start_date or expiration_date. "
+    "Do not invent owners, dates, offsets, or obligations; omit an obligation when no supported schedule can be identified."
 )
 
 
@@ -300,6 +332,31 @@ def _contract_schema(*, nullable_as_any_of: bool = False) -> dict:
             "termination_notice": nullable("string"),
             "annual_contract_value": nullable("number", description="Annual amount, without currency conversion"),
             "currency": nullable("string", description="Explicit three-letter currency code"),
+            "obligations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "category": {"type": "string", "enum": ["price_increase", "insurance_certificate", "audit_right", "termination_window", "other"]},
+                        "title": {"type": "string"},
+                        "description": nullable("string"),
+                        "due_date": nullable("string", description="ISO date YYYY-MM-DD when explicitly stated"),
+                        "due_offset_days": nullable("integer"),
+                        "due_offset_from": {"type": ["string", "null"], "enum": ["start_date", "expiration_date", None]},
+                        "due_offset_direction": {"type": ["string", "null"], "enum": ["before", "after", None]},
+                        "evidence": {
+                            "type": "object",
+                            "properties": {
+                                "field": {"type": "string"}, "quote": {"type": "string"},
+                                "page": nullable("integer"), "confidence": {"type": "number"},
+                            },
+                            "required": ["field", "quote", "page", "confidence"], "additionalProperties": False,
+                        },
+                    },
+                    "required": ["category", "title", "description", "due_date", "due_offset_days", "due_offset_from", "due_offset_direction", "evidence"],
+                    "additionalProperties": False,
+                },
+            },
             "evidence": {
                 "type": "array",
                 "items": {
@@ -314,7 +371,7 @@ def _contract_schema(*, nullable_as_any_of: bool = False) -> dict:
                 },
             },
         },
-        "required": ["contract", "start_date", "expiration_date", "renewal_notice_days", "notice_day_type", "auto_renew", "termination_notice", "annual_contract_value", "currency", "evidence"],
+        "required": ["contract", "start_date", "expiration_date", "renewal_notice_days", "notice_day_type", "auto_renew", "termination_notice", "annual_contract_value", "currency", "evidence", "obligations"],
         "additionalProperties": False,
     }
 

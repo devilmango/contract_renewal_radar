@@ -101,7 +101,7 @@ def _sync_graph(store: Store, tenant_id: str, token: str, user_id: str, calendar
 
 def _graph_event(task) -> dict:
     end = date.fromisoformat(task["due_date"]) + timedelta(days=1)
-    description = f"Review renewal before contract expiration on {task['expiration_date']}. Task: {task['id']}"
+    description = _task_description(task)
     return {
         "subject": task["title"],
         "body": {"contentType": "text", "content": description},
@@ -123,7 +123,7 @@ def _sync_google(store: Store, tenant_id: str, token: str, calendar_id: str) -> 
         event = {
             "id": event_id,
             "summary": task["title"],
-            "description": f"Review renewal before contract expiration on {task['expiration_date']}. Task: {task['id']}",
+            "description": _task_description(task),
             "start": {"date": task["due_date"]},
             "end": {"date": end.isoformat()},
         }
@@ -136,6 +136,14 @@ def _sync_google(store: Store, tenant_id: str, token: str, calendar_id: str) -> 
             store.delete_calendar_event(saved["task_id"], "google", tenant_id)
             removed += 1
     return {"provider": "google", "synced": len(tasks), "removed": removed}
+
+
+def _task_description(task) -> str:
+    if task["task_kind"] == "obligation":
+        description = f"Complete the assigned contract obligation by {task['due_date']}. Task: {task['id']}"
+    else:
+        description = f"Review renewal before contract expiration on {task['expiration_date']}. Task: {task['id']}"
+    return description
 
 
 def _request_json(url: str, *, method: str = "GET", token: str | None = None, payload: dict | None = None,

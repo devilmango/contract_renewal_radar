@@ -14,6 +14,32 @@ class Evidence(BaseModel):
     confidence: float = Field(default=0.5, ge=0, le=1)
 
 
+class ContractObligation(BaseModel):
+    """An extracted, schedulable obligation proposal with source evidence."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    category: Literal["price_increase", "insurance_certificate", "audit_right", "termination_window", "other"]
+    title: str = Field(min_length=1, max_length=250)
+    description: str | None = Field(default=None, max_length=2000)
+    due_date: date | None = None
+    due_offset_days: int | None = Field(default=None, ge=0, le=3650)
+    due_offset_from: Literal["start_date", "expiration_date"] | None = None
+    due_offset_direction: Literal["before", "after"] | None = None
+    evidence: Evidence
+
+    @model_validator(mode="after")
+    def validate_schedule(self) -> "ContractObligation":
+        has_absolute = self.due_date is not None
+        relative = (self.due_offset_days, self.due_offset_from, self.due_offset_direction)
+        has_relative = all(value is not None for value in relative)
+        if has_absolute == has_relative:
+            raise ValueError("Provide either a due_date or a complete due offset and anchor")
+        if any(value is not None for value in relative) and not has_relative:
+            raise ValueError("Relative due dates require offset days, anchor, and direction")
+        return self
+
+
 class ContractData(BaseModel):
     """Normalized contract terms. Dates use ISO-8601 calendar dates."""
 
@@ -36,6 +62,7 @@ class ContractData(BaseModel):
     currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
     supersedes_contract_id: str | None = Field(default=None, max_length=100)
     evidence: list[Evidence] = Field(default_factory=list)
+    obligations: list[ContractObligation] = Field(default_factory=list, max_length=100)
 
     @field_validator("owner_email")
     @classmethod
@@ -167,6 +194,7 @@ class ReminderTask(BaseModel):
     notice_timezone: str = "UTC"
     notice_holidays: list[date] = Field(default_factory=list)
     workflow_state: Literal["review", "needs_changes", "pending_approval", "notice_in_progress", "renewed", "terminated", "cancelled", "resolved"] = "review"
+    kind: Literal["renewal", "obligation"] = "renewal"
 
 
 class ResolveTaskRequest(BaseModel):
@@ -217,6 +245,33 @@ class TaskAssignmentRequest(BaseModel):
         if value and ("@" not in value or value.startswith("@") or value.endswith("@")):
             raise ValueError("owner_email must be a valid email address")
         return value
+
+
+class ObligationCreateRequest(ContractObligation):
+    owner_name: str | None = Field(default=None, max_length=150)
+    owner_email: str = Field(min_length=3, max_length=320)
+
+    @field_validator("owner_email")
+    @classmethod
+    def validate_owner_email(cls, value: str) -> str:
+        if "@" not in value or value.startswith("@") or value.endswith("@"):
+            raise ValueError("owner_email must be a valid email address")
+        return value
+
+
+class RenewalForecastRequest(BaseModel):
+    start_date: date
+    end_date: date
+    renewal_increase_pct: Decimal = Field(default=Decimal("0"), ge=-100, le=1000, max_digits=6, decimal_places=2)
+    renegotiation_savings_pct: Decimal = Field(default=Decimal("10"), ge=0, le=100, max_digits=5, decimal_places=2)
+
+    @model_validator(mode="after")
+    def validate_period(self) -> "RenewalForecastRequest":
+        if self.end_date < self.start_date:
+            raise ValueError("end_date must be on or after start_date")
+        if (self.end_date - self.start_date).days > 366 * 5:
+            raise ValueError("forecast periods cannot exceed five years")
+        return self
 
 
 class TaskCommentRequest(BaseModel):

@@ -51,11 +51,15 @@ def send_notification(
     message["From"] = settings.get("from_address", os.getenv("SMTP_FROM", "renewal-radar@example.com"))
     message["To"] = recipient
     message["Message-ID"] = f"<{hashlib.sha256((task['id'] + (':escalation' if escalation else ':reminder')).encode()).hexdigest()}@renewal-radar>"
+    task_kind = task.get("task_kind", "renewal") if isinstance(task, dict) else task["task_kind"]
+    action_label = "Contract obligation" if task_kind == "obligation" else "Contract renewal"
     message.set_content(
-        f"Contract renewal task: {task['title']}\n"
+        f"{action_label} task: {task['title']}\n"
         f"Action date: {task['due_date']}\n"
-        f"Contract expiration: {task['expiration_date']}\n"
-        + (f"This task is still unresolved. Escalation: {escalation_label or 'follow-up'}.\n" if escalation else "Please review the renewal and record the outcome.\n")
+        + (f"Contract expiration: {task['expiration_date']}\n" if task_kind != "obligation" else "")
+        + (f"This task is still unresolved. Escalation: {escalation_label or 'follow-up'}.\n" if escalation else
+           "Please complete the obligation and update its task status.\n" if task_kind == "obligation" else
+           "Please review the renewal and record the outcome.\n")
     )
     if provider == "microsoft":
         _send_microsoft_email(

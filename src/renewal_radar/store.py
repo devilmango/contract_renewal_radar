@@ -6,11 +6,12 @@ import re
 import sqlite3
 from difflib import SequenceMatcher
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from uuid import uuid4
+import calendar
 
 from .schemas import ContractData
 
@@ -110,7 +111,20 @@ class Store:
                     notice_timezone TEXT NOT NULL DEFAULT 'UTC',
                     notice_holidays_json TEXT NOT NULL DEFAULT '[]',
                     workflow_state TEXT NOT NULL DEFAULT 'review',
-                    tenant_id TEXT NOT NULL DEFAULT 'default'
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    task_kind TEXT NOT NULL DEFAULT 'renewal'
+                );
+                CREATE TABLE IF NOT EXISTS contract_obligations (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    contract_id TEXT NOT NULL REFERENCES contracts(id),
+                    task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
+                    category TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    evidence_json TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS renewal_outcomes (
                     task_id TEXT PRIMARY KEY REFERENCES tasks(id),
@@ -318,6 +332,7 @@ class Store:
                         db.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS notice_timezone TEXT NOT NULL DEFAULT 'UTC'")
                         db.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS notice_holidays_json TEXT NOT NULL DEFAULT '[]'")
                         db.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS workflow_state TEXT NOT NULL DEFAULT 'review'")
+                        db.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS task_kind TEXT NOT NULL DEFAULT 'renewal'")
                 else:
                     columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
                     if "tenant_id" not in columns:
@@ -332,10 +347,14 @@ class Store:
                         db.execute("ALTER TABLE tasks ADD COLUMN notice_holidays_json TEXT NOT NULL DEFAULT '[]'")
                     if table == "tasks" and "workflow_state" not in columns:
                         db.execute("ALTER TABLE tasks ADD COLUMN workflow_state TEXT NOT NULL DEFAULT 'review'")
+                    if table == "tasks" and "task_kind" not in columns:
+                        db.execute("ALTER TABLE tasks ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'renewal'")
                 if self.is_postgres and table == "contracts":
                     db.execute("ALTER TABLE contracts ADD COLUMN IF NOT EXISTS supplier_id TEXT")
             db.execute("CREATE INDEX IF NOT EXISTS idx_contract_tenant ON contracts(tenant_id, status)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_task_tenant ON tasks(tenant_id, status, due_date)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_task_kind_due ON tasks(tenant_id, task_kind, status, due_date)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_obligations_contract ON contract_obligations(tenant_id, contract_id, created_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_ready ON jobs(status, available_at, created_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_access_tenant ON access_events(tenant_id, accessed_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_notification_tenant ON notification_deliveries(tenant_id, attempted_at)")
@@ -452,7 +471,7 @@ class Store:
             suppliers = db.execute("SELECT * FROM suppliers WHERE tenant_id=? ORDER BY normalized_name", (tenant_id,)).fetchall()
             rows = db.execute(
                 "SELECT c.id,c.supplier_id,c.status,c.confirmed_json,c.extracted_json,t.id AS task_id,t.status AS task_status "
-                "FROM contracts c LEFT JOIN tasks t ON t.contract_id=c.id AND t.tenant_id=c.tenant_id "
+                "FROM contracts c LEFT JOIN tasks t ON t.contract_id=c.id AND t.tenant_id=c.tenant_id AND t.task_kind='renewal' "
                 "WHERE c.tenant_id=? AND c.supplier_id IS NOT NULL",
                 (tenant_id,),
             ).fetchall()
@@ -483,6 +502,182 @@ class Store:
                         Decimal(item["annual_spend_at_risk"].get(currency, "0")) + Decimal(str(amount))
                     )
         return list(by_supplier.values())
+
+    def create_contract_obligation(
+        self, contract_id: str, terms: dict[str, Any], owner_name: str | None,
+        owner_email: str, actor: str, tenant_id: str,
+    ) -> dict[str, Any] | None:
+        contract = self.get_contract(contract_id, tenant_id)
+        if not contract:
+            return None
+        if contract["status"] != "active":
+            raise ValueError("Obligations can be scheduled only for active contracts")
+        due_date = terms.get("due_date")
+        if due_date is None:
+            anchor_field = terms.get("due_offset_from")
+            anchor = None
+            confirmed = json.loads(contract["confirmed_json"] or "{}")
+            if anchor_field:
+                anchor = confirmed.get(anchor_field)
+            if not anchor or terms.get("due_offset_days") is None:
+                raise ValueError(f"Cannot resolve obligation due date without the contract {anchor_field or 'date'}")
+            anchor_date = date.fromisoformat(anchor) if isinstance(anchor, str) else anchor
+            delta = timedelta(days=int(terms["due_offset_days"]))
+            due_date = anchor_date - delta if terms.get("due_offset_direction") == "before" else anchor_date + delta
+        elif isinstance(due_date, str):
+            due_date = date.fromisoformat(due_date)
+        confirmed = json.loads(contract["confirmed_json"] or "{}")
+        start_date = confirmed.get("start_date")
+        if start_date and due_date < date.fromisoformat(start_date):
+            raise ValueError("Obligation due date cannot precede the contract start date")
+        obligation_id, task_id = str(uuid4()), str(uuid4())
+        now = utc_now().isoformat()
+        evidence = terms["evidence"]
+        if hasattr(evidence, "model_dump"):
+            evidence = evidence.model_dump(mode="json")
+        if not isinstance(evidence, dict) or not evidence.get("quote"):
+            raise ValueError("An evidence quote is required to schedule an obligation")
+        with self.connect() as db:
+            current = db.execute("SELECT status FROM contracts WHERE id=? AND tenant_id=?", (contract_id, tenant_id)).fetchone()
+            if not current or current["status"] != "active":
+                raise ValueError("Obligations can be scheduled only for active contracts")
+            db.execute(
+                "INSERT INTO tasks (id,contract_id,title,owner_name,owner_email,due_date,expiration_date,status,created_at,tenant_id,task_kind) "
+                "VALUES (?,?,?,?,?,?,?,'open',?,?,'obligation')",
+                (task_id, contract_id, terms["title"], owner_name, owner_email, due_date.isoformat(), due_date.isoformat(), now, tenant_id),
+            )
+            db.execute(
+                "INSERT INTO contract_obligations (id,tenant_id,contract_id,task_id,category,title,description,evidence_json,created_by,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (obligation_id, tenant_id, contract_id, task_id, terms["category"], terms["title"],
+                 terms.get("description"), json.dumps(evidence, default=str), actor, now),
+            )
+            self.add_audit(db, contract_id, "obligation.scheduled", actor, {
+                "obligation_id": obligation_id, "task_id": task_id, "category": terms["category"],
+                "title": terms["title"], "due_date": due_date.isoformat(), "owner_email": owner_email,
+            }, tenant_id)
+            return self._obligation_record(db.execute(
+                "SELECT o.*,t.status AS task_status,t.owner_name,t.owner_email,t.due_date,t.reminder_sent_at,t.escalated_at "
+                "FROM contract_obligations o JOIN tasks t ON t.id=o.task_id WHERE o.id=? AND o.tenant_id=?",
+                (obligation_id, tenant_id),
+            ).fetchone())
+
+    @staticmethod
+    def _obligation_record(row) -> dict[str, Any]:
+        result = dict(row)
+        result["evidence"] = json.loads(result.pop("evidence_json"))
+        result["status"] = result.pop("task_status")
+        return result
+
+    def list_contract_obligations(
+        self, tenant_id: str, status: str | None = None, owner_email: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses, params = ["o.tenant_id=?"], [tenant_id]
+        if status:
+            clauses.append("t.status=?")
+            params.append(status)
+        if owner_email is not None:
+            clauses.append("lower(t.owner_email)=lower(?)")
+            params.append(owner_email)
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT o.*,t.status AS task_status,t.owner_name,t.owner_email,t.due_date,t.reminder_sent_at,t.escalated_at "
+                "FROM contract_obligations o JOIN tasks t ON t.id=o.task_id WHERE " + " AND ".join(clauses) +
+                " ORDER BY t.due_date,o.created_at",
+                tuple(params),
+            ).fetchall()
+        return [self._obligation_record(row) for row in rows]
+
+    def renewal_forecast(
+        self, tenant_id: str, start_date: date, end_date: date,
+        renewal_increase_pct: Decimal = Decimal(0), renegotiation_savings_pct: Decimal = Decimal(10),
+    ) -> dict[str, Any]:
+        if end_date < start_date or (end_date - start_date).days > 366 * 5:
+            raise ValueError("Forecast period must be ordered and no longer than five years")
+        increase = Decimal(renewal_increase_pct) / Decimal(100)
+        savings = Decimal(renegotiation_savings_pct) / Decimal(100)
+        with self.connect() as db:
+            contracts = db.execute(
+                "SELECT c.id,c.filename,c.status,c.confirmed_json,c.extracted_json,s.name AS supplier_name,"
+                "t.id AS task_id,t.due_date AS notice_deadline "
+                "FROM contracts c LEFT JOIN suppliers s ON s.id=c.supplier_id AND s.tenant_id=c.tenant_id "
+                "LEFT JOIN tasks t ON t.contract_id=c.id AND t.tenant_id=c.tenant_id AND t.status='open' AND t.task_kind='renewal' "
+                "WHERE c.tenant_id=? AND c.status='active' ORDER BY c.id",
+                (tenant_id,),
+            ).fetchall()
+        scenarios = ("renew", "renegotiate", "terminate")
+        totals: dict[str, dict[str, Decimal]] = {scenario: {} for scenario in scenarios}
+        monthly: dict[str, dict[str, dict[str, Decimal]]] = {scenario: {} for scenario in scenarios}
+        events: dict[str, dict[str, dict[str, int]]] = {"notice_deadlines": {}, "expirations": {}}
+        items: list[dict[str, Any]] = []
+        missing_values: list[str] = []
+        considered = 0
+        for row in contracts:
+            terms = json.loads(row["confirmed_json"] or row["extracted_json"])
+            expiration = date.fromisoformat(terms["expiration_date"]) if terms.get("expiration_date") else None
+            agreement_start = date.fromisoformat(terms["start_date"]) if terms.get("start_date") else start_date
+            if agreement_start > end_date or (expiration and expiration < start_date):
+                continue
+            considered += 1
+            if row["notice_deadline"]:
+                deadline = date.fromisoformat(row["notice_deadline"])
+                if start_date <= deadline <= end_date:
+                    month = deadline.strftime("%Y-%m")
+                    events["notice_deadlines"].setdefault(month, {})["count"] = events["notice_deadlines"].setdefault(month, {}).get("count", 0) + 1
+            if expiration and start_date <= expiration <= end_date:
+                month = expiration.strftime("%Y-%m")
+                events["expirations"].setdefault(month, {})["count"] = events["expirations"].setdefault(month, {}).get("count", 0) + 1
+            value = terms.get("annual_contract_value")
+            currency = terms.get("currency")
+            if value is None or not currency:
+                missing_values.append(row["id"])
+                items.append({"contract_id": row["id"], "contract": terms.get("contract") or row["filename"],
+                              "supplier": row["supplier_name"], "expiration_date": expiration.isoformat() if expiration else None,
+                              "notice_deadline": row["notice_deadline"], "currency": currency, "annual_contract_value": None,
+                              "projected_costs": None})
+                continue
+            annual = Decimal(str(value))
+            base_start = max(start_date, agreement_start)
+            current_end = min(end_date, expiration) if expiration else end_date
+            base_monthly = _monthly_prorated_costs(annual, base_start, current_end)
+            scenario_monthly: dict[str, dict[str, Decimal]] = {scenario: dict(base_monthly) for scenario in scenarios}
+            if expiration and expiration < end_date:
+                tail_start = max(start_date, expiration + timedelta(days=1))
+                tails = {
+                    "renew": _monthly_prorated_costs(annual * (Decimal(1) + increase), tail_start, end_date),
+                    "renegotiate": _monthly_prorated_costs(annual * (Decimal(1) - savings), tail_start, end_date),
+                    "terminate": {},
+                }
+                for scenario in scenarios:
+                    for month, amount in tails[scenario].items():
+                        scenario_monthly[scenario][month] = scenario_monthly[scenario].get(month, Decimal(0)) + amount
+            scenario_totals = {}
+            for scenario in scenarios:
+                total = sum(scenario_monthly[scenario].values(), Decimal(0))
+                totals[scenario][currency] = totals[scenario].get(currency, Decimal(0)) + total
+                for month, amount in scenario_monthly[scenario].items():
+                    monthly[scenario].setdefault(month, {})[currency] = monthly[scenario].setdefault(month, {}).get(currency, Decimal(0)) + amount
+                scenario_totals[scenario] = _money_string(total)
+            items.append({
+                "contract_id": row["id"], "contract": terms.get("contract") or row["filename"],
+                "supplier": row["supplier_name"], "expiration_date": expiration.isoformat() if expiration else None,
+                "notice_deadline": row["notice_deadline"], "currency": currency,
+                "annual_contract_value": str(annual), "projected_costs": scenario_totals,
+            })
+        return {
+            "period": {"start_date": start_date.isoformat(), "end_date": end_date.isoformat()},
+            "assumptions": {"renewal_increase_pct": str(renewal_increase_pct), "renegotiation_savings_pct": str(renegotiation_savings_pct),
+                            "proration": "daily by calendar-year length; termination ends spend after expiration"},
+            "contracts_considered": considered, "contracts_missing_value": missing_values,
+            "scenarios": {scenario: {
+                "projected_cost_by_currency": {currency: _money_string(amount) for currency, amount in totals[scenario].items()},
+                "monthly_projected_cost_by_currency": {month: {currency: _money_string(amount) for currency, amount in values.items()}
+                                                       for month, values in sorted(monthly[scenario].items())},
+                "notice_deadlines_by_month": {month: value["count"] for month, value in sorted(events["notice_deadlines"].items())},
+                "expirations_by_month": {month: value["count"] for month, value in sorted(events["expirations"].items())},
+            } for scenario in scenarios},
+            "contracts": items,
+        }
 
     def record_renewal_outcome(self, task_id: str, request: dict[str, Any], actor: str, tenant_id: str) -> dict[str, Any] | None:
         with self.connect() as db:
@@ -840,7 +1035,7 @@ class Store:
     def list_tasks(
         self, status: str | None = None, owner_email: str | None = None,
         tenant_id: str = "default", workflow_state: str | None = None,
-        due_before: date | None = None, unassigned: bool = False,
+        due_before: date | None = None, unassigned: bool = False, kind: str | None = None,
     ) -> list[sqlite3.Row]:
         with self.connect() as db:
             clauses = ["tenant_id=?"]
@@ -859,6 +1054,9 @@ class Store:
                 params.append(due_before.isoformat())
             if unassigned:
                 clauses.append("(owner_email IS NULL OR trim(owner_email)='')")
+            if kind:
+                clauses.append("task_kind=?")
+                params.append(kind)
             return db.execute(
                 f"SELECT * FROM tasks WHERE {' AND '.join(clauses)} ORDER BY due_date", tuple(params),
             ).fetchall()
@@ -1086,7 +1284,7 @@ class Store:
             tasks = db.execute(
                 "SELECT t.*, c.extracted_json, c.confirmed_json "
                 "FROM tasks t JOIN contracts c ON c.id=t.contract_id "
-                "WHERE t.tenant_id=? AND t.status='open' ORDER BY t.due_date, t.id",
+                "WHERE t.tenant_id=? AND t.status='open' AND t.task_kind='renewal' ORDER BY t.due_date, t.id",
                 (tenant_id,),
             ).fetchall()
             pending = db.execute(
@@ -1551,6 +1749,8 @@ class Store:
                 db.execute("DELETE FROM task_notification_state WHERE task_id=?", (task["id"],))
                 db.execute("DELETE FROM task_comments WHERE task_id=?", (task["id"],))
                 db.execute("DELETE FROM notices WHERE task_id=?", (task["id"],))
+                db.execute("DELETE FROM contract_obligations WHERE task_id=?", (task["id"],))
+                db.execute("DELETE FROM renewal_outcomes WHERE task_id=?", (task["id"],))
             db.execute("DELETE FROM tasks WHERE contract_id=?", (contract_id,))
             db.execute("DELETE FROM external_documents WHERE contract_id=?", (contract_id,))
             db.execute("DELETE FROM review_feedback WHERE contract_id=? AND tenant_id=?", (contract_id, tenant_id))
@@ -1578,6 +1778,26 @@ def _amendment_match_key(value: str) -> str:
     ignored = {"agreement", "contract", "amendment", "addendum", "the", "and", "of"}
     tokens = re.findall(r"[a-z0-9]+", value.casefold())
     return " ".join(token for token in tokens if token not in ignored)
+
+
+def _monthly_prorated_costs(annual_value: Decimal, start: date, end: date) -> dict[str, Decimal]:
+    if end < start:
+        return {}
+    result: dict[str, Decimal] = {}
+    cursor = start
+    while cursor <= end:
+        last_of_month = date(cursor.year, cursor.month, calendar.monthrange(cursor.year, cursor.month)[1])
+        segment_end = min(end, last_of_month)
+        days = (segment_end - cursor).days + 1
+        year_days = 366 if calendar.isleap(cursor.year) else 365
+        key = cursor.strftime("%Y-%m")
+        result[key] = result.get(key, Decimal(0)) + annual_value * Decimal(days) / Decimal(year_days)
+        cursor = segment_end + timedelta(days=1)
+    return result
+
+
+def _money_string(value: Decimal) -> str:
+    return str(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def calculate_notice_deadline(expiration: date, notice_days: int, day_type: str, holidays: set[date] | None = None) -> date:
