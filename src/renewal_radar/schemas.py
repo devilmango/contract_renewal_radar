@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -31,6 +32,8 @@ class ContractData(BaseModel):
     termination_notice: str | None = Field(default=None, max_length=250)
     owner_name: str | None = Field(default=None, max_length=150)
     owner_email: str | None = Field(default=None, max_length=320)
+    annual_contract_value: Decimal | None = Field(default=None, ge=0, max_digits=16, decimal_places=2)
+    currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
     supersedes_contract_id: str | None = Field(default=None, max_length=100)
     evidence: list[Evidence] = Field(default_factory=list)
 
@@ -48,6 +51,23 @@ class ContractData(BaseModel):
         return self
 
 
+class IntegrationConnectionRequest(BaseModel):
+    """Tenant-owned provider configuration; credentials are encrypted before persistence."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    provider: Literal["google_calendar", "microsoft_calendar", "smtp", "microsoft_email", "gmail"]
+    settings: dict[str, str] = Field(default_factory=dict, max_length=20)
+    credentials: dict[str, str] = Field(default_factory=dict, max_length=20)
+
+    @field_validator("settings", "credentials")
+    @classmethod
+    def validate_connection_values(cls, value: dict[str, str]) -> dict[str, str]:
+        if any(not key or len(key) > 80 or len(item) > 4000 for key, item in value.items()):
+            raise ValueError("integration keys must be short and values cannot exceed 4000 characters")
+        return value
+
+
 class ContractRecord(BaseModel):
     id: str
     filename: str
@@ -62,6 +82,49 @@ class ContractRecord(BaseModel):
 
 class ConfirmationRequest(BaseModel):
     contract: ContractData
+
+
+class EscalationStep(BaseModel):
+    after_due_days: int = Field(ge=0, le=3650)
+    recipient_email: str | None = Field(default=None, max_length=320)
+    label: str = Field(default="Escalation", min_length=1, max_length=100)
+
+    @field_validator("recipient_email")
+    @classmethod
+    def validate_recipient_email(cls, value: str | None) -> str | None:
+        if value and ("@" not in value or value.startswith("@") or value.endswith("@")):
+            raise ValueError("recipient_email must be a valid email address")
+        return value
+
+
+class EscalationPolicy(BaseModel):
+    reminder_days_before: list[int] = Field(default_factory=lambda: [0], max_length=12)
+    escalation_steps: list[EscalationStep] = Field(default_factory=list, max_length=10)
+    backup_owner_email: str | None = Field(default=None, max_length=320)
+
+    @field_validator("backup_owner_email")
+    @classmethod
+    def validate_backup_owner_email(cls, value: str | None) -> str | None:
+        if value and ("@" not in value or value.startswith("@") or value.endswith("@")):
+            raise ValueError("backup_owner_email must be a valid email address")
+        return value
+
+    @field_validator("reminder_days_before")
+    @classmethod
+    def validate_reminder_days(cls, value: list[int]) -> list[int]:
+        if any(day < 0 or day > 3650 for day in value):
+            raise ValueError("reminder days must be between 0 and 3650")
+        if len(set(value)) != len(value):
+            raise ValueError("reminder days must be unique")
+        return sorted(value, reverse=True)
+
+    @field_validator("escalation_steps")
+    @classmethod
+    def validate_escalation_steps(cls, value: list[EscalationStep]) -> list[EscalationStep]:
+        days = [step.after_due_days for step in value]
+        if len(set(days)) != len(days):
+            raise ValueError("escalation steps must have unique after_due_days values")
+        return sorted(value, key=lambda step: step.after_due_days)
 
 
 class EvaluationFeedbackApprovalRequest(BaseModel):

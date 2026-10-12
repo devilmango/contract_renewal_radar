@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -239,6 +240,41 @@ class Store:
                     UNIQUE (prior_contract_id, tenant_id),
                     CHECK (contract_id <> prior_contract_id)
                 );
+                CREATE TABLE IF NOT EXISTS tenant_policies (
+                    tenant_id TEXT PRIMARY KEY,
+                    policy_json TEXT NOT NULL,
+                    updated_by TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS tenant_integrations (
+                    tenant_id TEXT NOT NULL,
+                    integration_name TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    settings_json TEXT NOT NULL,
+                    credentials_ciphertext TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'configured',
+                    updated_by TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_checked_at TEXT,
+                    last_error TEXT,
+                    PRIMARY KEY (tenant_id, integration_name)
+                );
+                CREATE TABLE IF NOT EXISTS integration_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT NOT NULL,
+                    integration_name TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS task_notification_state (
+                    task_id TEXT NOT NULL REFERENCES tasks(id),
+                    tenant_id TEXT NOT NULL,
+                    action_key TEXT NOT NULL,
+                    sent_at TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    PRIMARY KEY (task_id, action_key)
+                );
                 CREATE INDEX IF NOT EXISTS idx_contract_status ON contracts(status);
                 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, due_date);
                 CREATE INDEX IF NOT EXISTS idx_audit_contract ON audit_events(contract_id, id);
@@ -274,6 +310,7 @@ class Store:
             db.execute("CREATE INDEX IF NOT EXISTS idx_notification_tenant ON notification_deliveries(tenant_id, attempted_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_feedback_tenant ON review_feedback(tenant_id, status, captured_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_contract_versions_prior ON contract_versions(tenant_id, prior_contract_id)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_task_notification_tenant ON task_notification_state(tenant_id, sent_at)")
 
     def save_contract(self, contract_id: str, filename: str, provider: str, data: ContractData, raw_text: str, actor: str, tenant_id: str = "default") -> None:
         now = utc_now().isoformat()
@@ -565,15 +602,18 @@ class Store:
         with self.connect() as db:
             return db.execute("SELECT * FROM tasks WHERE id=? AND tenant_id=?", (task_id, tenant_id)).fetchone()
 
-    def due_tasks(self, today: date | None = None, tenant_id: str | None = None) -> list[sqlite3.Row]:
+    def due_tasks(
+        self, today: date | None = None, tenant_id: str | None = None, max_days_before: int = 0,
+    ) -> list[sqlite3.Row]:
+        through = (today + timedelta(days=max(0, max_days_before))).isoformat() if today else None
         with self.connect() as db:
-            if today is None and tenant_id is None:
+            if through is None and tenant_id is None:
                 return db.execute("SELECT * FROM tasks WHERE status='open' ORDER BY due_date").fetchall()
-            if today is not None and tenant_id is None:
-                return db.execute("SELECT * FROM tasks WHERE status='open' AND due_date<=? ORDER BY due_date", (today.isoformat(),)).fetchall()
-            if today is None:
+            if through is not None and tenant_id is None:
+                return db.execute("SELECT * FROM tasks WHERE status='open' AND due_date<=? ORDER BY due_date", (through,)).fetchall()
+            if through is None:
                 return db.execute("SELECT * FROM tasks WHERE tenant_id=? AND status='open' ORDER BY due_date", (tenant_id,)).fetchall()
-            return db.execute("SELECT * FROM tasks WHERE tenant_id=? AND status='open' AND due_date<=? ORDER BY due_date", (tenant_id, today.isoformat())).fetchall()
+            return db.execute("SELECT * FROM tasks WHERE tenant_id=? AND status='open' AND due_date<=? ORDER BY due_date", (tenant_id, through)).fetchall()
 
     def mark_notified(self, task_id: str, escalation: bool, channel: str) -> None:
         stamp = utc_now().isoformat()
@@ -657,6 +697,215 @@ class Store:
                                "failed_last_hour": failed_deliveries_hour,
                                "recent": [dict(row) for row in recent_deliveries]},
             "alerts": [],
+        }
+
+    def get_tenant_policy(self, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT policy_json, updated_by, updated_at FROM tenant_policies WHERE tenant_id=?",
+                (tenant_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {"policy": json.loads(row["policy_json"]), "updated_by": row["updated_by"], "updated_at": row["updated_at"]}
+
+    def save_tenant_policy(self, tenant_id: str, policy: dict[str, Any], actor: str) -> dict[str, Any]:
+        updated_at = utc_now().isoformat()
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO tenant_policies (tenant_id, policy_json, updated_by, updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(tenant_id) DO UPDATE SET policy_json=excluded.policy_json, updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+                (tenant_id, json.dumps(policy, ensure_ascii=False), actor, updated_at),
+            )
+        return {"policy": policy, "updated_by": actor, "updated_at": updated_at}
+
+    def task_notification_keys(self, task_id: str, tenant_id: str) -> set[str]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT action_key FROM task_notification_state WHERE task_id=? AND tenant_id=?",
+                (task_id, tenant_id),
+            ).fetchall()
+        return {row["action_key"] for row in rows}
+
+    def record_task_notification(self, task_id: str, tenant_id: str, action_key: str, channel: str) -> bool:
+        sent_at = utc_now().isoformat()
+        with self.connect() as db:
+            task = db.execute(
+                "SELECT contract_id FROM tasks WHERE id=? AND tenant_id=? AND status='open'",
+                (task_id, tenant_id),
+            ).fetchone()
+            if not task:
+                return False
+            inserted = db.execute(
+                "INSERT INTO task_notification_state (task_id, tenant_id, action_key, sent_at, channel) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(task_id, action_key) DO NOTHING",
+                (task_id, tenant_id, action_key, sent_at, channel),
+            )
+            if inserted.rowcount:
+                self.add_audit(db, task["contract_id"], "task.notification_schedule_completed", "system", {
+                    "task_id": task_id, "action_key": action_key, "channel": channel,
+                }, tenant_id)
+                return True
+            return False
+
+    def save_integration_connection(
+        self, tenant_id: str, integration_name: str, provider: str, settings: dict[str, str],
+        credentials_ciphertext: str, actor: str,
+    ) -> dict[str, Any]:
+        now = utc_now().isoformat()
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO tenant_integrations "
+                "(tenant_id,integration_name,provider,settings_json,credentials_ciphertext,status,updated_by,updated_at,last_checked_at,last_error) "
+                "VALUES (?,?,?,?,?,'configured',?,?,NULL,NULL) "
+                "ON CONFLICT(tenant_id,integration_name) DO UPDATE SET provider=excluded.provider, "
+                "settings_json=excluded.settings_json,credentials_ciphertext=excluded.credentials_ciphertext, "
+                "status='configured',updated_by=excluded.updated_by,updated_at=excluded.updated_at,last_error=NULL",
+                (tenant_id, integration_name, provider, json.dumps(settings), credentials_ciphertext, actor, now),
+            )
+            db.execute(
+                "INSERT INTO integration_audit (tenant_id,integration_name,action,actor,created_at) VALUES (?,?,?,?,?)",
+                (tenant_id, integration_name, "connection.saved", actor, now),
+            )
+        return self.get_integration_connection(tenant_id, integration_name)
+
+    def get_integration_connection(self, tenant_id: str, integration_name: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM tenant_integrations WHERE tenant_id=? AND integration_name=?",
+                (tenant_id, integration_name),
+            ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["settings"] = json.loads(result.pop("settings_json"))
+        return result
+
+    def list_integration_connections(self, tenant_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT integration_name,provider,settings_json,status,updated_by,updated_at,last_checked_at,last_error "
+                "FROM tenant_integrations WHERE tenant_id=? ORDER BY integration_name",
+                (tenant_id,),
+            ).fetchall()
+        return [{**dict(row), "settings": json.loads(row["settings_json"])} for row in rows]
+
+    def update_integration_health(
+        self, tenant_id: str, integration_name: str, status: str, last_error: str | None = None,
+    ) -> None:
+        with self.connect() as db:
+            db.execute(
+                "UPDATE tenant_integrations SET status=?,last_checked_at=?,last_error=? "
+                "WHERE tenant_id=? AND integration_name=?",
+                (status, utc_now().isoformat(), last_error, tenant_id, integration_name),
+            )
+
+    def delete_integration_connection(self, tenant_id: str, integration_name: str, actor: str) -> bool:
+        now = utc_now().isoformat()
+        with self.connect() as db:
+            deleted = db.execute(
+                "DELETE FROM tenant_integrations WHERE tenant_id=? AND integration_name=?",
+                (tenant_id, integration_name),
+            )
+            if deleted.rowcount:
+                db.execute(
+                    "INSERT INTO integration_audit (tenant_id,integration_name,action,actor,created_at) VALUES (?,?,?,?,?)",
+                    (tenant_id, integration_name, "connection.deleted", actor, now),
+                )
+                return True
+            return False
+
+    def renewal_risk_snapshot(self, tenant_id: str, as_of: date | None = None) -> dict[str, Any]:
+        today = as_of or date.today()
+        with self.connect() as db:
+            tasks = db.execute(
+                "SELECT t.*, c.extracted_json, c.confirmed_json "
+                "FROM tasks t JOIN contracts c ON c.id=t.contract_id "
+                "WHERE t.tenant_id=? AND t.status='open' ORDER BY t.due_date, t.id",
+                (tenant_id,),
+            ).fetchall()
+            pending = db.execute(
+                "SELECT id, filename, extracted_json, created_at FROM contracts "
+                "WHERE tenant_id=? AND status='pending_review' ORDER BY created_at",
+                (tenant_id,),
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        spend_at_risk: dict[str, Decimal] = {}
+        high_risk_spend: dict[str, Decimal] = {}
+        overdue = unassigned = due_30 = expiring_90 = high_risk = 0
+        for task in tasks:
+            due = date.fromisoformat(task["due_date"])
+            expiration = date.fromisoformat(task["expiration_date"])
+            days_to_due = (due - today).days
+            days_to_expiration = (expiration - today).days
+            factors: list[str] = []
+            score = 0
+            if days_to_due < 0:
+                overdue += 1
+                factors.append("overdue")
+                score += 50
+            elif days_to_due <= 7:
+                factors.append("deadline_within_7_days")
+                score += 30
+            elif days_to_due <= 30:
+                factors.append("deadline_within_30_days")
+                score += 15
+            if not (task["owner_email"] or "").strip():
+                unassigned += 1
+                factors.append("unassigned_owner")
+                score += 25
+            if task["workflow_state"] in {"needs_changes", "pending_approval"}:
+                factors.append(f"workflow_{task['workflow_state']}")
+                score += 15
+            if 0 <= days_to_due <= 30:
+                due_30 += 1
+            if 0 <= days_to_expiration <= 90:
+                expiring_90 += 1
+                factors.append("expiration_within_90_days")
+                score += 10
+            score = min(score, 100)
+            if score >= 50:
+                high_risk += 1
+            terms = json.loads(task["confirmed_json"] or task["extracted_json"])
+            value = terms.get("annual_contract_value")
+            currency = terms.get("currency")
+            if value is not None and currency:
+                amount = Decimal(str(value))
+                spend_at_risk[currency] = spend_at_risk.get(currency, Decimal(0)) + amount
+                if score >= 50:
+                    high_risk_spend[currency] = high_risk_spend.get(currency, Decimal(0)) + amount
+            items.append({
+                "task_id": task["id"], "contract_id": task["contract_id"],
+                "contract": terms.get("contract") or task["title"],
+                "title": task["title"], "owner_name": task["owner_name"],
+                "owner_email": task["owner_email"], "workflow_state": task["workflow_state"],
+                "due_date": task["due_date"], "expiration_date": task["expiration_date"],
+                "days_to_due": days_to_due, "risk_score": score,
+                "annual_contract_value": terms.get("annual_contract_value"), "currency": currency,
+                "risk_level": "high" if score >= 50 else "medium" if score >= 25 else "low",
+                "risk_factors": factors,
+            })
+        pending_reviews = []
+        for contract in pending:
+            terms = json.loads(contract["extracted_json"])
+            age_days = max(0, (today - date.fromisoformat(contract["created_at"][:10])).days)
+            pending_reviews.append({
+                "contract_id": contract["id"], "contract": terms.get("contract") or contract["filename"],
+                "filename": contract["filename"], "created_at": contract["created_at"],
+                "age_days": age_days, "risk_level": "high" if age_days >= 7 else "medium" if age_days >= 3 else "low",
+            })
+        items.sort(key=lambda item: (-item["risk_score"], item["days_to_due"], item["contract_id"]))
+        pending_reviews.sort(key=lambda item: (-item["age_days"], item["created_at"]))
+        return {
+            "tenant_id": tenant_id, "as_of": today.isoformat(),
+            "summary": {
+                "pending_review_contracts": len(pending_reviews), "overdue_tasks": overdue,
+                "unassigned_open_tasks": unassigned, "renewals_due_30_days": due_30,
+                "expirations_next_90_days": expiring_90, "high_risk_tasks": high_risk,
+                "annual_spend_at_risk": {key: f"{value:.2f}" for key, value in sorted(spend_at_risk.items())},
+                "annual_spend_high_risk": {key: f"{value:.2f}" for key, value in sorted(high_risk_spend.items())},
+            },
+            "tasks": items, "pending_reviews": pending_reviews,
         }
 
     def open_for_escalation(self, cutoff: date | None, tenant_id: str | None = None) -> list[sqlite3.Row]:
@@ -1034,6 +1283,7 @@ class Store:
             for task in tasks:
                 db.execute("DELETE FROM calendar_events WHERE task_id=?", (task["id"],))
                 db.execute("DELETE FROM notification_deliveries WHERE task_id=?", (task["id"],))
+                db.execute("DELETE FROM task_notification_state WHERE task_id=?", (task["id"],))
                 db.execute("DELETE FROM task_comments WHERE task_id=?", (task["id"],))
                 db.execute("DELETE FROM notices WHERE task_id=?", (task["id"],))
             db.execute("DELETE FROM tasks WHERE contract_id=?", (contract_id,))

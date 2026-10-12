@@ -129,6 +129,7 @@ def test_redaction_removes_review_feedback_and_notification_history(tmp_path):
     contract_id = make_confirmed_contract(store, "redaction-tenant")
     task = store.list_tasks(tenant_id="redaction-tenant")[0]
     store.record_notification_delivery(task["id"], "log", "reminder", "sent", 4)
+    assert store.record_task_notification(task["id"], "redaction-tenant", "reminder:0", "log")
     assert store.get_review_feedback(contract_id, "redaction-tenant")
     assert store.operations_snapshot("redaction-tenant")["notifications"]["recent"]
 
@@ -137,3 +138,4 @@ def test_redaction_removes_review_feedback_and_notification_history(tmp_path):
     assert store.redact_contract(contract_id, "redaction-tenant", "admin")
     assert store.get_review_feedback(contract_id, "redaction-tenant") is None
     assert store.operations_snapshot("redaction-tenant")["notifications"]["recent"] == []
+    assert store.task_notification_keys(task["id"], "redaction-tenant") == set()

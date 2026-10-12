@@ -31,6 +31,7 @@ ROLE_SCOPES = {
         "notices:dispatch",
         "integrations:sync",
         "jobs:read",
+        "settings:read",
         "data:hold",
         "access:read",
         "calendar:read",

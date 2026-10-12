@@ -37,7 +37,8 @@ An extraction is always a proposal. The service does not activate a contract or 
 - **Reviewer workspace:** Open `/review` for a side-by-side proposal, evidence quotes, extracted source text, editable terms, and confirmation or rejection actions.
 - **Renewal tasks:** Calculate the action date using calendar or business days, an IANA time zone, and reviewer-specified holiday dates.
 - **Amendment handling:** A confirmed amendment can supersede an active agreement, close its outstanding tasks, and expose version lineage with deterministic term-by-term differences.
-- **Reminder and escalation runner:** Send one reminder when the task is due and one escalation if it remains open after the configured delay.
+- **Reminder and escalation runner:** Send scheduled reminders before the notice deadline and tiered follow-ups when the task remains open.
+- **Configurable escalation policies:** Set tenant-specific reminder offsets, a backup owner, and multiple named escalation tiers with independent recipients.
 - **Calendar export:** Download open tasks in iCalendar format.
 - **Live calendar sync:** Upsert renewal events in Microsoft 365 or Google Calendar, automatically enqueue updates when contracts are confirmed or tasks close, and remove events for resolved tasks.
 - **Email integrations:** Deliver reminders through SMTP, Microsoft Graph, or Gmail API with tracked attempts and bounded background retries.
@@ -47,6 +48,7 @@ An extraction is always a proposal. The service does not activate a contract or 
 - **Durable background jobs:** Persist reminder, calendar-sync, document-reconciliation, and retention work with deduplication keys, worker leases, bounded retries, and dead-letter recovery.
 - **Reviewer task inbox:** Filter upcoming work by workflow stage, deadline, and assignment; assign owners, update workflow, comment, resolve, and inspect contract history and notice drafts.
 - **Operations dashboard:** Inspect queue health, retries, dead letters, stuck work, calendar-sync jobs, and email/log notification delivery attempts with threshold-based alerts.
+- **Renewal risk dashboard:** Triage overdue and near-deadline work, unassigned tasks, upcoming expirations, and aging contract reviews in a tenant-scoped portfolio view.
 - **Reviewer feedback evaluation:** Capture proposal-to-confirmed corrections, approve de-identified evidence-backed cases, and export them for repeatable provider comparison.
 - **Contract-data governance:** Enforce an LLM provider allowlist, record authenticated access history, support legal holds, and redact eligible contract records on demand or by retention policy.
 - **Evidence-quality evaluation:** Measure whether field values are supported by their evidence, track synthetic and OCR fixture results separately, and gate evidence quality in CI.
@@ -225,6 +227,23 @@ ESCALATION_AFTER_DAYS=7
 
 `ESCALATION_EMAIL` receives an unresolved-task escalation when configured; otherwise the task owner receives it. Without the selected provider's credentials, notifications are recorded through the local log channel.
 
+### Tenant escalation policies
+
+Reviewers can inspect the active policy with `GET /escalation-policy`; only administrators can update it with `PUT /escalation-policy`. Policies are tenant-scoped and stored in the configured database. `reminder_days_before` schedules reminders relative to the task's notice deadline, `backup_owner_email` receives reminders for unassigned tasks, and `escalation_steps` sends named follow-ups after the deadline to the configured escalation recipient. Each reminder offset and escalation day is persisted as a completed action so daily job retries do not resend a completed step. If a worker misses a scheduled day, all eligible unsent actions are caught up on its next run.
+
+```json
+{
+  "reminder_days_before": [90, 30, 7, 0],
+  "backup_owner_email": "contracts-ops@example.com",
+  "escalation_steps": [
+    {"after_due_days": 0, "recipient_email": "team-lead@example.com", "label": "Team lead"},
+    {"after_due_days": 7, "recipient_email": "legal@example.com", "label": "Legal escalation"}
+  ]
+}
+```
+
+The default policy sends one reminder on the notice deadline and escalates after `ESCALATION_AFTER_DAYS`, preserving the original behavior. Configured tiers are evaluated by each task's local notice date and use calendar-day offsets.
+
 The service also exposes `POST /reminders/run` for a scheduler that enqueues the run through HTTP. Use a token with the `scheduler` or `admin` role.
 
 ### 5. Resolve work, export dates, and review history
@@ -270,18 +289,30 @@ RADAR_AUTH_USERS_JSON='[{"actor":"contract-admin","token_sha256":"<64-character-
 
 The authenticated actor name, rather than a caller-supplied `X-Actor` or request-body field, is recorded in the audit history. Tokens are compared by digest and are not stored in SQLite. Rotate a token by generating a replacement, removing the old digest from `RADAR_AUTH_USERS_JSON`, and reloading the service.
 
+### Renewal risk dashboard
+
+Open `/renewal-risk` or request `GET /renewal-risk/summary`. The dashboard is tenant-scoped and shows pending contract reviews, overdue tasks, unassigned open tasks, notice deadlines within 30 days, expirations within 90 days, and high-risk task counts. Task risk scores are deterministic: overdue status, deadlines within 7/30 days, missing owners, selected blocked workflow states, and expirations within 90 days add risk points. Pending-review contracts are listed separately and marked high risk after seven days. Pass `as_of=YYYY-MM-DD` to the summary endpoint to produce a reproducible snapshot.
+
+Spend exposure uses only reviewer-confirmed `annual_contract_value` and ISO-style three-letter `currency` values. The summary reports `annual_spend_at_risk` for all open renewal tasks and `annual_spend_high_risk` for tasks with a deterministic risk score of 50 or more. Amounts are grouped by currency; they are never converted or summed across currencies. Contracts without confirmed values do not affect these totals.
+
 The built-in role configuration is intentionally small. An `owner` entry must include the same email address assigned to that owner's tasks. Each static token can set `tenant_id` (default `default`); principals only see data in their tenant. Provision a distinct ID for each organization.
 
 For OIDC single sign-on, configure the issuer, JWKS URL, audience, authorization and token endpoints, client ID and secret, and an exact callback URI of `/auth/oidc/callback`. The login uses authorization code flow with state and nonce checks; the ID token is signature-validated and held in a short-lived, HttpOnly session cookie. Radar reads roles from `OIDC_ROLES_CLAIM` (default `roles`) and tenant from `OIDC_TENANT_CLAIM` (default `tenant_id`). The ID token must contain those claims and use `OIDC_AUDIENCE`. Configure the same callback URI in the IdP. `RADAR_COOKIE_SECURE=true` is correct behind HTTPS; set it to `false` only for local HTTP development. Deploy behind TLS and protect client credentials.
 
 Reviewer permissions include source-text access so the reviewer can verify extraction evidence. Keep reviewer tokens scoped and assign role and tenant claims intentionally.
-Reviewers and administrators also manage assignments, workflow transitions, comments, and notice approval. Owners can read and create notices for assigned tasks; only reviewers or administrators can approve and record dispatch/delivery evidence.
+Reviewers and administrators also manage assignments, workflow transitions, comments, and notice approval. Reviewers can read the tenant's escalation policy; only administrators can change it. Owners can read and create notices for assigned tasks; only reviewers or administrators can approve and record dispatch/delivery evidence.
 
 ### Live calendar synchronization
 
 Set `CALENDAR_PROVIDER=microsoft` or `google`. Microsoft accepts a short-lived `MS_GRAPH_ACCESS_TOKEN` or client credentials (`MS_GRAPH_TENANT_ID`, `MS_GRAPH_CLIENT_ID`, `MS_GRAPH_CLIENT_SECRET`), plus `MS_GRAPH_USER_ID` and `MS_GRAPH_CALENDAR_ID`. Google uses `GOOGLE_CALENDAR_ACCESS_TOKEN` and `GOOGLE_CALENDAR_ID`; provide a current access token through a secret manager or token broker. Limit provider permissions to the intended calendar.
 
 Call `POST /calendar/sync` after configuration to enqueue a sync job. Contract confirmation, amendment confirmation, and task resolution automatically enqueue a sync when `CALENDAR_PROVIDER` is configured. The worker creates or updates open task events and removes events when tasks are resolved or superseded. Event IDs are retained in the configured database and synchronization actions are recorded in the contract audit trail. ICS export remains available for clients that do not need live updates.
+
+#### Tenant-owned calendar and email connections
+
+Administrators can manage organization-specific provider settings through `GET /integrations/connections`, `PUT /integrations/connections/{calendar|email}`, `POST /integrations/connections/{calendar|email}/check`, and `DELETE /integrations/connections/{calendar|email}`. Reviewer accounts can read connection status; only administrators can save, check, or remove a connection. Supported providers are Google Calendar, Microsoft Calendar, SMTP, Microsoft Graph email, and Gmail. OAuth refresh tokens are used to request fresh short-lived access tokens when available. Saving a connection replaces its credential bundle; credentials are encrypted with AES-GCM and never returned by the API. Connection changes and removals are recorded in the integration audit table.
+
+Set `INTEGRATION_ENCRYPTION_KEY` to a stable, deployment-managed 32-byte key (for example, generate one with `openssl rand -base64 32`) before saving connections. Back it up securely and keep it stable: losing or rotating the key without re-encrypting stored credentials makes those connections unreadable. Tenant credentials are used for that tenant's calendar sync and reminder email; legacy process-wide integration variables remain supported for tenants without a saved connection. The connection check performs a read-only provider request (or SMTP handshake/login) and records health without sending a message or calendar event.
 
 ### Amendments and contract versions
 
@@ -396,6 +427,7 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `GET` | `/contracts?status=pending_review\|active\|rejected\|superseded\|redacted` | `reviewer` or `admin`: list contracts |
 | `GET` | `/contracts/{contract_id}` | `reviewer` or `admin`: view proposal and confirmed terms |
 | `GET` | `/contracts/{contract_id}/versions` | `reviewer` or `admin`: view amendment lineage and term changes |
+| `GET` / `PUT` | `/escalation-policy` | `reviewer`: read tenant policy; `admin`: update tenant policy |
 | `DELETE` | `/contracts/{contract_id}` | `admin`: redact contract data unless a legal hold is active |
 | `GET/POST` | `/contracts/{contract_id}/legal-holds` | `reviewer` or `admin`: list active holds or place a hold |
 | `POST` | `/legal-holds/{hold_id}/release` | `reviewer` or `admin`: release a hold |
@@ -411,6 +443,11 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `POST` | `/reminders/run` | `scheduler` or `admin`: enqueue a durable reminder job (202) |
 | `GET` | `/jobs` or `/jobs/{job_id}` | `reviewer`, `scheduler`, or `admin`: inspect tenant jobs |
 | `GET` | `/operations/health` | `reviewer`, `scheduler`, or `admin`: inspect job and notification health with alerts |
+| `GET` | `/renewal-risk/summary` | `reviewer` or `admin`: inspect tenant-scoped renewal risk metrics and backlog |
+| `GET` | `/integrations/connections` | `reviewer` or `admin`: list tenant provider connections and health without credentials |
+| `PUT` | `/integrations/connections/{calendar\|email}` | `admin`: create or replace a tenant provider connection |
+| `POST` | `/integrations/connections/{calendar\|email}/check` | `admin`: run a read-only connection health check |
+| `DELETE` | `/integrations/connections/{calendar\|email}` | `admin`: remove a tenant provider connection |
 | `POST` | `/jobs/{job_id}/retry` | `admin`: requeue a dead job |
 | `POST` | `/data-retention/run` | `admin`: enqueue a configured retention sweep (202) |
 | `GET` | `/calendar.ics` | `reviewer` or `admin`: export all tasks; `owner`: export assigned tasks |
@@ -426,6 +463,7 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `GET` | `/review` | Public UI shell; API calls require a reviewer token |
 | `GET` | `/tasks/inbox` | Public UI shell; API calls require task permissions |
 | `GET` | `/operations` | Public UI shell; health API calls require `jobs:read` |
+| `GET` | `/renewal-risk` | Public UI shell; summary API calls require reviewer/admin contract and task read permissions |
 | `POST` | `/webhooks/google-drive` | Google Drive push callback; requires configured channel token |
 | `GET/POST` | `/webhooks/microsoft-graph` | Graph validation challenge and push callback; requires configured `clientState` |
 
@@ -471,7 +509,7 @@ OpenAPI and interactive request examples are available at `/docs` while the serv
 | `SMTP_STARTTLS` | `true` | Start TLS before SMTP login and send |
 | `GMAIL_ACCESS_TOKEN` | unset | Gmail API OAuth access token with `gmail.send` scope |
 | `ESCALATION_EMAIL` | task owner | Optional escalation recipient |
-| `ESCALATION_AFTER_DAYS` | `7` | Days after the initial reminder before escalation |
+| `ESCALATION_AFTER_DAYS` | `7` | Default-policy escalation delay after the notice deadline; tenant policies can override it |
 | `JOB_MAX_ATTEMPTS` | `5` | Attempts before a background job moves to dead-letter status |
 | `JOB_RETRY_BASE_SECONDS` | `30` | Base exponential retry delay in seconds (capped at one hour) |
 | `JOB_LEASE_SECONDS` | `120` | Worker lease duration before interrupted work can be reclaimed |

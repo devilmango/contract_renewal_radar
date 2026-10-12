@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .store import Store
+from .integrations import access_token, decrypt_credentials
 
 
 class CalendarSyncError(RuntimeError):
@@ -17,6 +18,18 @@ class CalendarSyncError(RuntimeError):
 
 def sync_calendar(store: Store, tenant_id: str) -> dict[str, int | str]:
     """Upsert open renewal tasks into Microsoft 365 or Google Calendar."""
+    connection = store.get_integration_connection(tenant_id, "calendar")
+    if connection:
+        provider = connection["provider"]
+        credentials = decrypt_credentials(tenant_id, "calendar", connection["credentials_ciphertext"])
+        settings = connection["settings"]
+        if provider == "microsoft_calendar":
+            token = access_token(provider, credentials)
+            return _sync_graph(store, tenant_id, token, settings["user_id"], settings["calendar_id"])
+        if provider == "google_calendar":
+            token = access_token(provider, credentials)
+            return _sync_google(store, tenant_id, token, settings["calendar_id"])
+        raise CalendarSyncError(f"Unsupported tenant calendar provider: {provider}")
     provider = os.getenv("CALENDAR_PROVIDER", "").strip().casefold()
     if provider not in {"microsoft", "google"}:
         raise CalendarSyncError("Set CALENDAR_PROVIDER to 'microsoft' or 'google' to enable live sync.")

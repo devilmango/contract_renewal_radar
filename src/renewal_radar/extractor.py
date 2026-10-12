@@ -32,6 +32,8 @@ class ContractExtractionOutput(BaseModel):
     notice_day_type: str
     auto_renew: bool | None
     termination_notice: str | None
+    annual_contract_value: float | None
+    currency: str | None
     evidence: list[Evidence]
 
 
@@ -128,6 +130,19 @@ class RulesExtractor:
         if termination:
             result["termination_notice"] = termination.group(1).strip()
             evidence.append(Evidence(field="termination_notice", quote=termination.group(0), confidence=0.7))
+
+        amount = re.search(
+            r"(?:annual contract value|annual fee|annual subscription fee|annual spend)\s*(?:is|of|:|=)?\s*"
+            r"(?:(USD|EUR|GBP|CAD|AUD|INR)\s*)?\$?\s*([\d,]+(?:\.\d{1,2})?)\s*(USD|EUR|GBP|CAD|AUD|INR)?",
+            normalized,
+            re.IGNORECASE,
+        )
+        if amount:
+            result["annual_contract_value"] = amount.group(2).replace(",", "")
+            currency = (amount.group(1) or amount.group(3) or ("USD" if "$" in amount.group(0) else "")).upper()
+            if currency:
+                result["currency"] = currency
+            evidence.append(Evidence(field="annual_contract_value", quote=amount.group(0), confidence=0.65))
 
         if not result:
             raise ExtractionError("No contract terms could be identified in the PDF text.")
@@ -258,7 +273,8 @@ _SYSTEM_PROMPT = (
     "Extract contract terms exactly as written. Return null when a value is not explicit. "
     "For notice_day_type, return business only when the contract explicitly says business days; otherwise return calendar. "
     "Do not calculate dates or infer missing terms. For each extracted field, provide a short "
-    "verbatim evidence quote from the document and a confidence from 0 to 1."
+    "verbatim evidence quote from the document and a confidence from 0 to 1. Extract annual_contract_value "
+    "and currency only when an annual amount and its currency are explicit; do not convert billing periods."
 )
 
 
@@ -282,6 +298,8 @@ def _contract_schema(*, nullable_as_any_of: bool = False) -> dict:
             "notice_day_type": {"type": "string", "enum": ["calendar", "business"]},
             "auto_renew": nullable("boolean"),
             "termination_notice": nullable("string"),
+            "annual_contract_value": nullable("number", description="Annual amount, without currency conversion"),
+            "currency": nullable("string", description="Explicit three-letter currency code"),
             "evidence": {
                 "type": "array",
                 "items": {
@@ -296,7 +314,7 @@ def _contract_schema(*, nullable_as_any_of: bool = False) -> dict:
                 },
             },
         },
-        "required": ["contract", "start_date", "expiration_date", "renewal_notice_days", "notice_day_type", "auto_renew", "termination_notice", "evidence"],
+        "required": ["contract", "start_date", "expiration_date", "renewal_notice_days", "notice_day_type", "auto_renew", "termination_notice", "annual_contract_value", "currency", "evidence"],
         "additionalProperties": False,
     }
 

@@ -31,6 +31,13 @@ def test_postgres_schema_migrations_and_concurrent_worker_storage():
     assert comment["body"] == "Review notice clause"
     assert store.list_tasks(status="open", tenant_id=tenant, unassigned=True)[0]["id"] == task_id
     assert store.get_review_feedback(contract_id, tenant)["status"] == "captured"
+    policy = {
+        "reminder_days_before": [14, 0], "escalation_steps": [], "backup_owner_email": None,
+    }
+    assert store.save_tenant_policy(tenant, policy, "ci-admin")["policy"] == policy
+    assert store.get_tenant_policy(tenant)["policy"] == policy
+    assert store.record_task_notification(task_id, tenant, "reminder:14", "log")
+    assert store.task_notification_keys(task_id, tenant) == {"reminder:14"}
     store.record_notification_delivery(task_id, "log", "reminder", "sent", 3)
     assert store.operations_snapshot(tenant)["notifications"]["by_channel"][0]["count"] == 1
 
@@ -54,4 +61,6 @@ def test_postgres_schema_migrations_and_concurrent_worker_storage():
     reopened = Store(url)
     assert reopened.get_task(task_id, tenant)["contract_id"] == contract_id
     assert reopened.get_review_feedback(contract_id, tenant)["status"] == "captured"
+    assert reopened.get_tenant_policy(tenant)["policy"] == policy
+    assert reopened.task_notification_keys(task_id, tenant) == {"reminder:14"}
     assert len(reopened.list_contract_versions(contract_id, tenant)) == 2
