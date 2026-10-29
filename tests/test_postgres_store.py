@@ -30,6 +30,7 @@ def test_postgres_schema_migrations_and_concurrent_worker_storage():
     )
     store.save_contract(contract_id, "agreement.pdf", "rules", terms, "notice 30 days", "ci", tenant)
     task_id = store.confirm_contract(contract_id, terms, "ci", tenant)
+    assert store.list_tasks(status="open", tenant_id=tenant, unassigned=True)[0]["id"] == task_id
     forecast = store.renewal_forecast(tenant, date(2025, 1, 1), date(2026, 1, 1), Decimal("5"), Decimal("10"))
     store.record_renewal_forecast(tenant, forecast, "ci-reviewer")
     store.record_renewal_outcome(task_id, {
@@ -45,7 +46,7 @@ def test_postgres_schema_migrations_and_concurrent_worker_storage():
     assert store.update_obligation_schedule(obligation["id"], tenant, "ci-reviewer", status="paused")["schedule_status"] == "paused"
     comment = store.add_task_comment(task_id, "Review notice clause", "ci", tenant)
     assert comment["body"] == "Review notice clause"
-    assert store.list_tasks(status="open", tenant_id=tenant, unassigned=True)[0]["id"] == task_id
+    assert store.get_task(task_id, tenant)["status"] == "resolved"
     assert store.get_review_feedback(contract_id, tenant)["status"] == "captured"
     policy = {
         "reminder_days_before": [14, 0], "escalation_steps": [], "backup_owner_email": None,
