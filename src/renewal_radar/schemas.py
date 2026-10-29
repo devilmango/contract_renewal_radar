@@ -227,6 +227,7 @@ class RenewalOutcomeRequest(BaseModel):
 
 class SupplierCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=250)
+    risk_level: Literal["low", "medium", "high", "critical"] = "medium"
 
     @field_validator("name")
     @classmethod
@@ -234,6 +235,10 @@ class SupplierCreateRequest(BaseModel):
         if not value.strip():
             raise ValueError("Supplier name cannot be blank")
         return value.strip()
+
+
+class SupplierRiskUpdateRequest(BaseModel):
+    risk_level: Literal["low", "medium", "high", "critical"]
 
 
 class TaskAssignmentRequest(BaseModel):
@@ -376,3 +381,100 @@ class AccessEvent(BaseModel):
     entity_type: str
     entity_id: str | None
     accessed_at: datetime
+
+
+class ObligationEvidenceRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    content_type: Literal["application/pdf", "image/png", "image/jpeg", "text/plain", "application/octet-stream"]
+    content_base64: str = Field(min_length=4, max_length=7_000_000)
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+class ObligationComplianceRequest(BaseModel):
+    outcome: Literal["failed", "missed"]
+    comment: str = Field(min_length=1, max_length=2000)
+
+
+class ObligationEvidenceReviewRequest(BaseModel):
+    decision: Literal["approved", "rejected"]
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+class ApprovalPlaybookRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=150)
+    min_contract_value: Decimal | None = Field(default=None, ge=0, max_digits=16, decimal_places=2)
+    currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
+    supplier_risk_levels: list[Literal["low", "medium", "high", "critical"]] = Field(default_factory=list, max_length=4)
+    changed_clause_categories: list[Literal["effective_term", "expiration", "renewal", "auto_renewal", "notice_period", "termination", "pricing", "data_retention", "liability", "security", "other"]] = Field(default_factory=list, max_length=20)
+    required_approvers: list[str] = Field(min_length=1, max_length=20)
+    checklist: list[str] = Field(default_factory=list, max_length=30)
+
+    @field_validator("required_approvers")
+    @classmethod
+    def validate_approvers(cls, value: list[str]) -> list[str]:
+        cleaned = sorted({email.strip().casefold() for email in value})
+        if any("@" not in email or email.startswith("@") or email.endswith("@") for email in cleaned):
+            raise ValueError("required_approvers must contain valid email addresses")
+        return cleaned
+
+    @field_validator("checklist", "changed_clause_categories")
+    @classmethod
+    def validate_playbook_lists(cls, value: list[str]) -> list[str]:
+        if any(not item.strip() or len(item) > 250 for item in value):
+            raise ValueError("playbook entries must be non-empty and at most 250 characters")
+        return [item.strip() for item in value]
+
+    @model_validator(mode="after")
+    def validate_threshold_currency(self) -> "ApprovalPlaybookRequest":
+        if self.min_contract_value is not None and not self.currency:
+            raise ValueError("currency is required with min_contract_value")
+        return self
+
+
+class BulkPortfolioRequest(BaseModel):
+    action: Literal["assign_tasks", "transition_tasks", "assign_supplier"]
+    ids: list[str] = Field(min_length=1, max_length=100)
+    owner_name: str | None = Field(default=None, max_length=150)
+    owner_email: str | None = Field(default=None, max_length=320)
+    workflow_state: Literal["review", "needs_changes", "pending_approval", "notice_in_progress"] | None = None
+    supplier_id: str | None = Field(default=None, max_length=100)
+    comment: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("ids")
+    @classmethod
+    def validate_ids(cls, value: list[str]) -> list[str]:
+        if any(not item.strip() or len(item) > 100 for item in value):
+            raise ValueError("IDs must be non-empty and at most 100 characters")
+        if len(set(value)) != len(value):
+            raise ValueError("IDs must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def validate_action_values(self) -> "BulkPortfolioRequest":
+        if self.action == "assign_tasks" and self.owner_email is None:
+            raise ValueError("owner_email is required to bulk assign tasks")
+        if self.owner_email and ("@" not in self.owner_email or self.owner_email.startswith("@") or self.owner_email.endswith("@")):
+            raise ValueError("owner_email must be a valid email address")
+        if self.action == "transition_tasks" and self.workflow_state is None:
+            raise ValueError("workflow_state is required to bulk transition tasks")
+        if self.action == "assign_supplier" and self.supplier_id is None:
+            raise ValueError("supplier_id is required to bulk assign contracts")
+        return self
+
+
+class PlaybookApplyRequest(BaseModel):
+    changed_clause_categories: list[Literal["effective_term", "expiration", "renewal", "auto_renewal", "notice_period", "termination", "pricing", "data_retention", "liability", "security", "other"]] = Field(default_factory=list, max_length=20)
+
+    @field_validator("changed_clause_categories")
+    @classmethod
+    def validate_categories(cls, value: list[str]) -> list[str]:
+        return [item.strip() for item in value if item.strip()]
+
+
+class PlaybookApprovalRequest(BaseModel):
+    approved: bool
+
+
+class PlaybookChecklistRequest(BaseModel):
+    index: int = Field(ge=0, le=100)
+    completed: bool

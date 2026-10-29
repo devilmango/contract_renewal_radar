@@ -50,6 +50,10 @@ An extraction is always a proposal. The service does not activate a contract or 
 - **Operations dashboard:** Inspect queue health, retries, dead letters, stuck work, integration checks, calendar-sync jobs, and email/log notification attempts with actionable retry controls and alerts.
 - **Renewal risk dashboard:** Triage overdue and near-deadline work, unassigned tasks, upcoming expirations, and aging contract reviews in a tenant-scoped portfolio view.
 - **Reviewer feedback evaluation:** Capture proposal-to-confirmed corrections, approve de-identified evidence-backed cases, and export them for repeatable provider comparison.
+- **Obligation proof and sign-off:** Attach checksummed completion evidence, require reviewer approval before recurring work advances, and retain failed, missed, submitted, and reviewed outcomes in compliance history.
+- **Renewal playbooks:** Route tasks to named approvers using contract-value, supplier-risk, and amendment-clause conditions; keep a renewal blocked until every reviewer and checklist requirement is complete.
+- **Portfolio operations:** Bulk-assign task owners, move eligible tasks into review, associate contracts with suppliers, and export tenant-scoped portfolios as CSV or Excel workbooks.
+- **Provider drift monitoring:** Compare rules and configured LLM providers on the same redacted fixtures, including field accuracy, evidence support, amendment clause coverage, and provider-extracted amendment term changes; surface score drops against each provider's prior run.
 - **Contract-data governance:** Enforce an LLM provider allowlist, record authenticated access history, support legal holds, and redact eligible contract records on demand or by retention policy.
 - **Evidence-quality evaluation:** Measure whether field values are supported by their evidence, track synthetic and OCR fixture results separately, and gate evidence quality in CI.
 - **Organization isolation:** Contract, task, source text, audit, and calendar records are scoped by tenant ID.
@@ -283,8 +287,8 @@ RADAR_AUTH_USERS_JSON='[{"actor":"contract-admin","token_sha256":"<64-character-
 | Role | Permissions |
 | --- | --- |
 | `admin` | All API operations |
-| `reviewer` | Upload and review contracts, view contract/access history, manage all tasks, and place or release legal holds |
-| `owner` | View assigned tasks, request workflow changes, comment, prepare notice drafts, and resolve assigned tasks |
+| `reviewer` | Upload and review contracts, approve obligation evidence, manage playbooks and portfolio exports, view contract/access history, manage all tasks, and place or release legal holds |
+| `owner` | View assigned tasks, upload obligation proof, record compliance exceptions, request workflow changes, comment, prepare notice drafts, and resolve assigned renewal tasks |
 | `scheduler` | Trigger the reminder/escalation runner and poll configured document sources |
 
 The authenticated actor name, rather than a caller-supplied `X-Actor` or request-body field, is recorded in the audit history. Tokens are compared by digest and are not stored in SQLite. Rotate a token by generating a replacement, removing the old digest from `RADAR_AUTH_USERS_JSON`, and reloading the service.
@@ -351,7 +355,35 @@ Supplier master records are tenant-scoped and canonicalized by case-folding and 
 
 ### Contract obligations beyond renewal
 
-The extraction schema and LLM prompt support dated obligations for price increases, insurance certificates, audit rights, and termination windows. The rules extractor proposes only obligations whose category and date occur in the same sentence; it does not invent a date or owner. Each proposal includes a source quote and can use either an explicit date or an explicit offset from the contract start or expiration. Explicit annual, quarterly, monthly, or every-N-month schedules are captured as recurrence intervals. Reviewers can inspect proposals in `/obligations/workspace`, assign an owner, verify the schedule and evidence, then create a separate reminder task. When an active recurring occurrence is resolved, the next task is created with a calendar-safe date and the same evidence and owner, up to the active contract's expiration. Reviewers can pause or resume a schedule, end it permanently, change the cadence, or reschedule an open occurrence in the workspace; all changes are tenant-scoped and audited. A paused or ended schedule does not create the next occurrence when its current task is resolved. `PATCH /obligations/{obligation_id}/schedule` updates schedule status and/or cadence; `POST /obligations/{obligation_id}/reschedule` moves an open occurrence within the contract term. The reminder engine, calendar sync, task inbox, and audit trail treat every occurrence as assigned work. `GET /obligations` lists the tenant's obligations; `POST /contracts/{contract_id}/obligations` schedules a reviewer-approved obligation on an active contract. Owner assignment is required. Obligations are removed when their contract is redacted and their open reminder tasks are resolved when an amendment supersedes the contract.
+The extraction schema and LLM prompt support dated obligations for price increases, insurance certificates, audit rights, and termination windows. The rules extractor proposes only obligations whose category and date occur in the same sentence; it does not invent a date or owner. Each proposal includes a source quote and can use either an explicit date or an explicit offset from the contract start or expiration. Explicit annual, quarterly, monthly, or every-N-month schedules are captured as recurrence intervals. Reviewers can inspect proposals in `/obligations/workspace`, assign an owner, verify the schedule and evidence, then create a separate reminder task. Owners attach completion proof through `/compliance/workspace` or `POST /obligations/{obligation_id}/evidence`; accepted files are PDF, PNG, JPEG, plain text, or binary, up to 5 MB. The file content and SHA-256 checksum are persisted in tenant-scoped storage. A new submission enters `pending_signoff`; only reviewer approval resolves the occurrence and creates the next recurring task. Rejected evidence stays in the compliance timeline and can be replaced with a new submission. The direct task-resolution endpoint rejects obligation occurrences without reviewer-approved evidence. Owners and reviewers can record `failed` outcomes at any time and mark an occurrence `missed` only after the due date. `GET /obligations/{obligation_id}/compliance` returns the immutable outcome timeline and proof metadata, and `/obligation-evidence/{evidence_id}/download` streams the original file only to an authorized tenant user. Reviewers can pause or resume a schedule, end it permanently, change the cadence, or reschedule an open occurrence; all changes are tenant-scoped and audited. A paused or ended schedule does not create the next occurrence when its current task is signed off. `PATCH /obligations/{obligation_id}/schedule` updates schedule status and/or cadence; `POST /obligations/{obligation_id}/reschedule` moves an open occurrence within the contract term. Obligations and attached proof are deleted when their contract is redacted; open reminder tasks are resolved when an amendment supersedes the contract.
+
+### Renewal approval playbooks
+
+Open `/portfolio/workspace` or call `POST /renewal-playbooks` to define a named approval playbook. Optional conditions include a minimum annual value and currency, supplier-risk levels, and changed amendment-clause categories. Every configured condition must match when the playbook is applied to an open renewal task. The request includes all clause categories identified during amendment review, such as `renewal`, `termination`, `pricing`, `security`, and `liability`. A match creates a task review, changes the task to `pending_approval`, and snapshots the required approvers and checklist. Every required approver must record a decision using their authenticated email, and every checklist entry must be complete before the review moves from `blocked` to `approved`; a rejection is final. Application, approvals, and checklist edits are written to the contract audit history. Playbook application is a workflow gate and does not itself send a notice or modify contract terms.
+
+Example:
+
+```json
+{
+  "name": "High-value cloud renewals",
+  "min_contract_value": "100000.00",
+  "currency": "USD",
+  "supplier_risk_levels": ["high", "critical"],
+  "changed_clause_categories": ["renewal", "pricing", "liability"],
+  "required_approvers": ["legal@example.com", "finance@example.com"],
+  "checklist": ["Review amendment differences", "Confirm notice instructions"]
+}
+```
+
+Use `POST /tasks/{task_id}/playbooks/{playbook_id}` with the observed `changed_clause_categories`, then retrieve the review with `GET /tasks/{task_id}/playbook-review`. Required approvers record decisions at `POST /tasks/{task_id}/playbook-review/approval`; reviewers update checklist items at `PATCH /tasks/{task_id}/playbook-review/checklist`. Configure supplier risk with `POST /suppliers` or `PATCH /suppliers/{supplier_id}/risk`.
+
+### Portfolio bulk actions and exports
+
+Open `/portfolio/workspace` for bulk task assignment, workflow transitions, supplier associations, and downloads. `POST /portfolio/bulk` accepts up to 100 unique IDs per request and applies an action atomically within the tenant: `assign_tasks` updates open task owners, `transition_tasks` moves compatible open tasks into a selected review state, or `assign_supplier` associates contracts with a tenant-owned supplier. The endpoint rejects the full operation if any selected record is missing, closed, incompatible, or belongs to another tenant. Bulk operations record contract audit events. `GET /portfolio/export?dataset=contracts|tasks|suppliers|obligations&format=csv|xlsx` exports confirmed portfolio fields only, excludes stored contract source text and evidence file contents, prevents spreadsheet formula injection, and enforces reviewer/admin access. Owner-scoped exports are not available.
+
+### Provider evaluation and drift monitoring
+
+Use `/portfolio/workspace` or call `POST /evaluations/runs` to evaluate the built-in redacted fixture set with the local rules baseline and each configured, allowlisted provider. Provider credentials must already be configured; LLM runs make external API requests and may incur charges. Each run stores provider/model, fixture-set fingerprint, field exact-match accuracy, evidence-support accuracy, amendment-clause evidence accuracy, and amendment comparison accuracy. Amendment fixtures include paired active/amendment text and reviewed expected changed fields, so the evaluator checks whether each provider identifies structured date/notice changes and preserves unchanged terms when only other text changes. Clause evidence scoring checks whether provider quotes cover expected term, expiration, renewal, auto-renewal, notice, and termination categories. `GET /evaluations/drift` is tenant-scoped and compares a run only with the provider's previous run over the identical fixture fingerprint. It reports a drift alert when any score drops by at least 0.10 (10 percentage points); the endpoint and workspace surface alerts for reviewer follow-up. The run action is explicit and can be repeated after changing prompts, models, or fixtures. These fixtures are regression signals rather than legal-quality certification.
 
 ### Renewal planning and forecasting
 
@@ -375,7 +407,7 @@ Set `CONTRACT_RETENTION_DAYS` to enable scheduled redaction of eligible old reco
 
 ## Extraction evaluation
 
-The `evaluation/cases/` directory contains fictional, redacted contract excerpts and OCR-style text fixtures, including amendments, ambiguous extensions, explicit no-notice cases, and calendar versus business-day terms. The evaluator reports exact-match field and case accuracy, source-type breakdowns, evidence quote grounding, whether each extracted value is supported by its field evidence, latency, provider-reported token usage, and an optional cost estimate using configured per-token rates.
+The `evaluation/cases/` directory contains fictional, redacted contract excerpts and OCR-style text fixtures, including paired active/amendment comparisons, ambiguous extensions, explicit no-notice cases, and calendar versus business-day terms. The evaluator reports exact-match field and case accuracy, source-type breakdowns, evidence quote grounding, field-evidence support, amendment clause evidence and changed-field comparison accuracy, latency, provider-reported token usage, and an optional cost estimate using configured per-token rates.
 
 Run the rules baseline locally:
 
@@ -395,9 +427,9 @@ Compare the rules baseline with every provider API key configured in the environ
 renewal-radar evaluate --provider all --output evaluation/reports/all-providers.json
 ```
 
-Use `--min-exact-accuracy`, `--min-field-accuracy`, and `--min-evidence-support` to make quality thresholds fail the command. GitHub Actions runs the rules baseline with 0.70 exact-case and field thresholds and a 0.90 evidence-support threshold for pull requests and pushes to `main` or `master`.
+Use `--min-exact-accuracy`, `--min-field-accuracy`, `--min-evidence-support`, `--min-clause-accuracy`, and `--min-amendment-comparison-accuracy` to make quality thresholds fail the command. GitHub Actions runs the rules baseline with 0.70 exact-case and field thresholds, a 0.90 evidence-support threshold, and 0.75 floors for amendment-clause evidence and changed-field comparisons for pull requests and pushes to `main` or `master`.
 
-`all` always includes the rules baseline, then includes configured and allowlisted LLM providers in provider-selection order. Each provider receives the same fixture texts. LLM evaluations make external API requests and may incur provider charges. This small fixture set is a regression signal, not a statistically representative measure of legal extraction quality; review the cases and add organization-approved, de-identified examples before using scores to select a provider. See the evaluation guide for an approval/de-identification record format. Do not commit confidential contracts or identifiers to a public repository.
+`all` always includes the rules baseline, then includes configured and allowlisted LLM providers in provider-selection order. Each provider receives the same fixture texts; paired amendment fixtures require an additional extraction call for the active version. LLM evaluations make external API requests and may incur provider charges. This compact fixture set is a regression signal, not a statistically representative measure of legal extraction quality; review the cases and add organization-approved, de-identified examples before using scores to select a provider. See the evaluation guide for an approval/de-identification record format. Do not commit confidential contracts or identifiers to a public repository.
 
 See [evaluation/README.md](evaluation/README.md) for scoring details and fixture conventions.
 
@@ -457,7 +489,7 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `GET` | `/contracts/{contract_id}/evaluation-feedback` | `reviewer` or `admin`: inspect captured reviewer corrections and approval status |
 | `POST` | `/contracts/{contract_id}/evaluation-feedback/approve` | `reviewer` or `admin`: approve a de-identified evidence-backed evaluation case |
 | `GET` | `/tasks?status=open\|resolved` | `reviewer` or `admin`: list all tasks; `owner`: list assigned tasks; filter with `workflow_state`, `due_before`, or `unassigned` |
-| `POST` | `/tasks/{task_id}/resolve` | `reviewer` or `admin`: resolve any task; `owner`: resolve assigned tasks |
+| `POST` | `/tasks/{task_id}/resolve` | `reviewer` or `admin`: resolve any task; `owner`: resolve assigned renewal tasks; obligation occurrences require approved evidence sign-off |
 | `POST` | `/reminders/run` | `scheduler` or `admin`: enqueue a durable reminder job (202) |
 | `GET` | `/jobs` or `/jobs/{job_id}` | `reviewer`, `scheduler`, or `admin`: inspect tenant jobs |
 | `GET` | `/operations/health` | `reviewer`, `scheduler`, or `admin`: inspect job, notification, and integration health with alerts |
@@ -482,6 +514,19 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `POST` | `/calendar/sync` | `reviewer` or `admin`: enqueue live calendar synchronization (202) |
 | `POST` | `/document-sources/sync` | `reviewer`, `admin`, or `scheduler`: poll configured cloud drives |
 | `POST` | `/tasks/{task_id}/assign` | `reviewer` or `admin`: assign a task owner |
+| `GET/POST` | `/obligations/{obligation_id}/compliance` | `reviewer`, `admin`, or assigned owner: inspect history or record failed/missed compliance |
+| `POST` | `/obligations/{obligation_id}/evidence` | `reviewer`, `admin`, or assigned owner: attach proof and request reviewer sign-off |
+| `POST` | `/obligation-evidence/{evidence_id}/review` | `reviewer` or `admin`: approve or reject submitted proof |
+| `GET` | `/obligation-evidence/{evidence_id}/download` | `reviewer`, `admin`, or assigned owner: download tenant-scoped proof |
+| `GET/POST` | `/renewal-playbooks` | `reviewer` or `admin`: list or create approval routing rules |
+| `POST` | `/tasks/{task_id}/playbooks/{playbook_id}` | `reviewer` or `admin`: evaluate rules and apply a playbook |
+| `GET` | `/tasks/{task_id}/playbook-review` | `reviewer`, `admin`, or assigned owner: read approval/checklist state |
+| `POST` | `/tasks/{task_id}/playbook-review/approval` | Required reviewer or admin approver: record a decision |
+| `PATCH` | `/tasks/{task_id}/playbook-review/checklist` | `reviewer` or `admin`: update a playbook checklist item |
+| `POST` | `/portfolio/bulk` | `reviewer` or `admin`: bulk assign, transition, or associate records |
+| `GET` | `/portfolio/export?dataset=contracts\|tasks\|suppliers\|obligations&format=csv\|xlsx` | `reviewer` or `admin`: download tenant-scoped CSV/XLSX |
+| `POST` | `/evaluations/runs` | `reviewer` or `admin`: evaluate the redacted fixture set with configured providers |
+| `GET` | `/evaluations/drift` | `reviewer` or `admin`: inspect provider history and score-drop alerts |
 | `POST` | `/tasks/{task_id}/transition` | `reviewer` or `admin`: advance workflow; owners can request changes or submit notice work |
 | `GET/POST` | `/tasks/{task_id}/comments` | `reviewer`, `admin`, or assigned `owner`: list/add comments |
 | `GET/POST` | `/tasks/{task_id}/notices` | `reviewer`, `admin`, or assigned `owner`: list/prepare notice drafts |

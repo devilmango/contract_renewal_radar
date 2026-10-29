@@ -1,0 +1,14 @@
+{
+  "id": "amendment-security-change-term-preserved",
+  "contract_text": "[CUSTOMER] Amendment No. 2 to Cloud Services Agreement. Amendment Effective Date: January 1, 2027. The parties leave the service term unchanged; the agreement expires December 31, 2027 and automatically renews for successive one-year terms unless written notice is given at least 90 days before expiration. Supplier must report any actual or suspected security incident involving Customer Data within 48 hours.",
+  "active_contract_text": "[CUSTOMER] Cloud Services Agreement. Effective Date: January 1, 2027. Expires December 31, 2027. The agreement automatically renews for successive one-year terms unless written notice is given at least 90 days before expiration.",
+  "expected": {
+    "start_date": "2027-01-01",
+    "expiration_date": "2027-12-31",
+    "renewal_notice_days": 90,
+    "notice_day_type": "calendar",
+    "auto_renew": true
+  },
+  "expected_clause_categories": ["effective_term", "expiration", "renewal", "auto_renewal", "notice_period"],
+  "expected_changed_fields": []
+}

@@ -18,7 +18,7 @@ jobs:
       - name: Run workflow and storage tests
         run: pytest -q
       - name: Evaluate redacted fixtures with deterministic baseline
-        run: renewal-radar evaluate --provider rules --min-exact-accuracy 0.70 --min-field-accuracy 0.70 --min-evidence-support 0.90
+        run: renewal-radar evaluate --provider rules --min-exact-accuracy 0.70 --min-field-accuracy 0.70 --min-evidence-support 0.90 --min-clause-accuracy 0.75 --min-amendment-comparison-accuracy 0.75
 
   postgres-storage:
     runs-on: ubuntu-latest

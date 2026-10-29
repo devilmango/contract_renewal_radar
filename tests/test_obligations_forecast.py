@@ -1,5 +1,7 @@
 from datetime import date
 from decimal import Decimal
+import base64
+import hashlib
 
 import pytest
 from fastapi import HTTPException
@@ -9,6 +11,16 @@ from renewal_radar.auth import AuthRegistry, Principal
 from renewal_radar.extractor import RulesExtractor
 from renewal_radar.schemas import ContractData, ObligationCreateRequest, ObligationScheduleUpdateRequest, RenewalForecastRequest
 from renewal_radar.store import Store
+
+
+def _complete_with_signoff(store, obligation_id, actor="owner", tenant="acme"):
+    obligation = store.get_contract_obligation(obligation_id, tenant)
+    payload = b"redacted compliance evidence"
+    evidence = store.submit_obligation_evidence(
+        obligation_id, tenant, actor, "proof.txt", "text/plain",
+        base64.b64encode(payload).decode(), hashlib.sha256(payload).hexdigest(), "Completed as required",
+    )
+    store.review_obligation_evidence(evidence["id"], tenant, "reviewer", "approved", "Verified")
 
 
 def test_rules_extractor_proposes_dated_obligations_with_evidence():
@@ -70,16 +82,16 @@ def test_recurring_obligation_creates_calendar_safe_occurrences_until_expiration
         "contract-1", request.model_dump(), None, request.owner_email, "reviewer", "acme",
     )
 
-    store.resolve_task(first["task_id"], "owner", "Completed", "acme")
+    _complete_with_signoff(store, first["id"])
     occurrences = store.list_contract_obligations("acme")
     assert [(item["due_date"], item["status"]) for item in occurrences] == [
         ("2026-01-31", "resolved"), ("2026-02-28", "open"),
     ]
     second = next(item for item in occurrences if item["status"] == "open")
-    store.resolve_task(second["task_id"], "owner", "Completed", "acme")
+    _complete_with_signoff(store, second["id"])
     third = next(item for item in store.list_contract_obligations("acme") if item["status"] == "open")
     assert third["due_date"] == "2026-03-28"
-    store.resolve_task(third["task_id"], "owner", "Completed", "acme")
+    _complete_with_signoff(store, third["id"])
     assert len(store.list_contract_obligations("acme")) == 3
 
 
@@ -126,7 +138,7 @@ def test_recurring_schedule_can_pause_change_cadence_and_reschedule(tmp_path):
     first = store.create_contract_obligation("contract", request.model_dump(), None, request.owner_email, "reviewer", "acme")
 
     paused = store.update_obligation_schedule(first["id"], "acme", "reviewer", status="paused")
-    store.resolve_task(first["task_id"], "owner", "Completed", "acme")
+    _complete_with_signoff(store, first["id"])
     assert paused["schedule_status"] == "paused"
     assert len(store.list_contract_obligations("acme")) == 1
 
@@ -137,13 +149,13 @@ def test_recurring_schedule_can_pause_change_cadence_and_reschedule(tmp_path):
     store.update_obligation_schedule(recurring["id"], "acme", "reviewer", recurrence_interval_months=6)
     moved = store.reschedule_obligation(recurring["id"], date(2026, 3, 5), "acme", "reviewer")
     assert moved["due_date"] == "2026-03-05"
-    store.resolve_task(recurring["task_id"], "owner", "Completed", "acme")
+    _complete_with_signoff(store, recurring["id"])
     next_row = next(item for item in store.list_contract_obligations("acme") if item["status"] == "open")
     assert next_row["due_date"] == "2026-09-05"
 
     ended = store.update_obligation_schedule(next_row["id"], "acme", "reviewer", status="ended")
     assert ended["schedule_status"] == "ended"
-    store.resolve_task(next_row["task_id"], "owner", "Completed", "acme")
+    _complete_with_signoff(store, next_row["id"])
     assert len([item for item in store.list_contract_obligations("acme") if item["recurrence_group_id"] == recurring["recurrence_group_id"]]) == 2
 
 

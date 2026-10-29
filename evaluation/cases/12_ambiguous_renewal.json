@@ -7,5 +7,6 @@
     "renewal_notice_days": null,
     "auto_renew": false,
     "termination_notice": "30 days"
-  }
+  },
+  "expected_clause_categories": ["effective_term", "expiration", "renewal", "auto_renewal", "termination"]
 }

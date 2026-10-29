@@ -54,6 +54,8 @@ def main() -> int:
     evaluate.add_argument("--min-exact-accuracy", type=float, help="Exit non-zero when any evaluated provider is below this exact-case accuracy")
     evaluate.add_argument("--min-field-accuracy", type=float, help="Exit non-zero when any scored field is below this accuracy")
     evaluate.add_argument("--min-evidence-support", type=float, help="Exit non-zero when evidence does not support the extracted values often enough")
+    evaluate.add_argument("--min-clause-accuracy", type=float, help="Exit non-zero when amendment-clause evidence coverage is below this score")
+    evaluate.add_argument("--min-amendment-comparison-accuracy", type=float, help="Exit non-zero when provider-extracted amendment field changes do not match reviewed fixture labels often enough")
 
     export_feedback = subparsers.add_parser(
         "export-feedback", help="Export explicitly approved, de-identified reviewer cases for provider evaluation",
@@ -164,6 +166,14 @@ def main() -> int:
                 score = report["field_evidence_support"]["accuracy"]
                 if score is None or score < args.min_evidence_support:
                     gate_failures.append(f"field_evidence_support={score} < {args.min_evidence_support}")
+            if args.min_clause_accuracy is not None:
+                score = report["clause_categories"]["accuracy"]
+                if score is None or score < args.min_clause_accuracy:
+                    gate_failures.append(f"clause_categories={score} < {args.min_clause_accuracy}")
+            if args.min_amendment_comparison_accuracy is not None:
+                score = report["amendment_comparison"]["accuracy"]
+                if score is None or score < args.min_amendment_comparison_accuracy:
+                    gate_failures.append(f"amendment_comparison={score} < {args.min_amendment_comparison_accuracy}")
             if gate_failures:
                 report["status"] = "gate_failed"
                 report["gate_failures"] = gate_failures

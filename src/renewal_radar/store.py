@@ -94,6 +94,7 @@ class Store:
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    risk_level TEXT NOT NULL DEFAULT 'medium',
                     UNIQUE (tenant_id, normalized_name)
                 );
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -339,6 +340,77 @@ class Store:
                     channel TEXT NOT NULL,
                     PRIMARY KEY (task_id, action_key)
                 );
+                CREATE TABLE IF NOT EXISTS obligation_evidence (
+                    id TEXT PRIMARY KEY,
+                    obligation_id TEXT NOT NULL REFERENCES contract_obligations(id),
+                    task_id TEXT NOT NULL REFERENCES tasks(id),
+                    tenant_id TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    content_type TEXT NOT NULL,
+                    content_base64 TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    comment TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending_signoff',
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
+                    review_comment TEXT
+                );
+                CREATE TABLE IF NOT EXISTS obligation_compliance_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    obligation_id TEXT NOT NULL REFERENCES contract_obligations(id),
+                    task_id TEXT NOT NULL REFERENCES tasks(id),
+                    tenant_id TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    comment TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    evidence_id TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS renewal_playbooks (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    min_contract_value TEXT,
+                    currency TEXT,
+                    supplier_risk_levels_json TEXT NOT NULL,
+                    changed_clause_categories_json TEXT NOT NULL,
+                    required_approvers_json TEXT NOT NULL,
+                    checklist_json TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (tenant_id, name)
+                );
+                CREATE TABLE IF NOT EXISTS task_playbook_reviews (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL REFERENCES tasks(id),
+                    playbook_id TEXT NOT NULL REFERENCES renewal_playbooks(id),
+                    required_approvers_json TEXT NOT NULL,
+                    approvals_json TEXT NOT NULL,
+                    checklist_json TEXT NOT NULL,
+                    changed_clause_categories_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'blocked',
+                    applied_by TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS provider_evaluation_runs (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT,
+                    dataset_fingerprint TEXT NOT NULL,
+                    cases_scored INTEGER NOT NULL,
+                    exact_accuracy REAL,
+                    evidence_support_accuracy REAL,
+                    clause_accuracy REAL,
+                    amendment_comparison_accuracy REAL,
+                    report_json TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_contract_status ON contracts(status);
                 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, due_date);
                 CREATE INDEX IF NOT EXISTS idx_audit_contract ON audit_events(contract_id, id);
@@ -400,6 +472,21 @@ class Store:
             db.execute("CREATE INDEX IF NOT EXISTS idx_outcome_tenant_date ON renewal_outcomes(tenant_id, recorded_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_forecast_tenant_date ON renewal_forecast_runs(tenant_id, recorded_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_forecast_lines_contract ON renewal_forecast_lines(tenant_id, contract_id)")
+            if self.is_postgres:
+                db.execute("ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS risk_level TEXT NOT NULL DEFAULT 'medium'")
+            else:
+                supplier_columns = {row["name"] for row in db.execute("PRAGMA table_info(suppliers)")}
+                if "risk_level" not in supplier_columns:
+                    db.execute("ALTER TABLE suppliers ADD COLUMN risk_level TEXT NOT NULL DEFAULT 'medium'")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_obligation_evidence_tenant ON obligation_evidence(tenant_id,obligation_id,created_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_provider_eval_tenant ON provider_evaluation_runs(tenant_id,provider,created_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_task_playbook_tenant ON task_playbook_reviews(tenant_id,task_id)")
+            if self.is_postgres:
+                db.execute("ALTER TABLE provider_evaluation_runs ADD COLUMN IF NOT EXISTS amendment_comparison_accuracy REAL")
+            else:
+                eval_columns = {row["name"] for row in db.execute("PRAGMA table_info(provider_evaluation_runs)")}
+                if "amendment_comparison_accuracy" not in eval_columns:
+                    db.execute("ALTER TABLE provider_evaluation_runs ADD COLUMN amendment_comparison_accuracy REAL")
 
     def save_contract(self, contract_id: str, filename: str, provider: str, data: ContractData, raw_text: str, actor: str, tenant_id: str = "default") -> None:
         now = utc_now().isoformat()
@@ -474,15 +561,17 @@ class Store:
     def _supplier_key(name: str) -> str:
         return " ".join(name.casefold().split())
 
-    def create_supplier(self, name: str, actor: str, tenant_id: str) -> dict[str, Any]:
+    def create_supplier(self, name: str, actor: str, tenant_id: str, risk_level: str = "medium") -> dict[str, Any]:
+        if risk_level not in {"low", "medium", "high", "critical"}:
+            raise ValueError("Supplier risk level must be low, medium, high, or critical")
         normalized = self._supplier_key(name)
         now = utc_now().isoformat()
         supplier_id = str(uuid4())
         with self.connect() as db:
             try:
                 db.execute(
-                    "INSERT INTO suppliers (id,tenant_id,name,normalized_name,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
-                    (supplier_id, tenant_id, name.strip(), normalized, actor, now, now),
+                    "INSERT INTO suppliers (id,tenant_id,name,normalized_name,created_by,created_at,updated_at,risk_level) VALUES (?,?,?,?,?,?,?,?)",
+                    (supplier_id, tenant_id, name.strip(), normalized, actor, now, now, risk_level),
                 )
             except Exception as exc:
                 if "unique" in str(exc).casefold() or "duplicate" in str(exc).casefold():
@@ -539,6 +628,19 @@ class Store:
                         Decimal(item["annual_spend_at_risk"].get(currency, "0")) + Decimal(str(amount))
                     )
         return list(by_supplier.values())
+
+    def update_supplier_risk(self, supplier_id: str, risk_level: str, tenant_id: str, actor: str) -> dict[str, Any] | None:
+        if risk_level not in {"low", "medium", "high", "critical"}:
+            raise ValueError("Supplier risk level must be low, medium, high, or critical")
+        with self.connect() as db:
+            supplier = db.execute("SELECT * FROM suppliers WHERE id=? AND tenant_id=?", (supplier_id, tenant_id)).fetchone()
+            if not supplier:
+                return None
+            db.execute("UPDATE suppliers SET risk_level=?,updated_at=? WHERE id=? AND tenant_id=?", (risk_level, utc_now().isoformat(), supplier_id, tenant_id))
+            contracts = db.execute("SELECT id FROM contracts WHERE supplier_id=? AND tenant_id=?", (supplier_id, tenant_id)).fetchall()
+            for contract in contracts:
+                self.add_audit(db, contract["id"], "supplier.risk_updated", actor, {"supplier_id": supplier_id, "risk_level": risk_level}, tenant_id)
+            return dict(db.execute("SELECT * FROM suppliers WHERE id=? AND tenant_id=?", (supplier_id, tenant_id)).fetchone())
 
     def create_contract_obligation(
         self, contract_id: str, terms: dict[str, Any], owner_name: str | None,
@@ -742,6 +844,381 @@ class Store:
                 tuple(params),
             ).fetchall()
         return [self._obligation_record(row) for row in rows]
+
+    def get_contract_obligation(self, obligation_id: str, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT o.*,t.status AS task_status,t.owner_name,t.owner_email,t.due_date,t.reminder_sent_at,t.escalated_at "
+                "FROM contract_obligations o JOIN tasks t ON t.id=o.task_id WHERE o.id=? AND o.tenant_id=?",
+                (obligation_id, tenant_id),
+            ).fetchone()
+        return self._obligation_record(row) if row else None
+
+    def bulk_portfolio_action(self, action: str, ids: list[str], tenant_id: str, actor: str, **values) -> dict[str, Any]:
+        """Apply a validated tenant-scoped portfolio action atomically."""
+        with self.connect() as db:
+            if action == "assign_tasks":
+                rows = db.execute(
+                    f"SELECT * FROM tasks WHERE tenant_id=? AND id IN ({','.join('?' for _ in ids)})",
+                    (tenant_id, *ids),
+                ).fetchall()
+                if len(rows) != len(ids) or any(row["status"] != "open" for row in rows):
+                    raise ValueError("All selected tasks must exist in this organization and be open")
+                for row in rows:
+                    db.execute("UPDATE tasks SET owner_name=?,owner_email=? WHERE id=?", (values.get("owner_name"), values.get("owner_email"), row["id"]))
+                    self.add_audit(db, row["contract_id"], "task.assigned", actor, {
+                        "task_id": row["id"], "owner_name": values.get("owner_name"), "owner_email": values.get("owner_email"), "bulk": True,
+                    }, tenant_id)
+            elif action == "transition_tasks":
+                rows = db.execute(
+                    f"SELECT * FROM tasks WHERE tenant_id=? AND id IN ({','.join('?' for _ in ids)})",
+                    (tenant_id, *ids),
+                ).fetchall()
+                target = values.get("workflow_state")
+                allowed = {"review": {"needs_changes", "pending_approval"}, "needs_changes": {"review", "pending_approval"},
+                           "pending_approval": {"review"}, "notice_in_progress": {"pending_approval"}}
+                if len(rows) != len(ids) or any(row["status"] != "open" or target not in allowed.get(row["workflow_state"], set()) for row in rows):
+                    raise ValueError("All selected tasks must exist, be open, and support the requested transition")
+                for row in rows:
+                    db.execute("UPDATE tasks SET workflow_state=? WHERE id=?", (target, row["id"]))
+                    self.add_audit(db, row["contract_id"], "task.workflow_transition", actor, {
+                        "task_id": row["id"], "from": row["workflow_state"], "to": target,
+                        "comment": values.get("comment"), "bulk": True,
+                    }, tenant_id)
+            elif action == "assign_supplier":
+                supplier_id = values.get("supplier_id")
+                supplier = db.execute("SELECT id FROM suppliers WHERE id=? AND tenant_id=?", (supplier_id, tenant_id)).fetchone()
+                rows = db.execute(
+                    f"SELECT * FROM contracts WHERE tenant_id=? AND id IN ({','.join('?' for _ in ids)})", (tenant_id, *ids),
+                ).fetchall()
+                if not supplier or len(rows) != len(ids):
+                    raise ValueError("All selected contracts and the supplier must belong to this organization")
+                for row in rows:
+                    db.execute("UPDATE contracts SET supplier_id=? WHERE id=?", (supplier_id, row["id"]))
+                    self.add_audit(db, row["id"], "contract.supplier_assigned", actor, {"supplier_id": supplier_id, "bulk": True}, tenant_id)
+                db.execute("UPDATE suppliers SET updated_at=? WHERE id=?", (utc_now().isoformat(), supplier_id))
+            else:
+                raise ValueError("Unsupported bulk portfolio action")
+        return {"action": action, "updated": ids, "count": len(ids)}
+
+    def submit_obligation_evidence(
+        self, obligation_id: str, tenant_id: str, actor: str, filename: str,
+        content_type: str, content_base64: str, sha256: str, comment: str | None,
+    ) -> dict[str, Any] | None:
+        evidence_id, now = str(uuid4()), utc_now().isoformat()
+        with self.connect() as db:
+            obligation = db.execute(
+                "SELECT o.*,t.status AS task_status FROM contract_obligations o JOIN tasks t ON t.id=o.task_id "
+                "WHERE o.id=? AND o.tenant_id=?", (obligation_id, tenant_id),
+            ).fetchone()
+            if not obligation:
+                return None
+            if obligation["task_status"] != "open":
+                raise ValueError("Evidence can be submitted only for an open occurrence")
+            db.execute(
+                "INSERT INTO obligation_evidence (id,obligation_id,task_id,tenant_id,filename,content_type,content_base64,sha256,comment,status,created_by,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,'pending_signoff',?,?)",
+                (evidence_id, obligation_id, obligation["task_id"], tenant_id, filename, content_type,
+                 content_base64, sha256, comment, actor, now),
+            )
+            db.execute(
+                "INSERT INTO obligation_compliance_history (obligation_id,task_id,tenant_id,outcome,comment,actor,evidence_id,created_at) "
+                "VALUES (?,?,?,'submitted_for_signoff',?,?,?,?)",
+                (obligation_id, obligation["task_id"], tenant_id, comment or "Evidence submitted for reviewer sign-off", actor, evidence_id, now),
+            )
+            self.add_audit(db, obligation["contract_id"], "obligation.evidence_submitted", actor, {
+                "obligation_id": obligation_id, "task_id": obligation["task_id"], "evidence_id": evidence_id,
+                "filename": filename, "sha256": sha256,
+            }, tenant_id)
+            return self._obligation_evidence_record(db.execute(
+                "SELECT * FROM obligation_evidence WHERE id=? AND tenant_id=?", (evidence_id, tenant_id),
+            ).fetchone())
+
+    @staticmethod
+    def _obligation_evidence_record(row) -> dict[str, Any]:
+        record = dict(row)
+        record.pop("content_base64", None)
+        return record
+
+    def list_obligation_evidence(self, obligation_id: str, tenant_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM obligation_evidence WHERE obligation_id=? AND tenant_id=? ORDER BY created_at",
+                (obligation_id, tenant_id),
+            ).fetchall()
+        return [self._obligation_evidence_record(row) for row in rows]
+
+    def get_obligation_evidence_content(self, evidence_id: str, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM obligation_evidence WHERE id=? AND tenant_id=?", (evidence_id, tenant_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def review_obligation_evidence(
+        self, evidence_id: str, tenant_id: str, actor: str, decision: str, comment: str | None,
+    ) -> dict[str, Any] | None:
+        if decision not in {"approved", "rejected"}:
+            raise ValueError("Evidence decision must be approved or rejected")
+        now = utc_now().isoformat()
+        with self.connect() as db:
+            evidence = db.execute(
+                "SELECT e.*,o.contract_id,t.status AS task_status FROM obligation_evidence e "
+                "JOIN contract_obligations o ON o.id=e.obligation_id JOIN tasks t ON t.id=e.task_id "
+                "WHERE e.id=? AND e.tenant_id=?", (evidence_id, tenant_id),
+            ).fetchone()
+            if not evidence:
+                return None
+            if evidence["status"] != "pending_signoff":
+                raise ValueError("Only evidence awaiting sign-off can be reviewed")
+            if evidence["task_status"] != "open":
+                raise ValueError("Evidence can be reviewed only while its obligation is open")
+            db.execute(
+                "UPDATE obligation_evidence SET status=?,reviewed_by=?,reviewed_at=?,review_comment=? WHERE id=? AND tenant_id=?",
+                (decision, actor, now, comment, evidence_id, tenant_id),
+            )
+            outcome = "completed" if decision == "approved" else "evidence_rejected"
+            db.execute(
+                "INSERT INTO obligation_compliance_history (obligation_id,task_id,tenant_id,outcome,comment,actor,evidence_id,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (evidence["obligation_id"], evidence["task_id"], tenant_id, outcome,
+                 comment or f"Evidence {decision}", actor, evidence_id, now),
+            )
+            if decision == "approved":
+                db.execute("UPDATE tasks SET status='resolved',workflow_state='resolved' WHERE id=?", (evidence["task_id"],))
+                task = db.execute("SELECT * FROM tasks WHERE id=?", (evidence["task_id"],)).fetchone()
+                self._create_next_obligation_occurrence(db, task, actor)
+            self.add_audit(db, evidence["contract_id"], f"obligation.evidence_{decision}", actor, {
+                "obligation_id": evidence["obligation_id"], "task_id": evidence["task_id"],
+                "evidence_id": evidence_id, "comment": comment,
+            }, tenant_id)
+            return self._obligation_evidence_record(db.execute(
+                "SELECT * FROM obligation_evidence WHERE id=? AND tenant_id=?", (evidence_id, tenant_id),
+            ).fetchone())
+
+    def record_obligation_compliance(
+        self, obligation_id: str, tenant_id: str, actor: str, outcome: str, comment: str,
+    ) -> dict[str, Any] | None:
+        if outcome not in {"failed", "missed"}:
+            raise ValueError("Compliance outcome must be failed or missed")
+        now = utc_now().isoformat()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT o.*,t.status AS task_status,t.due_date FROM contract_obligations o "
+                "JOIN tasks t ON t.id=o.task_id WHERE o.id=? AND o.tenant_id=?", (obligation_id, tenant_id),
+            ).fetchone()
+            if not row:
+                return None
+            if row["task_status"] != "open":
+                raise ValueError("Compliance can be recorded only for open occurrences")
+            if outcome == "missed" and date.fromisoformat(row["due_date"]) >= date.today():
+                raise ValueError("An occurrence can be marked missed only after its due date")
+            db.execute(
+                "INSERT INTO obligation_compliance_history (obligation_id,task_id,tenant_id,outcome,comment,actor,created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (obligation_id, row["task_id"], tenant_id, outcome, comment, actor, now),
+            )
+            self.add_audit(db, row["contract_id"], f"obligation.{outcome}", actor, {
+                "obligation_id": obligation_id, "task_id": row["task_id"], "comment": comment,
+            }, tenant_id)
+            return {"obligation_id": obligation_id, "task_id": row["task_id"], "outcome": outcome, "comment": comment, "actor": actor, "created_at": now}
+
+    def obligation_compliance_history(self, obligation_id: str, tenant_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM obligation_compliance_history WHERE obligation_id=? AND tenant_id=? ORDER BY id",
+                (obligation_id, tenant_id),
+            ).fetchall()]
+
+    def create_renewal_playbook(self, request: dict[str, Any], actor: str, tenant_id: str) -> dict[str, Any]:
+        playbook_id, now = str(uuid4()), utc_now().isoformat()
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO renewal_playbooks (id,tenant_id,name,min_contract_value,currency,supplier_risk_levels_json,changed_clause_categories_json,required_approvers_json,checklist_json,created_by,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (playbook_id, tenant_id, request["name"], str(request["min_contract_value"]) if request.get("min_contract_value") is not None else None,
+                 request.get("currency"), json.dumps(request.get("supplier_risk_levels", [])),
+                 json.dumps(request.get("changed_clause_categories", [])), json.dumps(request["required_approvers"]),
+                 json.dumps(request.get("checklist", [])), actor, now, now),
+            )
+            return self._playbook_record(db.execute("SELECT * FROM renewal_playbooks WHERE id=?", (playbook_id,)).fetchone())
+
+    @staticmethod
+    def _playbook_record(row) -> dict[str, Any]:
+        result = dict(row)
+        for column, key in (("supplier_risk_levels_json", "supplier_risk_levels"),
+                            ("changed_clause_categories_json", "changed_clause_categories"),
+                            ("required_approvers_json", "required_approvers"), ("checklist_json", "checklist")):
+            result[key] = json.loads(result.pop(column))
+        return result
+
+    def list_renewal_playbooks(self, tenant_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM renewal_playbooks WHERE tenant_id=? ORDER BY name", (tenant_id,)).fetchall()
+        return [self._playbook_record(row) for row in rows]
+
+    def apply_renewal_playbook(
+        self, playbook_id: str, task_id: str, tenant_id: str, actor: str, changed_clause_categories: list[str],
+    ) -> dict[str, Any] | None:
+        review_id, now = str(uuid4()), utc_now().isoformat()
+        with self.connect() as db:
+            playbook = db.execute("SELECT * FROM renewal_playbooks WHERE id=? AND tenant_id=?", (playbook_id, tenant_id)).fetchone()
+            task = db.execute(
+                "SELECT t.*,c.confirmed_json,c.extracted_json,c.supplier_id,s.risk_level FROM tasks t "
+                "JOIN contracts c ON c.id=t.contract_id LEFT JOIN suppliers s ON s.id=c.supplier_id AND s.tenant_id=c.tenant_id "
+                "WHERE t.id=? AND t.tenant_id=?", (task_id, tenant_id),
+            ).fetchone()
+            if not playbook or not task:
+                return None
+            if task["task_kind"] != "renewal" or task["status"] != "open":
+                raise ValueError("Playbooks can be applied only to open renewal tasks")
+            criteria_risks = json.loads(playbook["supplier_risk_levels_json"])
+            criteria_clauses = json.loads(playbook["changed_clause_categories_json"])
+            if criteria_risks and task["risk_level"] not in criteria_risks:
+                raise ValueError("Renewal does not match the playbook supplier-risk criteria")
+            if criteria_clauses and not set(criteria_clauses).intersection(changed_clause_categories):
+                raise ValueError("Renewal does not match the playbook changed-clause criteria")
+            if playbook["min_contract_value"] is not None:
+                terms = json.loads(task["confirmed_json"] or task["extracted_json"])
+                if terms.get("currency") != playbook["currency"] or Decimal(str(terms.get("annual_contract_value") or 0)) < Decimal(playbook["min_contract_value"]):
+                    raise ValueError("Renewal does not meet the playbook contract-value threshold")
+            existing = db.execute("SELECT status FROM task_playbook_reviews WHERE tenant_id=? AND task_id=? ORDER BY applied_at DESC LIMIT 1", (tenant_id, task_id)).fetchone()
+            if existing and existing["status"] != "rejected":
+                raise ValueError("A playbook review is already active for this task")
+            approvals = {email: None for email in json.loads(playbook["required_approvers_json"])}
+            checklist = [{"item": item, "completed": False, "completed_by": None, "completed_at": None}
+                         for item in json.loads(playbook["checklist_json"])]
+            db.execute(
+                "INSERT INTO task_playbook_reviews (id,tenant_id,task_id,playbook_id,required_approvers_json,approvals_json,checklist_json,changed_clause_categories_json,status,applied_by,applied_at) "
+                "VALUES (?,?,?,?,?,?,?,?, 'blocked',?,?)",
+                (review_id, tenant_id, task_id, playbook_id, json.dumps(list(approvals)), json.dumps(approvals),
+                 json.dumps(checklist), json.dumps(changed_clause_categories), actor, now),
+            )
+            db.execute("UPDATE tasks SET workflow_state='pending_approval' WHERE id=?", (task_id,))
+            self.add_audit(db, task["contract_id"], "playbook.applied", actor, {
+                "playbook_id": playbook_id, "task_id": task_id, "review_id": review_id,
+                "required_approvers": list(approvals), "changed_clause_categories": changed_clause_categories,
+            }, tenant_id)
+            return self._playbook_review_record(db.execute("SELECT * FROM task_playbook_reviews WHERE id=?", (review_id,)).fetchone())
+
+    @staticmethod
+    def _playbook_review_record(row) -> dict[str, Any]:
+        result = dict(row)
+        for column, key in (("required_approvers_json", "required_approvers"), ("approvals_json", "approvals"),
+                            ("checklist_json", "checklist"), ("changed_clause_categories_json", "changed_clause_categories")):
+            result[key] = json.loads(result.pop(column))
+        return result
+
+    def get_task_playbook_review(self, review_id: str, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM task_playbook_reviews WHERE id=? AND tenant_id=?", (review_id, tenant_id)).fetchone()
+        return self._playbook_review_record(row) if row else None
+
+    def task_playbook_review(self, task_id: str, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM task_playbook_reviews WHERE task_id=? AND tenant_id=? ORDER BY applied_at DESC LIMIT 1", (task_id, tenant_id)).fetchone()
+        return self._playbook_review_record(row) if row else None
+
+    def update_playbook_approval(self, task_id: str, tenant_id: str, email: str, approved: bool, actor: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM task_playbook_reviews WHERE task_id=? AND tenant_id=? ORDER BY applied_at DESC LIMIT 1", (task_id, tenant_id)).fetchone()
+            if not row:
+                return None
+            if row["status"] == "rejected":
+                raise ValueError("A rejected playbook decision cannot be changed")
+            approvals = json.loads(row["approvals_json"])
+            key = email.casefold()
+            if key not in approvals:
+                raise ValueError("Your email is not a required approver for this playbook")
+            if approvals[key] is not None:
+                raise ValueError("This approver has already recorded a decision")
+            approvals[key] = {"approved": approved, "actor": actor, "at": utc_now().isoformat()}
+            checklist = json.loads(row["checklist_json"])
+            rejected = any(item is not None and not item["approved"] for item in approvals.values())
+            all_approved = all(item is not None and item["approved"] for item in approvals.values())
+            status = "rejected" if rejected else "approved" if all_approved and all(item["completed"] for item in checklist) else "blocked"
+            db.execute("UPDATE task_playbook_reviews SET approvals_json=?,status=? WHERE id=?", (json.dumps(approvals), status, row["id"]))
+            task = db.execute("SELECT contract_id FROM tasks WHERE id=? AND tenant_id=?", (task_id, tenant_id)).fetchone()
+            if rejected:
+                db.execute("UPDATE tasks SET workflow_state='needs_changes' WHERE id=? AND tenant_id=?", (task_id, tenant_id))
+            self.add_audit(db, task["contract_id"], "playbook.approval_recorded", actor, {
+                "task_id": task_id, "approved": approved, "status": status,
+            }, tenant_id)
+            return self._playbook_review_record(db.execute("SELECT * FROM task_playbook_reviews WHERE id=?", (row["id"],)).fetchone())
+
+    def update_playbook_checklist(self, task_id: str, tenant_id: str, index: int, completed: bool, actor: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM task_playbook_reviews WHERE task_id=? AND tenant_id=? ORDER BY applied_at DESC LIMIT 1", (task_id, tenant_id)).fetchone()
+            if not row:
+                return None
+            if row["status"] == "rejected":
+                raise ValueError("A rejected playbook decision cannot be changed")
+            checklist = json.loads(row["checklist_json"])
+            if index < 0 or index >= len(checklist):
+                raise ValueError("Checklist item index is out of range")
+            checklist[index].update({"completed": completed, "completed_by": actor if completed else None,
+                                     "completed_at": utc_now().isoformat() if completed else None})
+            approvals = json.loads(row["approvals_json"])
+            rejected = any(v is not None and not v["approved"] for v in approvals.values())
+            status = "rejected" if rejected else "approved" if all(v is not None and v["approved"] for v in approvals.values()) and all(x["completed"] for x in checklist) else "blocked"
+            db.execute("UPDATE task_playbook_reviews SET checklist_json=?,status=? WHERE id=?", (json.dumps(checklist), status, row["id"]))
+            task = db.execute("SELECT contract_id FROM tasks WHERE id=? AND tenant_id=?", (task_id, tenant_id)).fetchone()
+            self.add_audit(db, task["contract_id"], "playbook.checklist_updated", actor, {"task_id": task_id, "index": index, "completed": completed, "status": status}, tenant_id)
+            return self._playbook_review_record(db.execute("SELECT * FROM task_playbook_reviews WHERE id=?", (row["id"],)).fetchone())
+
+    def record_provider_evaluation(self, tenant_id: str, provider: str, report: dict[str, Any], fingerprint: str, actor: str) -> dict[str, Any]:
+        run_id, now = str(uuid4()), utc_now().isoformat()
+        clauses = report.get("clause_categories", {})
+        clause_accuracy = clauses.get("accuracy") if isinstance(clauses, dict) else None
+        amendment_accuracy = (report.get("amendment_comparison") or {}).get("accuracy")
+        with self.connect() as db:
+            previous = db.execute(
+                "SELECT * FROM provider_evaluation_runs WHERE tenant_id=? AND provider=? AND dataset_fingerprint=? ORDER BY created_at DESC LIMIT 1",
+                (tenant_id, provider, fingerprint),
+            ).fetchone()
+            current_exact = report.get("exact_case_match", {}).get("accuracy")
+            current_evidence = report.get("field_evidence_support", {}).get("accuracy")
+            alerts = []
+            if previous:
+                for metric, current, field in (("exact_accuracy", current_exact, "exact_accuracy"),
+                                               ("evidence_support_accuracy", current_evidence, "evidence_support_accuracy"),
+                                               ("clause_accuracy", clause_accuracy, "clause_accuracy"),
+                                               ("amendment_comparison_accuracy", amendment_accuracy, "amendment_comparison_accuracy")):
+                    prior = previous[field]
+                    if current is not None and prior is not None and prior - current >= 0.10 - 1e-9:
+                        alerts.append({"metric": metric, "previous": prior, "current": current, "drop": round(prior-current, 4)})
+            db.execute(
+                "INSERT INTO provider_evaluation_runs (id,tenant_id,provider,model,dataset_fingerprint,cases_scored,exact_accuracy,evidence_support_accuracy,clause_accuracy,amendment_comparison_accuracy,report_json,created_by,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (run_id, tenant_id, provider, report.get("model"), fingerprint, int(report.get("cases_scored", 0)), current_exact,
+                 current_evidence, clause_accuracy, amendment_accuracy, json.dumps(report), actor, now),
+            )
+            return {"id": run_id, "provider": provider, "model": report.get("model"), "dataset_fingerprint": fingerprint,
+                    "cases_scored": int(report.get("cases_scored", 0)), "exact_accuracy": current_exact,
+                    "evidence_support_accuracy": current_evidence, "clause_accuracy": clause_accuracy,
+                    "amendment_comparison_accuracy": amendment_accuracy,
+                    "alerts": alerts, "created_at": now}
+
+    def provider_evaluation_history(self, tenant_id: str, provider: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            if provider:
+                rows = db.execute("SELECT * FROM provider_evaluation_runs WHERE tenant_id=? AND provider=? ORDER BY created_at DESC LIMIT ?", (tenant_id, provider, limit)).fetchall()
+            else:
+                rows = db.execute("SELECT * FROM provider_evaluation_runs WHERE tenant_id=? ORDER BY created_at DESC LIMIT ?", (tenant_id, limit)).fetchall()
+        return [{**dict(row), "report": json.loads(row["report_json"]), "alerts": self._evaluation_drift_alerts(row, tenant_id)} for row in rows]
+
+    def _evaluation_drift_alerts(self, row, tenant_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            previous = db.execute("SELECT * FROM provider_evaluation_runs WHERE tenant_id=? AND provider=? AND dataset_fingerprint=? AND created_at<? ORDER BY created_at DESC LIMIT 1",
+                                  (tenant_id, row["provider"], row["dataset_fingerprint"], row["created_at"])).fetchone()
+        if not previous:
+            return []
+        alerts = []
+        for metric in ("exact_accuracy", "evidence_support_accuracy", "clause_accuracy", "amendment_comparison_accuracy"):
+            old, new = previous[metric], row[metric]
+            if old is not None and new is not None and old - new >= 0.10 - 1e-9:
+                alerts.append({"metric": metric, "previous": old, "current": new, "drop": round(old-new, 4)})
+        return alerts
 
     def renewal_forecast(
         self, tenant_id: str, start_date: date, end_date: date,
@@ -1670,6 +2147,13 @@ class Store:
                 return None
             if row["status"] != "open":
                 raise ValueError("Task is already resolved")
+            if row["task_kind"] == "obligation":
+                evidence = db.execute(
+                    "SELECT status FROM obligation_evidence WHERE task_id=? AND tenant_id=? ORDER BY created_at DESC LIMIT 1",
+                    (task_id, tenant_id),
+                ).fetchone()
+                if not evidence or evidence["status"] != "approved":
+                    raise ValueError("Obligations require evidence and reviewer sign-off before resolution")
             db.execute("UPDATE tasks SET status='resolved', workflow_state='resolved' WHERE id=?", (task_id,))
             self.add_audit(db, row["contract_id"], "task.resolved", actor, {"task_id": task_id, "comment": comment}, tenant_id)
             self._create_next_obligation_occurrence(db, row, actor)
@@ -2027,6 +2511,11 @@ class Store:
                 raise ValueError("Contract is protected by an active legal hold")
             tasks = db.execute("SELECT id FROM tasks WHERE contract_id=?", (contract_id,)).fetchall()
             for task in tasks:
+                obligations = db.execute("SELECT id FROM contract_obligations WHERE task_id=?", (task["id"],)).fetchall()
+                for obligation in obligations:
+                    db.execute("DELETE FROM obligation_evidence WHERE obligation_id=? AND tenant_id=?", (obligation["id"], tenant_id))
+                    db.execute("DELETE FROM obligation_compliance_history WHERE obligation_id=? AND tenant_id=?", (obligation["id"], tenant_id))
+                db.execute("DELETE FROM task_playbook_reviews WHERE task_id=? AND tenant_id=?", (task["id"], tenant_id))
                 db.execute("DELETE FROM calendar_events WHERE task_id=?", (task["id"],))
                 db.execute("DELETE FROM notification_deliveries WHERE task_id=?", (task["id"],))
                 db.execute("DELETE FROM task_notification_state WHERE task_id=?", (task["id"],))

@@ -1,0 +1,14 @@
+{
+  "id": "amendment-data-retention-and-liability",
+  "contract_text": "[VENDOR] Amendment to Support Services Agreement. Effective Date: April 1, 2026. The current term expires March 31, 2027. This amendment does not change the term. The agreement automatically renews for another one-year term unless either party gives written notice at least 60 days before expiration. Supplier will delete Customer Data within 30 days after termination. Supplier's liability for a data breach is unlimited.",
+  "active_contract_text": "[VENDOR] Support Services Agreement. Effective Date: April 1, 2026. The current term expires March 31, 2027. The agreement automatically renews for another one-year term unless either party gives written notice at least 60 days before expiration.",
+  "expected": {
+    "start_date": "2026-04-01",
+    "expiration_date": "2027-03-31",
+    "renewal_notice_days": 60,
+    "notice_day_type": "calendar",
+    "auto_renew": true
+  },
+  "expected_clause_categories": ["effective_term", "expiration", "renewal", "auto_renewal", "notice_period"],
+  "expected_changed_fields": []
+}

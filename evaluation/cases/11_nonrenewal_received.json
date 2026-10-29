@@ -7,5 +7,6 @@
     "renewal_notice_days": 45,
     "notice_day_type": "calendar",
     "auto_renew": true
-  }
+  },
+  "expected_clause_categories": ["effective_term", "expiration", "renewal", "auto_renewal", "notice_period", "termination"]
 }

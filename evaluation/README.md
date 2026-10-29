@@ -4,6 +4,8 @@ The checked-in fixtures are fictional and use generic party placeholders such as
 
 Each JSON file contains a stable `id`, a `contract_text` excerpt, and reviewed `expected` values. Include fields with a `null` expected value when the source explicitly does not contain that term; this makes false-positive extraction measurable. `notice_day_type` is scored when the fixture defines a renewal notice convention.
 
+Amendment cases may also include `expected_clause_categories` using `effective_term`, `expiration`, `renewal`, `auto_renewal`, `notice_period`, or `termination`. The evaluator measures whether the provider's evidence quotes represent those clause signals. To score structured amendment comparisons, provide `active_contract_text` alongside the amended `contract_text` and an `expected_changed_fields` list. The provider extracts both versions, and the comparison score checks that the detected changes match the reviewed labels—including an empty list when structured terms are unchanged. These are deterministic evidence/comparison proxies, not legal interpretations or judgments about whether a changed term is acceptable.
+
 To add internal organization examples, obtain approval from the contract/data owner, de-identify all parties and personal identifiers, and keep the dataset in an access-controlled internal path. Do not put confidential contracts or unapproved agreement text in this public repository. An approved de-identified fixture must record its approval metadata, for example:
 
 ```json
@@ -65,6 +67,8 @@ Set minimum exact-case and field accuracy thresholds to fail the command when a 
 
 ```bash
 renewal-radar evaluate --provider rules --min-exact-accuracy 0.70 --min-field-accuracy 0.70 --min-evidence-support 0.90
+renewal-radar evaluate --provider rules --min-clause-accuracy 0.75
+renewal-radar evaluate --provider rules --min-amendment-comparison-accuracy 0.75
 ```
 
 GitHub Actions runs this deterministic gate on pull requests and pushes to `main` or `master`. LLM evaluations remain opt-in because they call external APIs and may incur charges; `LLM_ALLOWED_PROVIDERS` is enforced for evaluation runs too.
@@ -75,6 +79,8 @@ GitHub Actions runs this deterministic gate on pull requests and pushes to `main
 - **Exact case match:** a case counts as correct only when every expected field matches.
 - **Evidence grounding:** fraction of returned evidence quotes that occur verbatim in the source after case-folding and whitespace normalization.
 - **Field evidence support:** fraction of scored non-null extracted values whose field-specific evidence quote also expresses that value. For dates the evaluator parses the date from the quote; for notice periods it checks the day count and renewal/expiration context; for other fields it checks the clause signal. This remains a deterministic proxy and should be reviewed when adding new clause forms.
+- **Amendment clause evidence:** fraction of expected amendment categories represented by matching signals in extracted provider evidence. This can be gated with `--min-clause-accuracy`; the checked-in CI floor is 0.75.
+- **Amendment comparison accuracy:** exact matches between expected and provider-extracted changed structured fields for paired active/amendment fixtures. This can be gated with `--min-amendment-comparison-accuracy`; paired fixtures also test unchanged date and notice terms.
 - **Source-type breakdown:** exact-case and per-field accuracy for each `source_type`, so OCR regressions can be isolated from selectable-text fixtures.
 - **Latency:** total and average extraction time for the fixture set. This local measurement does not estimate provider billing.
 - **Token usage and estimated cost:** provider-reported input/output tokens are included when available. Set `EVAL_INPUT_USD_PER_MILLION_TOKENS` and `EVAL_OUTPUT_USD_PER_MILLION_TOKENS` to estimate cost for the selected model; keep these rates current because they are not fetched from providers.
@@ -83,3 +89,5 @@ GitHub Actions runs this deterministic gate on pull requests and pushes to `main
 Reports include provider and model, elapsed and average case time, field counts, accuracies, per-case expected and actual values, evidence grounding and support decisions, source-type breakdowns, and errors. Evaluation sends fixture text to external providers and may incur API charges.
 
 This compact regression set is not a legal benchmark. A strong score does not establish production reliability. Add reviewed, organization-approved, de-identified examples before using scores for provider selection.
+
+Authenticated reviewers can also run the same checked-in fixtures through `POST /evaluations/runs` and inspect persisted scores and 10-percentage-point drift alerts through `GET /evaluations/drift`. Provider runs are tenant-isolated and compare only when the fixture fingerprint matches; drift is tracked for field accuracy, evidence support, amendment clause evidence, and amendment comparison accuracy. They do not silently run in the background.

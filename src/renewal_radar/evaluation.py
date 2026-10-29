@@ -29,6 +29,8 @@ def load_cases(directory: Path) -> list[dict[str, Any]]:
         case = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(case, dict) or not case.get("id") or not case.get("contract_text") or not isinstance(case.get("expected"), dict):
             raise ValueError(f"Invalid evaluation fixture: {path}")
+        if "active_contract_text" in case and (not isinstance(case["active_contract_text"], str) or not case["active_contract_text"].strip()):
+            raise ValueError(f"active_contract_text must be non-empty text in {path}")
         unknown_fields = set(case["expected"]) - set(SCORED_FIELDS)
         if unknown_fields:
             raise ValueError(f"Unknown expected fields in {path}: {', '.join(sorted(unknown_fields))}")
@@ -44,7 +46,15 @@ def load_cases(directory: Path) -> list[dict[str, Any]]:
             if not isinstance(governance, dict) or governance.get("approved") is not True or governance.get("deidentified") is not True or not governance.get("approval_reference"):
                 raise ValueError(f"Approved de-identified fixture {path} needs governance.approved, governance.deidentified, and governance.approval_reference")
             validate_approved_deidentified_text(case["contract_text"], str(path))
+            if case.get("active_contract_text"):
+                validate_approved_deidentified_text(case["active_contract_text"], str(path))
         case["source_type"] = source_type
+        categories = case.get("expected_clause_categories", [])
+        if not isinstance(categories, list) or any(category not in _AMENDMENT_CLAUSE_PATTERNS for category in categories):
+            raise ValueError(f"Invalid expected_clause_categories in {path}")
+        changed_fields = case.get("expected_changed_fields", [])
+        if not isinstance(changed_fields, list) or any(field not in SCORED_FIELDS for field in changed_fields):
+            raise ValueError(f"Invalid expected_changed_fields in {path}")
         case["fixture"] = path.name
         cases.append(case)
     if not cases:
@@ -65,6 +75,9 @@ def evaluate_extractor(extractor, cases: list[dict[str, Any]]) -> dict[str, Any]
     case_count = exact_cases = 0
     evidence_total = evidence_grounded = 0
     support_total = support_count = 0
+    amendment_clause_total = amendment_clause_supported = 0
+    amendment_category_counts: dict[str, dict[str, int]] = {}
+    amendment_comparison_total = amendment_comparison_correct = 0
     elapsed_seconds = 0.0
     input_tokens = output_tokens = usage_cases = 0
     errors: list[dict[str, str]] = []
@@ -88,6 +101,20 @@ def evaluate_extractor(extractor, cases: list[dict[str, Any]]) -> dict[str, Any]
                 field_counts[field]["missing"] += 1
                 source_field = source_metrics["fields"].setdefault(field, {"correct": 0, "total": 0})
                 source_field["total"] += 1
+            failed_categories = case.get("expected_clause_categories", [])
+            amendment_clause_total += len(failed_categories)
+            for category in failed_categories:
+                counts = amendment_category_counts.setdefault(category, {"supported": 0, "total": 0})
+                counts["total"] += 1
+            case_results[-1]["amendment_clause_categories"] = {
+                category: {"supported_by_extracted_evidence": False} for category in failed_categories
+            }
+            if "active_contract_text" in case:
+                amendment_comparison_total += 1
+                case_results[-1]["amendment_comparison"] = {
+                    "expected_changed_fields": sorted(case.get("expected_changed_fields", [])),
+                    "actual_changed_fields": None, "match": False,
+                }
             continue
         elapsed_seconds += time.perf_counter() - started
         usage = getattr(extractor, "last_usage", None)
@@ -146,6 +173,42 @@ def evaluate_extractor(extractor, cases: list[dict[str, Any]]) -> dict[str, Any]
             if grounded:
                 evidence_grounded += 1
             evidence_results.append({"field": evidence.field, "quote": evidence.quote, "grounded": grounded})
+        expected_clauses = case.get("expected_clause_categories", [])
+        clause_results = {}
+        evidence_text = " ".join(item.quote for item in extracted.evidence)
+        for category in expected_clauses:
+            patterns = _AMENDMENT_CLAUSE_PATTERNS.get(category, ())
+            supported = bool(patterns and any(re.search(pattern, evidence_text, re.IGNORECASE) for pattern in patterns))
+            clause_results[category] = {"supported_by_extracted_evidence": supported}
+            amendment_clause_total += 1
+            amendment_clause_supported += int(supported)
+            counts = amendment_category_counts.setdefault(category, {"supported": 0, "total": 0})
+            counts["total"] += 1
+            counts["supported"] += int(supported)
+        comparison_result = None
+        if "active_contract_text" in case:
+            comparison_started = time.perf_counter()
+            try:
+                active_terms = extractor.extract(case["active_contract_text"])
+                comparison_usage = getattr(extractor, "last_usage", None)
+                if comparison_usage:
+                    input_tokens += comparison_usage["input_tokens"]
+                    output_tokens += comparison_usage["output_tokens"]
+                    if not usage:
+                        usage_cases += 1
+                actual_changes = sorted(
+                    field for field in SCORED_FIELDS
+                    if _normalize(getattr(active_terms, field)) != _normalize(getattr(extracted, field))
+                )
+                expected_changes = sorted(case.get("expected_changed_fields", []))
+                comparison_result = {"expected_changed_fields": expected_changes, "actual_changed_fields": actual_changes,
+                                     "match": actual_changes == expected_changes}
+            except Exception as exc:
+                comparison_result = {"expected_changed_fields": sorted(case.get("expected_changed_fields", [])),
+                                     "actual_changed_fields": None, "match": False, "error": str(exc)}
+            elapsed_seconds += time.perf_counter() - comparison_started
+            amendment_comparison_total += 1
+            amendment_comparison_correct += int(comparison_result["match"])
         case_result = {
             "case": case["id"],
             "source_type": source_type,
@@ -154,6 +217,10 @@ def evaluate_extractor(extractor, cases: list[dict[str, Any]]) -> dict[str, Any]
             "evidence": evidence_results,
             "field_evidence_support": case_evidence_support,
         }
+        if expected_clauses:
+            case_result["amendment_clause_categories"] = clause_results
+        if comparison_result is not None:
+            case_result["amendment_comparison"] = comparison_result
         if usage:
             case_result["token_usage"] = usage
         case_results.append(case_result)
@@ -179,6 +246,20 @@ def evaluate_extractor(extractor, cases: list[dict[str, Any]]) -> dict[str, Any]
             "supported": support_count,
             "total": support_total,
             "accuracy": _ratio(support_count, support_total),
+        },
+        "clause_categories": {
+            "supported": amendment_clause_supported,
+            "total": amendment_clause_total,
+            "accuracy": _ratio(amendment_clause_supported, amendment_clause_total),
+            "by_category": {category: {**counts, "accuracy": _ratio(counts["supported"], counts["total"])}
+                            for category, counts in sorted(amendment_category_counts.items())},
+            "meaning": "share of expected amendment terms represented in provider evidence quotes",
+        },
+        "amendment_comparison": {
+            "correct": amendment_comparison_correct,
+            "total": amendment_comparison_total,
+            "accuracy": _ratio(amendment_comparison_correct, amendment_comparison_total),
+            "meaning": "exact agreement between provider-extracted changed structured fields and reviewed amendment fixture labels",
         },
         "source_types": {
             source_type: {
@@ -269,3 +350,18 @@ def _evidence_supports(field: str, value: Any, quote: str | None) -> bool:
     if field == "termination_notice":
         return _normalize_text(str(value)) in folded
     return _normalize_text(str(value)) in folded
+
+
+_AMENDMENT_CLAUSE_PATTERNS = {
+    "effective_term": (r"\beffective\s+date\b", r"\bcommenc(?:e|ement|ing)\b", r"\bterm\b"),
+    "expiration": (r"\bexpir(?:ation|es|y|e)\b", r"\bends?\s+(?:on|at|through)\b", r"\bthrough\s+[A-Z][a-z]+\s+\d"),
+    "renewal": (r"\brenew(?:al|s|ed|ing)?\b", r"\bextend(?:s|ed|ing)?\b"),
+    "auto_renewal": (r"\bauto(?:matically)?\s+renew\w*\b", r"\bautomatically\s+extend\w*\b"),
+    "notice_period": (r"\bnotice\b.{0,50}\b\d+\s+days?\b", r"\b\d+\s+days?\b.{0,50}\bnotice\b"),
+    "termination": (r"\bterminat(?:e|ion|ed|ing)\b", r"\bnon[- ]renewal\b"),
+    "pricing": (r"\b(?:price|pricing|fee|cost|payment|increase)\b",),
+    "data_retention": (r"\b(?:data|retain|delete|privacy)\b",),
+    "liability": (r"\b(?:liabilit|indemn|damages)\w*\b",),
+    "security": (r"\b(?:security|breach|encryption|incident)\w*\b",),
+    "other": (r"\b(?:agreement|amendment|obligation)\b",),
+}
