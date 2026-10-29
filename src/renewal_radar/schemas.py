@@ -26,6 +26,7 @@ class ContractObligation(BaseModel):
     due_offset_days: int | None = Field(default=None, ge=0, le=3650)
     due_offset_from: Literal["start_date", "expiration_date"] | None = None
     due_offset_direction: Literal["before", "after"] | None = None
+    recurrence_interval_months: int | None = Field(default=None, ge=1, le=120)
     evidence: Evidence
 
     @model_validator(mode="after")
@@ -257,6 +258,21 @@ class ObligationCreateRequest(ContractObligation):
         if "@" not in value or value.startswith("@") or value.endswith("@"):
             raise ValueError("owner_email must be a valid email address")
         return value
+
+
+class ObligationScheduleUpdateRequest(BaseModel):
+    status: Literal["active", "paused", "ended"] | None = None
+    recurrence_interval_months: int | None = Field(default=None, ge=1, le=120)
+
+    @model_validator(mode="after")
+    def require_update(self) -> "ObligationScheduleUpdateRequest":
+        if self.status is None and self.recurrence_interval_months is None:
+            raise ValueError("Provide a schedule status or recurrence interval")
+        return self
+
+
+class ObligationRescheduleRequest(BaseModel):
+    due_date: date
 
 
 class RenewalForecastRequest(BaseModel):

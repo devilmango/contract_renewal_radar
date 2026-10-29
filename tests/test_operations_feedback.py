@@ -43,6 +43,11 @@ def test_notification_failures_and_job_health_appear_as_alerts(tmp_path, monkeyp
         with pytest.raises(OSError, match="SMTP unavailable"):
             run_reminders(store, today=date(2026, 1, 1), tenant_id=tenant)
 
+    store.save_integration_connection(
+        tenant, "calendar", "google_calendar", {"calendar_id": "primary"}, "encrypted", "admin",
+    )
+    store.update_integration_health(tenant, "calendar", "error", "provider timeout")
+
     stuck = store.enqueue_job(tenant, "calendar.sync", {"tenant_id": tenant}, "dead-calendar", max_attempts=1)
     claimed = store.claim_job("operations-worker", job_id=stuck["id"])
     assert claimed["id"] == stuck["id"]
@@ -56,9 +61,16 @@ def test_notification_failures_and_job_health_appear_as_alerts(tmp_path, monkeyp
     assert health["status"] == "degraded"
     assert health["jobs"]["by_status"]["dead"] == 1
     assert health["notifications"]["failed_last_hour"] == 3
+    assert health["integrations"]["error_count"] == 1
+    assert "settings" not in health["integrations"]["connections"][0]
+    assert any(alert["code"] == "integration_error" for alert in health["alerts"])
     assert any(alert["code"] == "repeated_notification_failures" for alert in health["alerts"])
     assert any(alert["code"] == "dead_jobs" for alert in health["alerts"])
     assert health["notifications"]["recent"][0]["task_id"] == task_id
+
+    retry = endpoint(app, "/jobs/{job_id}/retry", "POST")
+    queued = retry(stuck["id"], Principal("admin", frozenset({"admin"}), tenant_id=tenant))
+    assert queued.status == "queued"
 
 
 def test_confirmed_review_corrections_require_governance_before_export(tmp_path, monkeypatch):

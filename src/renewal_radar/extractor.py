@@ -164,9 +164,11 @@ class RulesExtractor:
                 if not pattern.search(excerpt) or (category, parsed) in seen_obligations:
                     continue
                 evidence_quote = excerpt[:1000]
+                recurrence = _recurrence_interval_months(excerpt)
                 obligations.append(ContractObligation(
                     category=category, title=label, description=evidence_quote,
                     due_date=parsed,
+                    recurrence_interval_months=recurrence,
                     evidence=Evidence(field=f"obligation:{category}", quote=evidence_quote, confidence=0.62),
                 ))
                 seen_obligations.add((category, parsed))
@@ -306,8 +308,27 @@ _SYSTEM_PROMPT = (
     "and currency only when an annual amount and its currency are explicit; do not convert billing periods. "
     "Also extract schedulable obligations for price increases, insurance certificates, audit rights, and termination windows. "
     "For each obligation, include a verbatim evidence quote and either its explicit due_date or an explicit day offset from the contract start_date or expiration_date. "
+    "If the clause explicitly repeats on a schedule, include recurrence_interval_months (for example annual=12, quarterly=3); otherwise use null. "
     "Do not invent owners, dates, offsets, or obligations; omit an obligation when no supported schedule can be identified."
 )
+
+
+def _recurrence_interval_months(text: str) -> int | None:
+    normalized = text.casefold()
+    if re.search(r"\b(annually|annual|each year|every year|yearly)\b", normalized):
+        return 12
+    if re.search(r"\b(quarterly|each quarter|every quarter)\b", normalized):
+        return 3
+    if re.search(r"\b(semi-?annually|biannually|twice a year|twice yearly|every six months?)\b", normalized):
+        return 6
+    if re.search(r"\b(monthly|each month|every month)\b", normalized):
+        return 1
+    match = re.search(r"\bevery\s+(\d{1,3}|two|three|four|five|six|eight|ten|twelve)\s+months?\b", normalized)
+    if not match:
+        return None
+    amount = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "eight": 8, "ten": 10, "twelve": 12}.get(match.group(1), match.group(1))
+    amount = int(amount)
+    return amount if 1 <= amount <= 120 else None
 
 
 def _user_prompt(text: str) -> str:
@@ -344,6 +365,7 @@ def _contract_schema(*, nullable_as_any_of: bool = False) -> dict:
                         "due_offset_days": nullable("integer"),
                         "due_offset_from": {"type": ["string", "null"], "enum": ["start_date", "expiration_date", None]},
                         "due_offset_direction": {"type": ["string", "null"], "enum": ["before", "after", None]},
+                        "recurrence_interval_months": nullable("integer"),
                         "evidence": {
                             "type": "object",
                             "properties": {
@@ -353,7 +375,7 @@ def _contract_schema(*, nullable_as_any_of: bool = False) -> dict:
                             "required": ["field", "quote", "page", "confidence"], "additionalProperties": False,
                         },
                     },
-                    "required": ["category", "title", "description", "due_date", "due_offset_days", "due_offset_from", "due_offset_direction", "evidence"],
+                    "required": ["category", "title", "description", "due_date", "due_offset_days", "due_offset_from", "due_offset_direction", "recurrence_interval_months", "evidence"],
                     "additionalProperties": False,
                 },
             },

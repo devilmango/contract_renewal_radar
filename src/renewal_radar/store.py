@@ -12,6 +12,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from uuid import uuid4
 import calendar
+from statistics import median
 
 from .schemas import ContractData
 
@@ -124,7 +125,10 @@ class Store:
                     description TEXT,
                     evidence_json TEXT NOT NULL,
                     created_by TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    recurrence_interval_months INTEGER,
+                    recurrence_group_id TEXT NOT NULL,
+                    schedule_status TEXT NOT NULL DEFAULT 'active'
                 );
                 CREATE TABLE IF NOT EXISTS renewal_outcomes (
                     task_id TEXT PRIMARY KEY REFERENCES tasks(id),
@@ -139,6 +143,25 @@ class Store:
                     notes TEXT,
                     recorded_by TEXT NOT NULL,
                     recorded_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS renewal_forecast_runs (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    period_start TEXT NOT NULL,
+                    period_end TEXT NOT NULL,
+                    renewal_increase_pct TEXT NOT NULL,
+                    renegotiation_savings_pct TEXT NOT NULL,
+                    recorded_by TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS renewal_forecast_lines (
+                    run_id TEXT NOT NULL REFERENCES renewal_forecast_runs(id),
+                    tenant_id TEXT NOT NULL,
+                    contract_id TEXT NOT NULL REFERENCES contracts(id),
+                    supplier TEXT,
+                    currency TEXT,
+                    annual_contract_value TEXT NOT NULL,
+                    PRIMARY KEY (run_id, contract_id)
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -352,6 +375,18 @@ class Store:
                 if self.is_postgres and table == "contracts":
                     db.execute("ALTER TABLE contracts ADD COLUMN IF NOT EXISTS supplier_id TEXT")
             db.execute("CREATE INDEX IF NOT EXISTS idx_contract_tenant ON contracts(tenant_id, status)")
+            obligation_columns = {row["name"] for row in db.execute("PRAGMA table_info(contract_obligations)")} if not self.is_postgres else {
+                row["column_name"] for row in db.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name='contract_obligations'"
+                )
+            }
+            if "recurrence_interval_months" not in obligation_columns:
+                db.execute("ALTER TABLE contract_obligations ADD COLUMN recurrence_interval_months INTEGER")
+            if "recurrence_group_id" not in obligation_columns:
+                db.execute("ALTER TABLE contract_obligations ADD COLUMN recurrence_group_id TEXT")
+                db.execute("UPDATE contract_obligations SET recurrence_group_id=id WHERE recurrence_group_id IS NULL")
+            if "schedule_status" not in obligation_columns:
+                db.execute("ALTER TABLE contract_obligations ADD COLUMN schedule_status TEXT NOT NULL DEFAULT 'active'")
             db.execute("CREATE INDEX IF NOT EXISTS idx_task_tenant ON tasks(tenant_id, status, due_date)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_task_kind_due ON tasks(tenant_id, task_kind, status, due_date)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_obligations_contract ON contract_obligations(tenant_id, contract_id, created_at)")
@@ -363,6 +398,8 @@ class Store:
             db.execute("CREATE INDEX IF NOT EXISTS idx_task_notification_tenant ON task_notification_state(tenant_id, sent_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_supplier_tenant ON suppliers(tenant_id, normalized_name)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_outcome_tenant_date ON renewal_outcomes(tenant_id, recorded_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_forecast_tenant_date ON renewal_forecast_runs(tenant_id, recorded_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_forecast_lines_contract ON renewal_forecast_lines(tenant_id, contract_id)")
 
     def save_contract(self, contract_id: str, filename: str, provider: str, data: ContractData, raw_text: str, actor: str, tenant_id: str = "default") -> None:
         now = utc_now().isoformat()
@@ -531,6 +568,8 @@ class Store:
         if start_date and due_date < date.fromisoformat(start_date):
             raise ValueError("Obligation due date cannot precede the contract start date")
         obligation_id, task_id = str(uuid4()), str(uuid4())
+        recurrence_months = terms.get("recurrence_interval_months")
+        recurrence_group = str(uuid4())
         now = utc_now().isoformat()
         evidence = terms["evidence"]
         if hasattr(evidence, "model_dump"):
@@ -547,14 +586,17 @@ class Store:
                 (task_id, contract_id, terms["title"], owner_name, owner_email, due_date.isoformat(), due_date.isoformat(), now, tenant_id),
             )
             db.execute(
-                "INSERT INTO contract_obligations (id,tenant_id,contract_id,task_id,category,title,description,evidence_json,created_by,created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO contract_obligations "
+                "(id,tenant_id,contract_id,task_id,category,title,description,evidence_json,created_by,created_at,recurrence_interval_months,recurrence_group_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (obligation_id, tenant_id, contract_id, task_id, terms["category"], terms["title"],
-                 terms.get("description"), json.dumps(evidence, default=str), actor, now),
+                 terms.get("description"), json.dumps(evidence, default=str), actor, now,
+                 recurrence_months, recurrence_group),
             )
             self.add_audit(db, contract_id, "obligation.scheduled", actor, {
                 "obligation_id": obligation_id, "task_id": task_id, "category": terms["category"],
                 "title": terms["title"], "due_date": due_date.isoformat(), "owner_email": owner_email,
+                "recurrence_interval_months": recurrence_months,
             }, tenant_id)
             return self._obligation_record(db.execute(
                 "SELECT o.*,t.status AS task_status,t.owner_name,t.owner_email,t.due_date,t.reminder_sent_at,t.escalated_at "
@@ -568,6 +610,119 @@ class Store:
         result["evidence"] = json.loads(result.pop("evidence_json"))
         result["status"] = result.pop("task_status")
         return result
+
+    def _create_next_obligation_occurrence(self, db, task, actor: str) -> str | None:
+        obligation = db.execute(
+            "SELECT * FROM contract_obligations WHERE task_id=? AND tenant_id=?",
+            (task["id"], task["tenant_id"]),
+        ).fetchone()
+        if not obligation or not obligation["recurrence_interval_months"]:
+            return None
+        if obligation["schedule_status"] != "active":
+            return None
+        contract = db.execute(
+            "SELECT status,confirmed_json FROM contracts WHERE id=? AND tenant_id=?",
+            (task["contract_id"], task["tenant_id"]),
+        ).fetchone()
+        if not contract or contract["status"] != "active":
+            return None
+        terms = json.loads(contract["confirmed_json"] or "{}")
+        expiration = date.fromisoformat(terms["expiration_date"]) if terms.get("expiration_date") else None
+        due = _add_months(date.fromisoformat(task["due_date"]), obligation["recurrence_interval_months"])
+        if expiration and due > expiration:
+            return None
+        task_id, obligation_id = str(uuid4()), str(uuid4())
+        now = utc_now().isoformat()
+        db.execute(
+            "INSERT INTO tasks (id,contract_id,title,owner_name,owner_email,due_date,expiration_date,status,created_at,tenant_id,task_kind) "
+            "VALUES (?,?,?,?,?,?,?,'open',?,?,'obligation')",
+            (task_id, task["contract_id"], task["title"], task["owner_name"], task["owner_email"],
+             due.isoformat(), due.isoformat(), now, task["tenant_id"]),
+        )
+        db.execute(
+            "INSERT INTO contract_obligations "
+            "(id,tenant_id,contract_id,task_id,category,title,description,evidence_json,created_by,created_at,recurrence_interval_months,recurrence_group_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (obligation_id, obligation["tenant_id"], obligation["contract_id"], task_id,
+             obligation["category"], obligation["title"], obligation["description"],
+             obligation["evidence_json"], "system:recurrence", now,
+             obligation["recurrence_interval_months"], obligation["recurrence_group_id"] or obligation["id"]),
+        )
+        self.add_audit(db, task["contract_id"], "obligation.occurrence_created", actor, {
+            "obligation_id": obligation_id, "task_id": task_id, "previous_task_id": task["id"],
+            "due_date": due.isoformat(), "recurrence_interval_months": obligation["recurrence_interval_months"],
+        }, task["tenant_id"])
+        return task_id
+
+    def update_obligation_schedule(
+        self, obligation_id: str, tenant_id: str, actor: str, *,
+        status: str | None = None, recurrence_interval_months: int | None = None,
+    ) -> dict[str, Any] | None:
+        if status is not None and status not in {"active", "paused", "ended"}:
+            raise ValueError("Schedule status must be active, paused, or ended")
+        if recurrence_interval_months is not None and not 1 <= recurrence_interval_months <= 120:
+            raise ValueError("Recurrence interval must be between 1 and 120 months")
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM contract_obligations WHERE id=? AND tenant_id=?", (obligation_id, tenant_id),
+            ).fetchone()
+            if not row:
+                return None
+            new_status = status or row["schedule_status"]
+            if row["schedule_status"] == "ended" and new_status != "ended":
+                raise ValueError("An ended schedule cannot be reactivated")
+            new_interval = recurrence_interval_months if recurrence_interval_months is not None else row["recurrence_interval_months"]
+            if new_status == "active" and not new_interval:
+                raise ValueError("An active recurring schedule requires a cadence")
+            group = row["recurrence_group_id"] or obligation_id
+            db.execute(
+                "UPDATE contract_obligations SET schedule_status=?,recurrence_interval_months=? "
+                "WHERE tenant_id=? AND recurrence_group_id=?",
+                (new_status, new_interval, tenant_id, group),
+            )
+            self.add_audit(db, row["contract_id"], "obligation.schedule_updated", actor, {
+                "obligation_id": obligation_id, "recurrence_group_id": group,
+                "schedule_status": new_status, "recurrence_interval_months": new_interval,
+            }, tenant_id)
+            result = db.execute(
+                "SELECT o.*,t.status AS task_status,t.owner_name,t.owner_email,t.due_date,t.reminder_sent_at,t.escalated_at "
+                "FROM contract_obligations o JOIN tasks t ON t.id=o.task_id WHERE o.id=? AND o.tenant_id=?",
+                (obligation_id, tenant_id),
+            ).fetchone()
+        return self._obligation_record(result)
+
+    def reschedule_obligation(
+        self, obligation_id: str, due_date: date, tenant_id: str, actor: str,
+    ) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT o.*,t.status AS task_status,t.due_date,t.owner_name,t.owner_email,t.reminder_sent_at,t.escalated_at "
+                "FROM contract_obligations o JOIN tasks t ON t.id=o.task_id WHERE o.id=? AND o.tenant_id=?",
+                (obligation_id, tenant_id),
+            ).fetchone()
+            if not row:
+                return None
+            if row["task_status"] != "open":
+                raise ValueError("Only open obligation occurrences can be rescheduled")
+            contract = db.execute(
+                "SELECT confirmed_json FROM contracts WHERE id=? AND tenant_id=?", (row["contract_id"], tenant_id),
+            ).fetchone()
+            terms = json.loads(contract["confirmed_json"] or "{}")
+            if terms.get("start_date") and due_date < date.fromisoformat(terms["start_date"]):
+                raise ValueError("Obligation due date cannot precede the contract start date")
+            if terms.get("expiration_date") and due_date > date.fromisoformat(terms["expiration_date"]):
+                raise ValueError("Obligation due date cannot follow the contract expiration date")
+            db.execute("UPDATE tasks SET due_date=?,expiration_date=? WHERE id=?", (due_date.isoformat(), due_date.isoformat(), row["task_id"]))
+            self.add_audit(db, row["contract_id"], "obligation.rescheduled", actor, {
+                "obligation_id": obligation_id, "task_id": row["task_id"],
+                "previous_due_date": row["due_date"], "due_date": due_date.isoformat(),
+            }, tenant_id)
+            result = db.execute(
+                "SELECT o.*,t.status AS task_status,t.owner_name,t.owner_email,t.due_date,t.reminder_sent_at,t.escalated_at "
+                "FROM contract_obligations o JOIN tasks t ON t.id=o.task_id WHERE o.id=? AND o.tenant_id=?",
+                (obligation_id, tenant_id),
+            ).fetchone()
+        return self._obligation_record(result)
 
     def list_contract_obligations(
         self, tenant_id: str, status: str | None = None, owner_email: str | None = None,
@@ -710,6 +865,92 @@ class Store:
             details["task_id"] = task_id
             self.add_audit(db, task["contract_id"], "renewal.outcome_recorded", actor, details, tenant_id)
             return dict(db.execute("SELECT * FROM renewal_outcomes WHERE task_id=?", (task_id,)).fetchone())
+
+    def record_renewal_forecast(self, tenant_id: str, forecast: dict[str, Any], actor: str) -> str:
+        """Persist a reviewer-generated forecast so later outcomes can be scored against it."""
+        run_id, recorded_at = str(uuid4()), utc_now().isoformat()
+        period = forecast["period"]
+        assumptions = forecast["assumptions"]
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO renewal_forecast_runs "
+                "(id,tenant_id,period_start,period_end,renewal_increase_pct,renegotiation_savings_pct,recorded_by,recorded_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (run_id, tenant_id, period["start_date"], period["end_date"],
+                 str(assumptions["renewal_increase_pct"]), str(assumptions["renegotiation_savings_pct"]), actor, recorded_at),
+            )
+            for item in forecast["contracts"]:
+                if item.get("annual_contract_value") is None:
+                    continue
+                db.execute(
+                    "INSERT INTO renewal_forecast_lines (run_id,tenant_id,contract_id,supplier,currency,annual_contract_value) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (run_id, tenant_id, item["contract_id"], item.get("supplier"), item.get("currency"), item["annual_contract_value"]),
+                )
+        return run_id
+
+    def renewal_forecast_accuracy(self, tenant_id: str) -> dict[str, Any]:
+        """Compare the most recent pre-outcome forecast with actual annualized decisions."""
+        with self.connect() as db:
+            outcomes = db.execute(
+                "SELECT o.*,c.confirmed_json,c.extracted_json FROM renewal_outcomes o "
+                "JOIN contracts c ON c.id=o.contract_id AND c.tenant_id=o.tenant_id "
+                "WHERE o.tenant_id=? ORDER BY o.recorded_at", (tenant_id,),
+            ).fetchall()
+            runs = db.execute(
+                "SELECT r.*,l.contract_id,l.supplier,l.currency,l.annual_contract_value "
+                "FROM renewal_forecast_runs r JOIN renewal_forecast_lines l ON l.run_id=r.id "
+                "WHERE r.tenant_id=? ORDER BY r.recorded_at", (tenant_id,),
+            ).fetchall()
+        groups: dict[tuple[str | None, str, str], list[tuple[Decimal, Decimal]]] = {}
+        increases: list[Decimal] = []
+        savings: list[Decimal] = []
+        scored = 0
+        for outcome in outcomes:
+            candidates = [r for r in runs if r["contract_id"] == outcome["contract_id"] and r["recorded_at"] <= outcome["recorded_at"]]
+            if not candidates:
+                continue
+            run = candidates[-1]
+            if outcome["actual_annual_value"] is None and outcome["outcome"] not in {"terminated", "expired"}:
+                continue
+            terms = json.loads(outcome["confirmed_json"] or outcome["extracted_json"] or "{}")
+            baseline = Decimal(str(run["annual_contract_value"]))
+            actual = Decimal(str(outcome["actual_annual_value"] or 0))
+            currency = outcome["currency"] or run["currency"] or terms.get("currency") or ""
+            supplier = run["supplier"]
+            predictions = {
+                "renew": baseline * (Decimal(1) + Decimal(run["renewal_increase_pct"]) / Decimal(100)),
+                "renegotiate": baseline * (Decimal(1) - Decimal(run["renegotiation_savings_pct"]) / Decimal(100)),
+                "terminate": Decimal(0),
+            }
+            for scenario, predicted in predictions.items():
+                groups.setdefault((supplier, scenario, currency), []).append((predicted, actual))
+            scored += 1
+            if baseline > 0 and outcome["actual_annual_value"] is not None:
+                ratio = (Decimal(str(outcome["actual_annual_value"])) / baseline - 1) * 100
+                if outcome["outcome"] == "renewed":
+                    increases.append(ratio)
+                elif outcome["outcome"] == "renegotiated":
+                    savings.append(-ratio)
+        metrics = []
+        for (supplier, scenario, currency), values in sorted(groups.items(), key=lambda x: (x[0][0] or "", x[0][1], x[0][2])):
+            variances = [predicted - actual for predicted, actual in values]
+            metrics.append({
+                "supplier": supplier, "scenario": scenario, "currency": currency,
+                "sample_count": len(values), "mean_predicted_annual_value": _money_string(sum((x[0] for x in values), Decimal(0)) / len(values)),
+                "mean_actual_annual_value": _money_string(sum((x[1] for x in values), Decimal(0)) / len(values)),
+                "mean_variance": _money_string(sum(variances, Decimal(0)) / len(variances)),
+                "mean_absolute_variance": _money_string(sum((abs(x) for x in variances), Decimal(0)) / len(variances)),
+            })
+        return {
+            "outcome_count": scored,
+            "by_supplier_and_scenario": metrics,
+            "recommended_assumptions": {
+                "renewal_increase_pct": _percent_string(median(increases)) if increases else None,
+                "renegotiation_savings_pct": _percent_string(median(savings)) if savings else None,
+                "renewal_samples": len(increases), "renegotiation_samples": len(savings),
+            },
+        }
 
     def renewal_outcome_summary(self, tenant_id: str) -> dict[str, Any]:
         with self.connect() as db:
@@ -870,10 +1111,19 @@ class Store:
                 if not previous:
                     raise ValueError("supersedes_contract_id must reference an active contract in this organization")
                 previous_tasks = [dict(row) for row in db.execute(
-                    "SELECT id,title,due_date,expiration_date,owner_email,workflow_state FROM tasks "
+                    "SELECT id,title,due_date,expiration_date,owner_email,workflow_state,task_kind FROM tasks "
                     "WHERE contract_id=? AND tenant_id=? AND status='open' ORDER BY due_date,id",
                     (data.supersedes_contract_id, tenant_id),
                 ).fetchall()]
+                previous_obligations = [dict(row) for row in db.execute(
+                    "SELECT o.id,o.category,o.title,o.description,o.recurrence_interval_months,o.evidence_json,"
+                    "t.id AS task_id,t.due_date,t.owner_email FROM contract_obligations o "
+                    "JOIN tasks t ON t.id=o.task_id WHERE o.contract_id=? AND o.tenant_id=? AND t.status='open' "
+                    "ORDER BY t.due_date,o.title",
+                    (data.supersedes_contract_id, tenant_id),
+                ).fetchall()]
+            else:
+                previous_obligations = []
 
         after = data.model_dump(mode="json")
         before = json.loads(previous["confirmed_json"] or previous["extracted_json"]) if previous else {}
@@ -886,6 +1136,26 @@ class Store:
             field: {"before": before.get(field), "after": after.get(field)}
             for field in compared_fields if previous and before.get(field) != after.get(field)
         }
+        obligation_proposals = data.obligations or ContractData.model_validate_json(proposal["extracted_json"]).obligations
+        proposed_obligations = [
+            {
+                "category": item.category,
+                "title": item.title,
+                "due_date": item.due_date.isoformat() if item.due_date else None,
+                "due_offset_days": item.due_offset_days,
+                "due_offset_from": item.due_offset_from,
+                "due_offset_direction": item.due_offset_direction,
+                "recurrence_interval_months": item.recurrence_interval_months,
+                "evidence_quote": item.evidence.quote,
+            }
+            for item in obligation_proposals
+        ]
+        old_obligation_summary = [
+            {key: row[key] for key in ("category", "title", "due_date", "owner_email", "recurrence_interval_months")}
+            for row in previous_obligations
+        ]
+        if previous and old_obligation_summary != proposed_obligations:
+            changes["obligations"] = {"before": old_obligation_summary, "after": proposed_obligations}
         return {
             "contract_id": contract_id,
             "amendment": previous is not None,
@@ -894,8 +1164,14 @@ class Store:
                 "contract": before.get("contract") or previous["filename"], "status_after_confirmation": "superseded",
             } if previous else None),
             "changes": changes,
+            "source_comparison": _compare_source_clauses(previous["raw_text"], proposal["raw_text"]) if previous else None,
             "impact": {
                 "open_tasks_to_resolve": previous_tasks,
+                "open_obligations_to_review": [
+                    {key: row[key] for key in ("id", "task_id", "category", "title", "due_date", "owner_email", "recurrence_interval_months")}
+                    for row in previous_obligations
+                ],
+                "proposed_obligations_to_review": proposed_obligations,
                 "new_task": {
                     "title": f"Review renewal: {data.contract or proposal['filename']}",
                     "due_date": due.isoformat(), "expiration_date": data.expiration_date.isoformat(),
@@ -1151,6 +1427,10 @@ class Store:
         for row in counts:
             by_status[row["status"]] = by_status.get(row["status"], 0) + row["count"]
             by_type.setdefault(row["job_type"], {})[row["status"]] = row["count"]
+        connections = [
+            {key: item[key] for key in ("integration_name", "provider", "status", "last_checked_at", "last_error")}
+            for item in self.list_integration_connections(tenant_id)
+        ]
         return {
             "generated_at": now.isoformat(), "tenant_id": tenant_id,
             "jobs": {"by_status": by_status, "by_type": by_type, "queued_stuck": queued_stuck,
@@ -1159,6 +1439,8 @@ class Store:
             "notifications": {"by_channel": [dict(row) for row in deliveries],
                                "failed_last_hour": failed_deliveries_hour,
                                "recent": [dict(row) for row in recent_deliveries]},
+            "integrations": {"connections": connections,
+                             "error_count": sum(1 for item in connections if item["status"] == "error")},
             "alerts": [],
         }
 
@@ -1390,6 +1672,7 @@ class Store:
                 raise ValueError("Task is already resolved")
             db.execute("UPDATE tasks SET status='resolved', workflow_state='resolved' WHERE id=?", (task_id,))
             self.add_audit(db, row["contract_id"], "task.resolved", actor, {"task_id": task_id, "comment": comment}, tenant_id)
+            self._create_next_obligation_occurrence(db, row, actor)
             return row
 
     def transition_task(self, task_id: str, workflow_state: str, actor: str, comment: str | None, tenant_id: str) -> sqlite3.Row | None:
@@ -1798,6 +2081,53 @@ def _monthly_prorated_costs(annual_value: Decimal, start: date, end: date) -> di
 
 def _money_string(value: Decimal) -> str:
     return str(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _percent_string(value: Decimal) -> str:
+    return str(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _compare_source_clauses(active_text: str, amendment_text: str) -> dict[str, Any]:
+    """Return exact source quotes for changed clause-sized text spans."""
+    def split_clauses(text: str) -> list[str]:
+        parts = re.split(r"\n+|(?<=[.!?])\s+(?=[A-Z0-9(])", text or "")
+        return [part.strip() for part in parts if len(part.strip()) >= 12]
+
+    def normalized(text: str) -> str:
+        return re.sub(r"\W+", " ", text.casefold()).strip()
+
+    before, after = split_clauses(active_text), split_clauses(amendment_text)
+    matcher = SequenceMatcher(a=[normalized(x) for x in before], b=[normalized(x) for x in after])
+    changes: list[dict[str, Any]] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        for kind, clauses in (("removed", before[i1:i2]), ("added", after[j1:j2])):
+            for quote in clauses:
+                text = quote.casefold()
+                categories = []
+                for category, terms in {
+                    "renewal": ("renew", "extension", "term"),
+                    "pricing": ("price", "fee", "cost", "payment", "increase"),
+                    "termination": ("terminat", "cancel", "notice", "expire"),
+                    "data_retention": ("data", "retain", "delete", "privacy"),
+                    "liability": ("liabilit", "indemn", "damages"),
+                    "security": ("security", "breach", "encryption"),
+                }.items():
+                    if any(term in text for term in terms):
+                        categories.append(category)
+                changes.append({
+                    "change": kind, "source_quote": quote, "categories": categories or ["other"],
+                    "needs_reviewer_attention": True,
+                })
+    return {"changes": changes, "unchanged_clause_count": len(set(normalized(x) for x in before) & set(normalized(x) for x in after))}
+
+
+def _add_months(value: date, months: int) -> date:
+    month_index = value.year * 12 + value.month - 1 + months
+    year, month_zero = divmod(month_index, 12)
+    month = month_zero + 1
+    return date(year, month, min(value.day, calendar.monthrange(year, month)[1]))
 
 
 def calculate_notice_deadline(expiration: date, notice_days: int, day_type: str, holidays: set[date] | None = None) -> date:

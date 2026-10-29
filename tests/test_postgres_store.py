@@ -2,6 +2,7 @@
 
 import os
 from datetime import date
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -24,9 +25,24 @@ def test_postgres_schema_migrations_and_concurrent_worker_storage():
         start_date=date(2025, 1, 1),
         expiration_date=date(2026, 1, 1),
         renewal_notice_days=30,
+        annual_contract_value=Decimal("1000.00"),
+        currency="USD",
     )
     store.save_contract(contract_id, "agreement.pdf", "rules", terms, "notice 30 days", "ci", tenant)
     task_id = store.confirm_contract(contract_id, terms, "ci", tenant)
+    forecast = store.renewal_forecast(tenant, date(2025, 1, 1), date(2026, 1, 1), Decimal("5"), Decimal("10"))
+    store.record_renewal_forecast(tenant, forecast, "ci-reviewer")
+    store.record_renewal_outcome(task_id, {
+        "outcome": "renegotiated", "actual_annual_value": Decimal("900.00"), "annual_savings": Decimal("100.00"),
+        "currency": "USD", "actual_expiration_date": date(2027, 1, 1),
+    }, "ci-reviewer", tenant)
+    assert store.renewal_forecast_accuracy(tenant)["outcome_count"] == 1
+    obligation = store.create_contract_obligation(contract_id, {
+        "category": "insurance_certificate", "title": "CI certificate", "due_date": date(2025, 6, 1),
+        "recurrence_interval_months": 12,
+        "evidence": {"field": "obligation:insurance_certificate", "quote": "Provide an annual certificate."},
+    }, "CI owner", "ci@example.com", "ci-reviewer", tenant)
+    assert store.update_obligation_schedule(obligation["id"], tenant, "ci-reviewer", status="paused")["schedule_status"] == "paused"
     comment = store.add_task_comment(task_id, "Review notice clause", "ci", tenant)
     assert comment["body"] == "Review notice clause"
     assert store.list_tasks(status="open", tenant_id=tenant, unassigned=True)[0]["id"] == task_id
