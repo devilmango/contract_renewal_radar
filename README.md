@@ -51,7 +51,9 @@ An extraction is always a proposal. The service does not activate a contract or 
 - **Renewal risk dashboard:** Triage overdue and near-deadline work, unassigned tasks, upcoming expirations, and aging contract reviews in a tenant-scoped portfolio view.
 - **Reviewer feedback evaluation:** Capture proposal-to-confirmed corrections, approve de-identified evidence-backed cases, and export them for repeatable provider comparison.
 - **Obligation proof and sign-off:** Attach checksummed completion evidence, require reviewer approval before recurring work advances, and retain failed, missed, submitted, and reviewed outcomes in compliance history.
-- **Renewal playbooks:** Route tasks to named approvers using contract-value, supplier-risk, and amendment-clause conditions; keep a renewal blocked until every reviewer and checklist requirement is complete.
+- **Approval inbox with SLAs:** Review pending obligation evidence and playbook decisions in one age-ranked queue. Scheduled reminder runs notify assigned reviewers, escalate work after the approval SLA, and retain delivery attempts and outcomes in an audit history.
+- **Renewal playbooks:** Route tasks to named approvers using contract-value, supplier-risk, and amendment-clause conditions; edit, version, simulate against open renewals, and retire rules while retaining the applied version snapshot for past decisions.
+- **Automatic amendment pairing:** Rank pending uploads against active contracts, preselect strong name matches for reviewer confirmation, compare quoted source clauses and structured terms, and infer amendment categories for playbook routing.
 - **Portfolio operations:** Bulk-assign task owners, move eligible tasks into review, associate contracts with suppliers, and export tenant-scoped portfolios as CSV or Excel workbooks.
 - **Provider drift monitoring:** Compare rules and configured LLM providers on the same redacted fixtures, including field accuracy, evidence support, amendment clause coverage, and provider-extracted amendment term changes; surface score drops against each provider's prior run.
 - **Contract-data governance:** Enforce an LLM provider allowlist, record authenticated access history, support legal holds, and redact eligible contract records on demand or by retention policy.
@@ -230,6 +232,8 @@ ESCALATION_AFTER_DAYS=7
 `EMAIL_PROVIDER` accepts `smtp`, `microsoft`, or `gmail`. Microsoft Graph email reuses `MS_GRAPH_TENANT_ID`, `MS_GRAPH_CLIENT_ID`, `MS_GRAPH_CLIENT_SECRET`, and `MS_GRAPH_USER_ID`; grant the app the Graph `Mail.Send` application permission with tenant admin consent. Gmail uses `GMAIL_ACCESS_TOKEN` from an OAuth token broker with the `gmail.send` scope. Set `SMTP_FROM` to a sender address verified for the selected provider. Microsoft and Gmail provider errors are recorded as failed notification attempts; the token itself is never written to the job or audit record. Keep provider credentials in a secret manager.
 
 `ESCALATION_EMAIL` receives an unresolved-task escalation when configured; otherwise the task owner receives it. Without the selected provider's credentials, notifications are recorded through the local log channel.
+
+Approval decisions share the scheduled reminder runner. Set `APPROVAL_SLA_DAYS` (default `3`) to define when a pending reviewer item is overdue, `APPROVAL_REVIEWER_EMAILS` to route obligation evidence sign-offs (comma-separated), and `APPROVAL_ESCALATION_EMAIL` to receive overdue approval escalations. Playbook reminders go to approvers who have not yet decided. Run `renewal-radar run-reminders` daily or schedule the same durable reminder job used for renewal notices. The `/approvals` workspace shows current age, SLA status, and recent delivery attempts.
 
 ### Tenant escalation policies
 

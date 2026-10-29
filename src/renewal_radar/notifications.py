@@ -46,18 +46,25 @@ def send_notification(
         raise ValueError("GMAIL_ACCESS_TOKEN is required when EMAIL_PROVIDER=gmail")
 
     message = EmailMessage()
-    prefix = (f"Escalation · {escalation_label}: " if escalation and escalation_label else "Escalation: ") if escalation else "Action required: "
+    approval_type = task.get("approval_type") if isinstance(task, dict) else None
+    prefix = (f"Approval escalation · {escalation_label}: " if escalation and approval_type and escalation_label else
+              "Approval escalation: " if escalation and approval_type else
+              f"Escalation · {escalation_label}: " if escalation and escalation_label else
+              "Escalation: " if escalation else
+              "Approval reminder: " if approval_type else "Action required: ")
     message["Subject"] = prefix + task["title"]
     message["From"] = settings.get("from_address", os.getenv("SMTP_FROM", "renewal-radar@example.com"))
     message["To"] = recipient
     message["Message-ID"] = f"<{hashlib.sha256((task['id'] + (':escalation' if escalation else ':reminder')).encode()).hexdigest()}@renewal-radar>"
     task_kind = task.get("task_kind", "renewal") if isinstance(task, dict) else task["task_kind"]
-    action_label = "Contract obligation" if task_kind == "obligation" else "Contract renewal"
+    action_label = "Reviewer approval" if approval_type else "Contract obligation" if task_kind == "obligation" else "Contract renewal"
     message.set_content(
         f"{action_label} task: {task['title']}\n"
         f"Action date: {task['due_date']}\n"
         + (f"Contract expiration: {task['expiration_date']}\n" if task_kind != "obligation" else "")
+        + ("This item is awaiting reviewer sign-off. Open the approval inbox to record a decision.\n" if approval_type else "")
         + (f"This task is still unresolved. Escalation: {escalation_label or 'follow-up'}.\n" if escalation else
+           "A reviewer decision is still needed. Please open the approval inbox.\n" if approval_type else
            "Please complete the obligation and update its task status.\n" if task_kind == "obligation" else
            "Please review the renewal and record the outcome.\n")
     )

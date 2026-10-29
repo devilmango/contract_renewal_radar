@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import os
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -63,7 +64,71 @@ def run_reminders(store: Store, today: date | None = None, tenant_id: str | None
                 sent_keys.add(action_key)
                 existing_escalations.add(action_key)
                 escalated += 1
+    approval_counts = run_approval_reminders(store, today= supplied_today or now.date(), tenant_id=tenant_id)
+    return {"reminders_sent": sent + approval_counts["reminders_sent"],
+            "escalations_sent": escalated + approval_counts["escalations_sent"]}
+
+
+def run_approval_reminders(store: Store, today: date | None = None, tenant_id: str | None = None) -> dict[str, int]:
+    """Notify reviewers about outstanding evidence and playbook decisions."""
+    as_of = today or date.today()
+    sla_days = max(1, int(os.getenv("APPROVAL_SLA_DAYS", "3")))
+    tenants = [tenant_id] if tenant_id else _tenants_with_approvals(store)
+    sent = escalated = 0
+    for tenant in tenants:
+        queue = store.approval_inbox(tenant, sla_days=sla_days, today=as_of)
+        for item in queue["items"]:
+            if item["age_days"] < 1:
+                continue
+            is_escalation = item["age_days"] >= sla_days
+            configured = [email.strip() for email in os.getenv("APPROVAL_REVIEWER_EMAILS", "").split(",") if email.strip()]
+            recipients = item["reviewers"] or configured
+            if is_escalation:
+                escalation = os.getenv("APPROVAL_ESCALATION_EMAIL", os.getenv("ESCALATION_EMAIL", "")).strip()
+                if escalation:
+                    recipients = [escalation]
+            if not recipients:
+                recipients = [None]
+            action = "escalation" if is_escalation else "reminder"
+            for recipient in recipients:
+                action_key = f"{action}:{as_of.isoformat()}:{(recipient or 'log').casefold()}"
+                task = store.get_task(item["task_id"], tenant)
+                if not task:
+                    continue
+                task = dict(task)
+                task["title"] = f"Approval {action}: {item['subject']} ({item['type'].replace('_', ' ')})"
+                task["id"] = f"{task['id']}:{item['target_id']}"
+                task["owner_email"] = recipient
+                task["task_kind"] = "obligation" if item["type"] == "obligation_signoff" else "renewal"
+                task["approval_type"] = item["type"]
+                task["tenant_id"] = tenant
+                channel = delivery_channel(task, is_escalation, recipient, store=store)
+                started = time.perf_counter()
+                status, error = "sent", None
+                try:
+                    send_notification(task, escalation=is_escalation, recipient_email=recipient,
+                                      escalation_label="approval SLA breached" if is_escalation else None, store=store)
+                except Exception as exc:
+                    status, error = "failed", f"{type(exc).__name__}: {exc}"
+                inserted = store.record_approval_notification(
+                    tenant, item["type"], item["target_id"], item["task_id"], action_key, recipient,
+                    channel, status, round((time.perf_counter() - started) * 1000), error,
+                )
+                if inserted and status == "sent":
+                    if is_escalation:
+                        escalated += 1
+                    else:
+                        sent += 1
     return {"reminders_sent": sent, "escalations_sent": escalated}
+
+
+def _tenants_with_approvals(store: Store) -> list[str]:
+    with store.connect() as db:
+        rows = db.execute(
+            "SELECT DISTINCT tenant_id FROM obligation_evidence WHERE status='pending_signoff' "
+            "UNION SELECT DISTINCT tenant_id FROM task_playbook_reviews WHERE status='blocked'"
+        ).fetchall()
+    return [row["tenant_id"] for row in rows]
 
 
 def _send_and_record(

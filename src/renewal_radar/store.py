@@ -275,7 +275,8 @@ class Store:
                     status TEXT NOT NULL,
                     duration_ms INTEGER NOT NULL,
                     error_message TEXT,
-                    attempted_at TEXT NOT NULL
+                    attempted_at TEXT NOT NULL,
+                    recipient TEXT
                 );
                 CREATE TABLE IF NOT EXISTS review_feedback (
                     id TEXT PRIMARY KEY,
@@ -381,7 +382,19 @@ class Store:
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    status TEXT NOT NULL DEFAULT 'active',
                     UNIQUE (tenant_id, name)
+                );
+                CREATE TABLE IF NOT EXISTS renewal_playbook_history (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    playbook_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS task_playbook_reviews (
                     id TEXT PRIMARY KEY,
@@ -394,7 +407,29 @@ class Store:
                     changed_clause_categories_json TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'blocked',
                     applied_by TEXT NOT NULL,
-                    applied_at TEXT NOT NULL
+                    applied_at TEXT NOT NULL,
+                    playbook_snapshot_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE TABLE IF NOT EXISTS approval_notification_state (
+                    tenant_id TEXT NOT NULL,
+                    target_type TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    action_key TEXT NOT NULL,
+                    sent_at TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, target_type, target_id, action_key)
+                );
+                CREATE TABLE IF NOT EXISTS approval_notification_deliveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT NOT NULL,
+                    target_type TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL REFERENCES tasks(id),
+                    recipient TEXT,
+                    channel TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL,
+                    error_message TEXT,
+                    attempted_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS provider_evaluation_runs (
                     id TEXT PRIMARY KEY,
@@ -418,6 +453,21 @@ class Store:
             if self.is_postgres:
                 schema = schema.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
             db.executescript(schema)
+            if self.is_postgres:
+                db.execute("ALTER TABLE notification_deliveries ADD COLUMN IF NOT EXISTS recipient TEXT")
+                db.execute("ALTER TABLE renewal_playbooks ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1")
+                db.execute("ALTER TABLE renewal_playbooks ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'")
+                db.execute("ALTER TABLE task_playbook_reviews ADD COLUMN IF NOT EXISTS playbook_snapshot_json TEXT NOT NULL DEFAULT '{}'")
+            else:
+                for table, column, declaration in (
+                    ("notification_deliveries", "recipient", "TEXT"),
+                    ("renewal_playbooks", "version", "INTEGER NOT NULL DEFAULT 1"),
+                    ("renewal_playbooks", "status", "TEXT NOT NULL DEFAULT 'active'"),
+                    ("task_playbook_reviews", "playbook_snapshot_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ):
+                    columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+                    if column not in columns:
+                        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
             # Upgrade databases created by earlier versions without dropping data.
             for table in ("contracts", "tasks", "audit_events"):
                 if self.is_postgres:
@@ -1030,6 +1080,80 @@ class Store:
                 (obligation_id, tenant_id),
             ).fetchall()]
 
+    def approval_inbox(self, tenant_id: str, sla_days: int = 3, today: date | None = None) -> dict[str, Any]:
+        """Return pending evidence sign-offs and playbook decisions with SLA age."""
+        as_of = today or date.today()
+        with self.connect() as db:
+            evidence_rows = db.execute(
+                "SELECT e.id AS target_id,e.created_at,e.task_id,e.obligation_id,o.title AS subject,c.id AS contract_id,"
+                "COALESCE(t.owner_email,'') AS owner_email,c.confirmed_json,c.extracted_json "
+                "FROM obligation_evidence e JOIN contract_obligations o ON o.id=e.obligation_id "
+                "JOIN tasks t ON t.id=e.task_id JOIN contracts c ON c.id=o.contract_id "
+                "WHERE e.tenant_id=? AND e.status='pending_signoff' AND t.status='open' ORDER BY e.created_at,e.id",
+                (tenant_id,),
+            ).fetchall()
+            playbook_rows = db.execute(
+                "SELECT r.id AS target_id,r.applied_at AS created_at,r.task_id,t.contract_id,t.title AS subject,"
+                "r.required_approvers_json,r.approvals_json,c.confirmed_json,c.extracted_json "
+                "FROM task_playbook_reviews r JOIN tasks t ON t.id=r.task_id JOIN contracts c ON c.id=t.contract_id "
+                "WHERE r.tenant_id=? AND r.status='blocked' AND t.status='open' ORDER BY r.applied_at,r.id",
+                (tenant_id,),
+            ).fetchall()
+            deliveries = db.execute(
+                "SELECT target_type,target_id,recipient,channel,status,error_message,attempted_at "
+                "FROM approval_notification_deliveries WHERE tenant_id=? ORDER BY attempted_at DESC LIMIT 100",
+                (tenant_id,),
+            ).fetchall()
+        entries = []
+        for row in evidence_rows:
+            terms = json.loads(row["confirmed_json"] or row["extracted_json"] or "{}")
+            entries.append({"type": "obligation_signoff", "target_id": row["target_id"], "obligation_id": row["obligation_id"], "task_id": row["task_id"],
+                            "contract_id": row["contract_id"], "subject": row["subject"], "pending_since": row["created_at"],
+                            "age_days": max(0, (as_of - date.fromisoformat(row["created_at"][:10])).days),
+                            "sla_days": sla_days, "sla_breached": max(0, (as_of - date.fromisoformat(row["created_at"][:10])).days) >= sla_days,
+                            "reviewers": _configured_approval_reviewers(), "contract": terms.get("contract")})
+        for row in playbook_rows:
+            terms = json.loads(row["confirmed_json"] or row["extracted_json"] or "{}")
+            approvals = json.loads(row["approvals_json"])
+            waiting = [email for email, decision in approvals.items() if decision is None]
+            entries.append({"type": "playbook_decision", "target_id": row["target_id"], "task_id": row["task_id"],
+                            "contract_id": row["contract_id"], "subject": row["subject"], "pending_since": row["created_at"],
+                            "age_days": max(0, (as_of - date.fromisoformat(row["created_at"][:10])).days),
+                            "sla_days": sla_days, "sla_breached": max(0, (as_of - date.fromisoformat(row["created_at"][:10])).days) >= sla_days,
+                            "reviewers": waiting or json.loads(row["required_approvers_json"]), "contract": terms.get("contract")})
+        entries.sort(key=lambda item: (not item["sla_breached"], -item["age_days"], item["pending_since"]))
+        return {"as_of": as_of.isoformat(), "sla_days": sla_days, "items": entries,
+                "deliveries": [dict(row) for row in deliveries]}
+
+    def record_approval_notification(
+        self, tenant_id: str, target_type: str, target_id: str, task_id: str,
+        action_key: str, recipient: str | None, channel: str, status: str,
+        duration_ms: int, error_message: str | None = None,
+    ) -> bool:
+        now = utc_now().isoformat()
+        with self.connect() as db:
+            inserted = db.execute(
+                "INSERT INTO approval_notification_state (tenant_id,target_type,target_id,action_key,sent_at) "
+                "VALUES (?,?,?,?,?) ON CONFLICT (tenant_id,target_type,target_id,action_key) DO NOTHING",
+                (tenant_id, target_type, target_id, action_key, now),
+            )
+            if not inserted.rowcount:
+                return False
+            db.execute(
+                "INSERT INTO approval_notification_deliveries (tenant_id,target_type,target_id,task_id,recipient,channel,status,duration_ms,error_message,attempted_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (tenant_id, target_type, target_id, task_id, recipient, channel, status, max(0, duration_ms),
+                 error_message[:1000] if error_message else None, now),
+            )
+            contract = db.execute("SELECT contract_id FROM tasks WHERE id=? AND tenant_id=?", (task_id, tenant_id)).fetchone()
+            if contract:
+                self.add_audit(db, contract["contract_id"], "approval.notification_" + status, "system", {
+                    "target_type": target_type, "target_id": target_id, "task_id": task_id,
+                    "recipient": recipient, "channel": channel, "action_key": action_key,
+                    "error": error_message[:500] if error_message else None,
+                }, tenant_id)
+            return True
+
     def create_renewal_playbook(self, request: dict[str, Any], actor: str, tenant_id: str) -> dict[str, Any]:
         playbook_id, now = str(uuid4()), utc_now().isoformat()
         with self.connect() as db:
@@ -1041,7 +1165,9 @@ class Store:
                  json.dumps(request.get("changed_clause_categories", [])), json.dumps(request["required_approvers"]),
                  json.dumps(request.get("checklist", [])), actor, now, now),
             )
-            return self._playbook_record(db.execute("SELECT * FROM renewal_playbooks WHERE id=?", (playbook_id,)).fetchone())
+            result = self._playbook_record(db.execute("SELECT * FROM renewal_playbooks WHERE id=?", (playbook_id,)).fetchone())
+            self.add_playbook_history_entry(db, tenant_id, playbook_id, 1, result, actor, "created", now)
+            return result
 
     @staticmethod
     def _playbook_record(row) -> dict[str, Any]:
@@ -1052,14 +1178,143 @@ class Store:
             result[key] = json.loads(result.pop(column))
         return result
 
-    def list_renewal_playbooks(self, tenant_id: str) -> list[dict[str, Any]]:
+    def list_renewal_playbooks(self, tenant_id: str, include_retired: bool = False) -> list[dict[str, Any]]:
         with self.connect() as db:
-            rows = db.execute("SELECT * FROM renewal_playbooks WHERE tenant_id=? ORDER BY name", (tenant_id,)).fetchall()
+            if include_retired:
+                rows = db.execute("SELECT * FROM renewal_playbooks WHERE tenant_id=? ORDER BY name,version DESC", (tenant_id,)).fetchall()
+            else:
+                rows = db.execute("SELECT * FROM renewal_playbooks WHERE tenant_id=? AND status='active' ORDER BY name", (tenant_id,)).fetchall()
         return [self._playbook_record(row) for row in rows]
+
+    def edit_renewal_playbook(
+        self, playbook_id: str, request: dict[str, Any], actor: str, tenant_id: str, retire: bool = False,
+    ) -> dict[str, Any] | None:
+        now = utc_now().isoformat()
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM renewal_playbooks WHERE id=? AND tenant_id=?", (playbook_id, tenant_id)).fetchone()
+            if not row:
+                return None
+            if row["status"] != "active":
+                raise ValueError("Only an active playbook can be edited or retired")
+            prior = self._playbook_record(row)
+            db.execute(
+                "INSERT INTO renewal_playbook_history (id,tenant_id,playbook_id,version,snapshot_json,actor,action,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (str(uuid4()), tenant_id, playbook_id, row["version"], json.dumps(prior), actor,
+                 "retired" if retire else "superseded", now),
+            )
+            if retire:
+                db.execute("UPDATE renewal_playbooks SET status='retired',version=version+1,updated_at=? WHERE id=? AND tenant_id=?",
+                           (now, playbook_id, tenant_id))
+            else:
+                db.execute(
+                    "UPDATE renewal_playbooks SET name=?,min_contract_value=?,currency=?,supplier_risk_levels_json=?,"
+                    "changed_clause_categories_json=?,required_approvers_json=?,checklist_json=?,version=version+1,updated_at=? "
+                    "WHERE id=? AND tenant_id=?",
+                    (request["name"], str(request["min_contract_value"]) if request.get("min_contract_value") is not None else None,
+                     request.get("currency"), json.dumps(request.get("supplier_risk_levels", [])),
+                     json.dumps(request.get("changed_clause_categories", [])), json.dumps(request["required_approvers"]),
+                     json.dumps(request.get("checklist", [])), now, playbook_id, tenant_id),
+                )
+            self.add_playbook_history_entry(db, tenant_id, playbook_id, row["version"] + 1,
+                                            self._playbook_record(db.execute("SELECT * FROM renewal_playbooks WHERE id=?", (playbook_id,)).fetchone()),
+                                            actor, "retired" if retire else "updated", now)
+            return self._playbook_record(db.execute("SELECT * FROM renewal_playbooks WHERE id=?", (playbook_id,)).fetchone())
+
+    @staticmethod
+    def add_playbook_history_entry(db, tenant_id: str, playbook_id: str, version: int, snapshot: dict[str, Any], actor: str, action: str, now: str) -> None:
+        db.execute(
+            "INSERT INTO renewal_playbook_history (id,tenant_id,playbook_id,version,snapshot_json,actor,action,created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (str(uuid4()), tenant_id, playbook_id, version, json.dumps(snapshot), actor, action, now),
+        )
+
+    def renewal_playbook_history(self, playbook_id: str, tenant_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM renewal_playbook_history WHERE playbook_id=? AND tenant_id=? ORDER BY version,id", (playbook_id, tenant_id)).fetchall()
+        return [{**dict(row), "snapshot": json.loads(row["snapshot_json"])} for row in rows]
+
+    def simulate_renewal_playbooks(self, tenant_id: str) -> dict[str, Any]:
+        playbooks = self.list_renewal_playbooks(tenant_id)
+        with self.connect() as db:
+            tasks = db.execute(
+                "SELECT t.id AS task_id,t.contract_id,t.title,t.due_date,t.status,c.confirmed_json,c.extracted_json,c.supplier_id,s.risk_level "
+                "FROM tasks t JOIN contracts c ON c.id=t.contract_id LEFT JOIN suppliers s ON s.id=c.supplier_id AND s.tenant_id=c.tenant_id "
+                "WHERE t.tenant_id=? AND t.status='open' AND t.task_kind='renewal' ORDER BY t.due_date,t.id", (tenant_id,),
+            ).fetchall()
+        routes = []
+        for task in tasks:
+            categories = self.detect_task_changed_clause_categories(task["task_id"], tenant_id)
+            terms = json.loads(task["confirmed_json"] or task["extracted_json"])
+            matched, decisions = [], []
+            for playbook in playbooks:
+                reasons = []
+                misses = []
+                risks = playbook["supplier_risk_levels"]
+                if risks and task["risk_level"] not in risks:
+                    misses.append("supplier risk does not match")
+                clauses = playbook["changed_clause_categories"]
+                if clauses and not set(clauses).intersection(categories):
+                    misses.append("changed clauses do not match")
+                minimum = playbook["min_contract_value"]
+                if minimum is not None:
+                    if terms.get("currency") != playbook["currency"] or Decimal(str(terms.get("annual_contract_value") or 0)) < Decimal(minimum):
+                        misses.append("contract value is below the configured threshold or currency differs")
+                if risks and task["risk_level"] in risks:
+                    reasons.append("supplier risk matched")
+                if clauses and set(clauses).intersection(categories):
+                    reasons.append("changed clause matched: " + ", ".join(sorted(set(clauses).intersection(categories))))
+                if minimum is not None and not any("contract value" in miss for miss in misses):
+                    reasons.append(f"annual value meets {playbook['currency']} {minimum}")
+                if not misses:
+                    if not reasons:
+                        reasons.append("playbook has no conditional rules")
+                    matched.append(playbook)
+                decisions.append({"playbook_id": playbook["id"], "name": playbook["name"],
+                                  "version": playbook["version"], "matched": not misses,
+                                  "reasons": reasons, "unmatched_reasons": misses,
+                                  "approvers": playbook["required_approvers"] if not misses else [],
+                                  "checklist": playbook["checklist"] if not misses else []})
+            route = matched[0] if matched else None
+            routes.append({"task_id": task["task_id"], "contract_id": task["contract_id"], "title": task["title"],
+                           "due_date": task["due_date"], "detected_clause_categories": categories,
+                           "route": (route["required_approvers"] if route else []),
+                           "route_name": route["name"] if route else None, "matches": decisions})
+        return {"tenant_id": tenant_id, "tasks_considered": len(routes), "routes": routes}
+
+    def detect_task_changed_clause_categories(self, task_id: str, tenant_id: str) -> list[str]:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT current.raw_text AS current_text,current.confirmed_json,prior.raw_text AS prior_text,prior.confirmed_json AS prior_terms "
+                "FROM tasks t JOIN contracts current ON current.id=t.contract_id AND current.tenant_id=t.tenant_id "
+                "JOIN contract_versions v ON v.contract_id=current.id AND v.tenant_id=current.tenant_id "
+                "JOIN contracts prior ON prior.id=v.prior_contract_id AND prior.tenant_id=v.tenant_id "
+                "WHERE t.id=? AND t.tenant_id=? ORDER BY v.linked_at DESC LIMIT 1", (task_id, tenant_id),
+            ).fetchone()
+        if not row:
+            return []
+        detected = set()
+        for change in _compare_source_clauses(row["prior_text"], row["current_text"])["changes"]:
+            detected.update(change["categories"])
+        current = json.loads(row["confirmed_json"] or "{}")
+        prior = json.loads(row["prior_terms"] or "{}")
+        for field in ("start_date", "expiration_date"):
+            if current.get(field) != prior.get(field):
+                detected.add("expiration" if field == "expiration_date" else "effective_term")
+        for field in ("renewal_notice_days", "notice_day_type", "notice_method", "notice_recipient"):
+            if current.get(field) != prior.get(field):
+                detected.add("notice_period")
+        if current.get("auto_renew") != prior.get("auto_renew"):
+            detected.add("auto_renewal")
+        if current.get("termination_notice") != prior.get("termination_notice"):
+            detected.add("termination")
+        if current.get("annual_contract_value") != prior.get("annual_contract_value") or current.get("currency") != prior.get("currency"):
+            detected.add("pricing")
+        return sorted(detected)
 
     def apply_renewal_playbook(
         self, playbook_id: str, task_id: str, tenant_id: str, actor: str, changed_clause_categories: list[str],
     ) -> dict[str, Any] | None:
+        if not changed_clause_categories:
+            changed_clause_categories = self.detect_task_changed_clause_categories(task_id, tenant_id)
         review_id, now = str(uuid4()), utc_now().isoformat()
         with self.connect() as db:
             playbook = db.execute("SELECT * FROM renewal_playbooks WHERE id=? AND tenant_id=?", (playbook_id, tenant_id)).fetchone()
@@ -1070,6 +1325,8 @@ class Store:
             ).fetchone()
             if not playbook or not task:
                 return None
+            if playbook["status"] != "active":
+                raise ValueError("Retired playbooks cannot be applied")
             if task["task_kind"] != "renewal" or task["status"] != "open":
                 raise ValueError("Playbooks can be applied only to open renewal tasks")
             criteria_risks = json.loads(playbook["supplier_risk_levels_json"])
@@ -1089,10 +1346,10 @@ class Store:
             checklist = [{"item": item, "completed": False, "completed_by": None, "completed_at": None}
                          for item in json.loads(playbook["checklist_json"])]
             db.execute(
-                "INSERT INTO task_playbook_reviews (id,tenant_id,task_id,playbook_id,required_approvers_json,approvals_json,checklist_json,changed_clause_categories_json,status,applied_by,applied_at) "
-                "VALUES (?,?,?,?,?,?,?,?, 'blocked',?,?)",
+                "INSERT INTO task_playbook_reviews (id,tenant_id,task_id,playbook_id,required_approvers_json,approvals_json,checklist_json,changed_clause_categories_json,status,applied_by,applied_at,playbook_snapshot_json) "
+                "VALUES (?,?,?,?,?,?,?,?, 'blocked',?,?,?)",
                 (review_id, tenant_id, task_id, playbook_id, json.dumps(list(approvals)), json.dumps(approvals),
-                 json.dumps(checklist), json.dumps(changed_clause_categories), actor, now),
+                 json.dumps(checklist), json.dumps(changed_clause_categories), actor, now, json.dumps(self._playbook_record(playbook))),
             )
             db.execute("UPDATE tasks SET workflow_state='pending_approval' WHERE id=?", (task_id,))
             self.add_audit(db, task["contract_id"], "playbook.applied", actor, {
@@ -1107,6 +1364,7 @@ class Store:
         for column, key in (("required_approvers_json", "required_approvers"), ("approvals_json", "approvals"),
                             ("checklist_json", "checklist"), ("changed_clause_categories_json", "changed_clause_categories")):
             result[key] = json.loads(result.pop(column))
+        result["playbook_snapshot"] = json.loads(result.pop("playbook_snapshot_json", "{}") or "{}")
         return result
 
     def get_task_playbook_review(self, review_id: str, tenant_id: str) -> dict[str, Any] | None:
@@ -1554,7 +1812,10 @@ class Store:
                 "expiration_date": terms.get("expiration_date"), "match_score": round(score, 3),
                 "match_reasons": reasons,
             })
-        return sorted(candidates, key=lambda item: (-item["match_score"], item["contract"].casefold()))[:limit]
+        ranked = sorted(candidates, key=lambda item: (-item["match_score"], item["contract"].casefold()))[:limit]
+        for candidate in ranked:
+            candidate["automatic_match"] = candidate["match_score"] >= 0.65
+        return ranked
 
     def preview_contract_confirmation(self, contract_id: str, data: ContractData, tenant_id: str) -> dict[str, Any]:
         """Validate a proposed confirmation and describe its task/version effects without writing."""
@@ -1633,6 +1894,11 @@ class Store:
         ]
         if previous and old_obligation_summary != proposed_obligations:
             changes["obligations"] = {"before": old_obligation_summary, "after": proposed_obligations}
+        source_comparison = _compare_source_clauses(previous["raw_text"], proposal["raw_text"]) if previous else None
+        detected_clause_categories = sorted({
+            category for change in (source_comparison or {}).get("changes", []) for category in change["categories"]
+        })
+        detected_clause_categories.extend(category for category in self._structured_clause_categories(changes) if category not in detected_clause_categories)
         return {
             "contract_id": contract_id,
             "amendment": previous is not None,
@@ -1641,7 +1907,8 @@ class Store:
                 "contract": before.get("contract") or previous["filename"], "status_after_confirmation": "superseded",
             } if previous else None),
             "changes": changes,
-            "source_comparison": _compare_source_clauses(previous["raw_text"], proposal["raw_text"]) if previous else None,
+            "source_comparison": source_comparison,
+            "detected_clause_categories": detected_clause_categories,
             "impact": {
                 "open_tasks_to_resolve": previous_tasks,
                 "open_obligations_to_review": [
@@ -1656,6 +1923,17 @@ class Store:
                 },
             },
         }
+
+    @staticmethod
+    def _structured_clause_categories(changes: dict[str, Any]) -> list[str]:
+        mapping = {
+            "start_date": "effective_term", "expiration_date": "expiration",
+            "renewal_notice_days": "notice_period", "notice_day_type": "notice_period",
+            "notice_method": "notice_period", "notice_recipient": "notice_period",
+            "auto_renew": "auto_renewal", "termination_notice": "termination",
+            "annual_contract_value": "pricing", "currency": "pricing",
+        }
+        return sorted({mapping[field] for field in changes if field in mapping})
 
     def list_contract_versions(self, contract_id: str, tenant_id: str = "default") -> list[dict[str, Any]]:
         """Return the complete amendment lineage with deterministic term deltas."""
@@ -1844,7 +2122,7 @@ class Store:
 
     def record_notification_delivery(
         self, task_id: str, channel: str, notification_type: str, status: str,
-        duration_ms: int, error_message: str | None = None,
+        duration_ms: int, error_message: str | None = None, recipient: str | None = None,
     ) -> None:
         stamp = utc_now().isoformat()
         with self.connect() as db:
@@ -1852,13 +2130,13 @@ class Store:
             if not task:
                 return
             db.execute(
-                "INSERT INTO notification_deliveries (tenant_id, task_id, channel, notification_type, status, duration_ms, error_message, attempted_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (task["tenant_id"], task_id, channel, notification_type, status, max(0, duration_ms), error_message[:1000] if error_message else None, stamp),
+                "INSERT INTO notification_deliveries (tenant_id, task_id, channel, notification_type, status, duration_ms, error_message, attempted_at, recipient) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (task["tenant_id"], task_id, channel, notification_type, status, max(0, duration_ms), error_message[:1000] if error_message else None, stamp, recipient),
             )
             self.add_audit(db, task["contract_id"], f"notification.{status}", "system", {
                 "task_id": task_id, "channel": channel, "notification_type": notification_type,
-                "duration_ms": max(0, duration_ms),
+                "duration_ms": max(0, duration_ms), "recipient": recipient,
             }, task["tenant_id"])
 
     def operations_snapshot(self, tenant_id: str, stuck_after_minutes: int = 15) -> dict[str, Any]:
@@ -2511,6 +2789,13 @@ class Store:
                 raise ValueError("Contract is protected by an active legal hold")
             tasks = db.execute("SELECT id FROM tasks WHERE contract_id=?", (contract_id,)).fetchall()
             for task in tasks:
+                approval_targets = db.execute(
+                    "SELECT id FROM obligation_evidence WHERE task_id=? UNION SELECT id FROM task_playbook_reviews WHERE task_id=?",
+                    (task["id"], task["id"]),
+                ).fetchall()
+                for target in approval_targets:
+                    db.execute("DELETE FROM approval_notification_state WHERE target_id=? AND tenant_id=?", (target["id"], tenant_id))
+                db.execute("DELETE FROM approval_notification_deliveries WHERE task_id=? AND tenant_id=?", (task["id"], tenant_id))
                 obligations = db.execute("SELECT id FROM contract_obligations WHERE task_id=?", (task["id"],)).fetchall()
                 for obligation in obligations:
                     db.execute("DELETE FROM obligation_evidence WHERE obligation_id=? AND tenant_id=?", (obligation["id"], tenant_id))
@@ -2550,6 +2835,11 @@ def _amendment_match_key(value: str) -> str:
     ignored = {"agreement", "contract", "amendment", "addendum", "the", "and", "of"}
     tokens = re.findall(r"[a-z0-9]+", value.casefold())
     return " ".join(token for token in tokens if token not in ignored)
+
+
+def _configured_approval_reviewers() -> list[str]:
+    configured = os.getenv("APPROVAL_REVIEWER_EMAILS", "")
+    return sorted({email.strip().casefold() for email in configured.split(",") if "@" in email})
 
 
 def _monthly_prorated_costs(annual_value: Decimal, start: date, end: date) -> dict[str, Decimal]:
@@ -2596,9 +2886,13 @@ def _compare_source_clauses(active_text: str, amendment_text: str) -> dict[str, 
                 text = quote.casefold()
                 categories = []
                 for category, terms in {
-                    "renewal": ("renew", "extension", "term"),
+                    "effective_term": ("effective date", "commencement", "service start", "term begins"),
+                    "expiration": ("expire", "expiration", "expiry", "end of term"),
+                    "renewal": ("renew", "extension"),
+                    "auto_renewal": ("automatically renew", "auto-renew", "automatic renewal"),
+                    "notice_period": ("notice", "days prior", "days before expiration"),
                     "pricing": ("price", "fee", "cost", "payment", "increase"),
-                    "termination": ("terminat", "cancel", "notice", "expire"),
+                    "termination": ("terminat", "cancel"),
                     "data_retention": ("data", "retain", "delete", "privacy"),
                     "liability": ("liabilit", "indemn", "damages"),
                     "security": ("security", "breach", "encryption"),
