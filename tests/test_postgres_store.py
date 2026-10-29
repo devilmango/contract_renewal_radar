@@ -14,8 +14,15 @@ from renewal_radar.store import Store
 def test_postgres_schema_migrations_and_concurrent_worker_storage():
     url = os.getenv("TEST_POSTGRES_URL")
     if not url:
+        if os.getenv("RUN_POSTGRES_TESTS") == "1":
+            pytest.fail("RUN_POSTGRES_TESTS=1 requires TEST_POSTGRES_URL to be configured")
         pytest.skip("Set TEST_POSTGRES_URL to run the PostgreSQL integration check")
-    pytest.importorskip("psycopg")
+    try:
+        import psycopg  # noqa: F401
+    except ImportError:
+        if os.getenv("RUN_POSTGRES_TESTS") == "1":
+            pytest.fail("RUN_POSTGRES_TESTS=1 requires the psycopg database extra")
+        pytest.skip("Install the database extra to run the PostgreSQL integration check")
 
     tenant = f"ci-{uuid4()}"
     store = Store(url)
@@ -31,6 +38,9 @@ def test_postgres_schema_migrations_and_concurrent_worker_storage():
     store.save_contract(contract_id, "agreement.pdf", "rules", terms, "notice 30 days", "ci", tenant)
     task_id = store.confirm_contract(contract_id, terms, "ci", tenant)
     assert store.list_tasks(status="open", tenant_id=tenant, unassigned=True)[0]["id"] == task_id
+    # Reminder state is only recorded for open tasks; capture it before the outcome closes this task.
+    assert store.record_task_notification(task_id, tenant, "reminder:14", "log")
+    assert store.task_notification_keys(task_id, tenant) == {"reminder:14"}
     forecast = store.renewal_forecast(tenant, date(2025, 1, 1), date(2026, 1, 1), Decimal("5"), Decimal("10"))
     store.record_renewal_forecast(tenant, forecast, "ci-reviewer")
     store.record_renewal_outcome(task_id, {
@@ -53,8 +63,6 @@ def test_postgres_schema_migrations_and_concurrent_worker_storage():
     }
     assert store.save_tenant_policy(tenant, policy, "ci-admin")["policy"] == policy
     assert store.get_tenant_policy(tenant)["policy"] == policy
-    assert store.record_task_notification(task_id, tenant, "reminder:14", "log")
-    assert store.task_notification_keys(task_id, tenant) == {"reminder:14"}
     store.record_notification_delivery(task_id, "log", "reminder", "sent", 3)
     assert store.operations_snapshot(tenant)["notifications"]["by_channel"][0]["count"] == 1
 

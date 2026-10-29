@@ -38,6 +38,7 @@ jobs:
           --health-retries 5
     env:
       TEST_POSTGRES_URL: postgresql://radar:radar-ci-password@localhost:5432/renewal_radar
+      RUN_POSTGRES_TESTS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -405,6 +405,20 @@ Reminder runs, live calendar synchronization, document-source reconciliation, an
 
 The queue is durable across process restarts and supports a separate worker process. SQLite still serializes writers and is intended for a single host. To use PostgreSQL, install `pip install -e '.[database]'` and set `DATABASE_URL` (for example, `postgresql://radar:secret@db:5432/radar`); it takes precedence over `DATABASE_PATH`. The service creates its schema idempotently and applies additive compatibility upgrades at startup. Use a managed PostgreSQL service, backups, and a tested restore procedure for production. SMTP is at-least-once around process crashes: the stable message ID helps downstream deduplication, but SMTP itself does not guarantee exactly-once delivery.
 
+### PostgreSQL integration test service
+
+Run the PostgreSQL storage integration test locally against an ephemeral PostgreSQL 16 container. Install the test and database extras, start the standalone test service, wait for it to become healthy, and point `TEST_POSTGRES_URL` at its published port:
+
+```bash
+pip install -e '.[test,database]'
+docker compose -f docker-compose.test.yml up -d --wait postgres-test
+TEST_POSTGRES_URL=postgresql://radar:radar-test-password@localhost:5433/renewal_radar_test \
+  pytest -q tests/test_postgres_store.py
+docker compose -f docker-compose.test.yml down -v
+```
+
+Set `POSTGRES_TEST_PORT` to use a different local port. The integration test skips when `TEST_POSTGRES_URL` is unset; CI starts the same PostgreSQL major version as a job service and runs the test with the database extra installed.
+
 ### Data governance
 
 Set `LLM_ALLOWED_PROVIDERS` to an explicit comma-separated list such as `rules,anthropic` to control which extraction providers may receive contract text. `rules` runs locally. The `.env.example` defaults this allowlist to `rules`; if the setting is omitted, existing deployments remain compatible and all configured providers are allowed. `LLM_PROVIDER=auto` and `renewal-radar evaluate --provider all` honor the allowlist too.
