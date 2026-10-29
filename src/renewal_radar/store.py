@@ -25,6 +25,16 @@ def iso(value: datetime | date | None) -> str | None:
     return value.isoformat() if value else None
 
 
+def _approval_age_days(created_at: str, as_of: date) -> int:
+    created = datetime.fromisoformat(created_at)
+    if as_of == date.today():
+        now = datetime.now(timezone.utc)
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        return max(0, int((now - created).total_seconds() // 86400))
+    return max(0, (as_of - created.date()).days)
+
+
 class _PostgresConnection:
     """Small DB-API adapter for the SQLite-shaped queries used by Store."""
 
@@ -445,6 +455,41 @@ class Store:
                     report_json TEXT NOT NULL,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS provider_evaluation_schedules (
+                    tenant_id TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    interval_hours INTEGER NOT NULL DEFAULT 24,
+                    run_on_provider_change INTEGER NOT NULL DEFAULT 1,
+                    alert_emails_json TEXT NOT NULL DEFAULT '[]',
+                    last_run_at TEXT,
+                    provider_signature TEXT,
+                    updated_by TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS evaluation_alert_deliveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    metric TEXT NOT NULL,
+                    recipient TEXT,
+                    channel TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL,
+                    error_message TEXT,
+                    attempted_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS portfolio_saved_filters (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    dataset TEXT NOT NULL,
+                    filters_json TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (tenant_id, name)
                 );
                 CREATE INDEX IF NOT EXISTS idx_contract_status ON contracts(status);
                 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, due_date);
@@ -947,6 +992,50 @@ class Store:
                     db.execute("UPDATE contracts SET supplier_id=? WHERE id=?", (supplier_id, row["id"]))
                     self.add_audit(db, row["id"], "contract.supplier_assigned", actor, {"supplier_id": supplier_id, "bulk": True}, tenant_id)
                 db.execute("UPDATE suppliers SET updated_at=? WHERE id=?", (utc_now().isoformat(), supplier_id))
+            elif action == "assign_obligations":
+                rows = db.execute(
+                    f"SELECT o.id,o.contract_id,o.task_id,t.status,t.owner_name,t.owner_email FROM contract_obligations o "
+                    f"JOIN tasks t ON t.id=o.task_id AND t.tenant_id=o.tenant_id WHERE o.tenant_id=? AND o.id IN ({','.join('?' for _ in ids)})",
+                    (tenant_id, *ids),
+                ).fetchall()
+                if len(rows) != len(ids) or any(row["status"] != "open" for row in rows):
+                    raise ValueError("All selected obligations must exist in this organization and be open")
+                for row in rows:
+                    db.execute("UPDATE tasks SET owner_name=?,owner_email=? WHERE id=? AND tenant_id=?",
+                               (values.get("owner_name"), values.get("owner_email"), row["task_id"], tenant_id))
+                    self.add_audit(db, row["contract_id"], "obligation.assigned", actor, {
+                        "obligation_id": row["id"], "task_id": row["task_id"],
+                        "owner_name": values.get("owner_name"), "owner_email": values.get("owner_email"), "bulk": True,
+                    }, tenant_id)
+            elif action == "review_obligations":
+                decision = values.get("decision")
+                if decision not in {"approved", "rejected"}:
+                    raise ValueError("Evidence decision must be approved or rejected")
+                rows = db.execute(
+                    f"SELECT e.*,o.contract_id,t.status AS task_status FROM obligation_evidence e "
+                    f"JOIN contract_obligations o ON o.id=e.obligation_id AND o.tenant_id=e.tenant_id "
+                    f"JOIN tasks t ON t.id=e.task_id AND t.tenant_id=e.tenant_id "
+                    f"WHERE e.tenant_id=? AND e.id IN ({','.join('?' for _ in ids)})",
+                    (tenant_id, *ids),
+                ).fetchall()
+                if len(rows) != len(ids) or any(row["status"] != "pending_signoff" or row["task_status"] != "open" for row in rows):
+                    raise ValueError("All selected evidence must be pending sign-off for open obligations in this organization")
+                now = utc_now().isoformat()
+                for row in rows:
+                    db.execute("UPDATE obligation_evidence SET status=?,reviewed_by=?,reviewed_at=?,review_comment=? WHERE id=? AND tenant_id=?",
+                               (decision, actor, now, values.get("comment"), row["id"], tenant_id))
+                    db.execute("INSERT INTO obligation_compliance_history (obligation_id,task_id,tenant_id,outcome,comment,actor,evidence_id,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                               (row["obligation_id"], row["task_id"], tenant_id,
+                                "completed" if decision == "approved" else "evidence_rejected",
+                                values.get("comment") or f"Evidence {decision} (bulk review)", actor, row["id"], now))
+                    if decision == "approved":
+                        db.execute("UPDATE tasks SET status='resolved',workflow_state='resolved' WHERE id=? AND tenant_id=?", (row["task_id"], tenant_id))
+                        task = db.execute("SELECT * FROM tasks WHERE id=? AND tenant_id=?", (row["task_id"], tenant_id)).fetchone()
+                        self._create_next_obligation_occurrence(db, task, actor)
+                    self.add_audit(db, row["contract_id"], f"obligation.evidence_{decision}", actor, {
+                        "obligation_id": row["obligation_id"], "task_id": row["task_id"],
+                        "evidence_id": row["id"], "comment": values.get("comment"), "bulk": True,
+                    }, tenant_id)
             else:
                 raise ValueError("Unsupported bulk portfolio action")
         return {"action": action, "updated": ids, "count": len(ids)}
@@ -1109,8 +1198,8 @@ class Store:
             terms = json.loads(row["confirmed_json"] or row["extracted_json"] or "{}")
             entries.append({"type": "obligation_signoff", "target_id": row["target_id"], "obligation_id": row["obligation_id"], "task_id": row["task_id"],
                             "contract_id": row["contract_id"], "subject": row["subject"], "pending_since": row["created_at"],
-                            "age_days": max(0, (as_of - date.fromisoformat(row["created_at"][:10])).days),
-                            "sla_days": sla_days, "sla_breached": max(0, (as_of - date.fromisoformat(row["created_at"][:10])).days) >= sla_days,
+                            "age_days": _approval_age_days(row["created_at"], as_of),
+                            "sla_days": sla_days, "sla_breached": _approval_age_days(row["created_at"], as_of) >= sla_days,
                             "reviewers": _configured_approval_reviewers(), "contract": terms.get("contract")})
         for row in playbook_rows:
             terms = json.loads(row["confirmed_json"] or row["extracted_json"] or "{}")
@@ -1118,8 +1207,8 @@ class Store:
             waiting = [email for email, decision in approvals.items() if decision is None]
             entries.append({"type": "playbook_decision", "target_id": row["target_id"], "task_id": row["task_id"],
                             "contract_id": row["contract_id"], "subject": row["subject"], "pending_since": row["created_at"],
-                            "age_days": max(0, (as_of - date.fromisoformat(row["created_at"][:10])).days),
-                            "sla_days": sla_days, "sla_breached": max(0, (as_of - date.fromisoformat(row["created_at"][:10])).days) >= sla_days,
+                            "age_days": _approval_age_days(row["created_at"], as_of),
+                            "sla_days": sla_days, "sla_breached": _approval_age_days(row["created_at"], as_of) >= sla_days,
                             "reviewers": waiting or json.loads(row["required_approvers_json"]), "contract": terms.get("contract")})
         entries.sort(key=lambda item: (not item["sla_breached"], -item["age_days"], item["pending_since"]))
         return {"as_of": as_of.isoformat(), "sla_days": sla_days, "items": entries,
@@ -1477,6 +1566,94 @@ class Store:
             if old is not None and new is not None and old - new >= 0.10 - 1e-9:
                 alerts.append({"metric": metric, "previous": old, "current": new, "drop": round(old-new, 4)})
         return alerts
+
+    def save_provider_evaluation_schedule(self, tenant_id: str, config: dict[str, Any], actor: str) -> dict[str, Any]:
+        now = utc_now().isoformat()
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO provider_evaluation_schedules (tenant_id,enabled,interval_hours,run_on_provider_change,alert_emails_json,updated_by,updated_at) "
+                "VALUES (?,?,?,?,?,?,?) ON CONFLICT(tenant_id) DO UPDATE SET enabled=excluded.enabled,interval_hours=excluded.interval_hours,"
+                "run_on_provider_change=excluded.run_on_provider_change,alert_emails_json=excluded.alert_emails_json,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+                (tenant_id, int(config["enabled"]), config["interval_hours"], int(config["run_on_provider_change"]),
+                 json.dumps(config.get("alert_emails", [])), actor, now),
+            )
+        return self.get_provider_evaluation_schedule(tenant_id) or {}
+
+    def get_provider_evaluation_schedule(self, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM provider_evaluation_schedules WHERE tenant_id=?", (tenant_id,)).fetchone()
+        if not row:
+            return None
+        return {**dict(row), "enabled": bool(row["enabled"]), "run_on_provider_change": bool(row["run_on_provider_change"]),
+                "alert_emails": json.loads(row["alert_emails_json"])}
+
+    def provider_evaluation_schedule_tenants(self) -> list[str]:
+        with self.connect() as db:
+            rows = db.execute("SELECT tenant_id FROM provider_evaluation_schedules WHERE enabled=1 ORDER BY tenant_id").fetchall()
+        return [row["tenant_id"] for row in rows]
+
+    def provider_evaluation_due(self, tenant_id: str, signature: str, now: datetime | None = None) -> tuple[bool, dict[str, Any] | None]:
+        schedule = self.get_provider_evaluation_schedule(tenant_id)
+        if not schedule or not schedule["enabled"]:
+            return False, schedule
+        current = now or utc_now()
+        changed = bool(schedule["run_on_provider_change"] and schedule["provider_signature"] and schedule["provider_signature"] != signature)
+        due = not schedule["last_run_at"]
+        if schedule["last_run_at"]:
+            last = datetime.fromisoformat(schedule["last_run_at"])
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            due = current - last >= timedelta(hours=schedule["interval_hours"])
+        return changed or due, schedule
+
+    def complete_provider_evaluation_schedule(self, tenant_id: str, signature: str) -> None:
+        with self.connect() as db:
+            db.execute("UPDATE provider_evaluation_schedules SET last_run_at=?,provider_signature=? WHERE tenant_id=?",
+                       (utc_now().isoformat(), signature, tenant_id))
+
+    def record_evaluation_alert_delivery(self, tenant_id: str, run_id: str, provider: str, metric: str,
+                                        recipient: str | None, channel: str, status: str,
+                                        duration_ms: int, error_message: str | None = None) -> None:
+        with self.connect() as db:
+            db.execute("INSERT INTO evaluation_alert_deliveries (tenant_id,run_id,provider,metric,recipient,channel,status,duration_ms,error_message,attempted_at) "
+                       "VALUES (?,?,?,?,?,?,?,?,?,?)", (tenant_id,run_id,provider,metric,recipient,channel,status,duration_ms,error_message,utc_now().isoformat()))
+
+    def evaluation_alert_delivery_history(self, tenant_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM evaluation_alert_deliveries WHERE tenant_id=? ORDER BY attempted_at DESC LIMIT ?", (tenant_id,limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_portfolio_filter(self, tenant_id: str, name: str, dataset: str, filters: dict[str, Any], actor: str) -> dict[str, Any]:
+        now, filter_id = utc_now().isoformat(), str(uuid4())
+        try:
+            with self.connect() as db:
+                db.execute("INSERT INTO portfolio_saved_filters (id,tenant_id,name,dataset,filters_json,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                           (filter_id,tenant_id,name,dataset,json.dumps(filters),actor,now,now))
+                row = db.execute("SELECT * FROM portfolio_saved_filters WHERE id=?",(filter_id,)).fetchone()
+        except Exception as exc:
+            if "unique" in str(exc).lower():
+                raise ValueError("A saved filter with this name already exists") from exc
+            raise
+        return self._portfolio_filter_record(row)
+
+    @staticmethod
+    def _portfolio_filter_record(row) -> dict[str, Any]:
+        return {**dict(row), "filters": json.loads(row["filters_json"])}
+
+    def list_portfolio_filters(self, tenant_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM portfolio_saved_filters WHERE tenant_id=? ORDER BY name",(tenant_id,)).fetchall()
+        return [self._portfolio_filter_record(row) for row in rows]
+
+    def get_portfolio_filter(self, filter_id: str, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM portfolio_saved_filters WHERE id=? AND tenant_id=?",(filter_id,tenant_id)).fetchone()
+        return self._portfolio_filter_record(row) if row else None
+
+    def delete_portfolio_filter(self, filter_id: str, tenant_id: str) -> bool:
+        with self.connect() as db:
+            cursor = db.execute("DELETE FROM portfolio_saved_filters WHERE id=? AND tenant_id=?",(filter_id,tenant_id))
+        return cursor.rowcount > 0
 
     def renewal_forecast(
         self, tenant_id: str, start_date: date, end_date: date,

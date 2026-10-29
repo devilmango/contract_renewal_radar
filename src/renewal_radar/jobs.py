@@ -19,6 +19,22 @@ def enqueue_reminder_run(store: Store, tenant_id: str, *, as_of: date | None = N
     )
     if row["status"] == "dead":
         row = store.retry_dead_job(row["id"], tenant_id) or row
+    enqueue_due_provider_evaluation(store, tenant_id)
+    return job_record(row)
+
+
+def enqueue_due_provider_evaluation(store: Store, tenant_id: str) -> dict | None:
+    """Queue a scheduled evaluation when its interval expires or provider model changes."""
+    from .evaluation_jobs import provider_configuration_signature
+
+    signature = provider_configuration_signature()
+    due, _schedule = store.provider_evaluation_due(tenant_id, signature)
+    if not due:
+        return None
+    row = store.enqueue_job(tenant_id, "evaluation.run", {"tenant_id": tenant_id, "signature": signature},
+                            f"evaluation:{tenant_id}:{signature}:{date.today().isoformat()}", max_attempts=_max_attempts())
+    if row["status"] == "dead":
+        row = store.retry_dead_job(row["id"], tenant_id) or row
     return job_record(row)
 
 
@@ -57,6 +73,9 @@ def enqueue_document_source_sync(store: Store, tenant_id: str, provider: str, ev
 def process_jobs(store: Store, limit: int = 20, worker_id: str | None = None, job_id: str | None = None) -> dict[str, int]:
     worker = worker_id or f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
     processed = succeeded = retried = dead = 0
+    if job_id is None:
+        for tenant_id in store.provider_evaluation_schedule_tenants():
+            enqueue_due_provider_evaluation(store, tenant_id)
     while processed < max(0, limit):
         job = store.claim_job(worker, lease_seconds=max(15, int(os.getenv("JOB_LEASE_SECONDS", "120"))), job_id=job_id)
         if not job:
@@ -74,6 +93,9 @@ def process_jobs(store: Store, limit: int = 20, worker_id: str | None = None, jo
             elif job["job_type"] == "document_sources.sync":
                 from .drive_ingestion import sync_document_sources
                 result = sync_document_sources(store, job["tenant_id"], provider=payload["provider"])
+            elif job["job_type"] == "evaluation.run":
+                from .evaluation_jobs import run_scheduled_provider_evaluation
+                result = run_scheduled_provider_evaluation(store, job["tenant_id"], payload.get("signature", ""))
             else:
                 raise ValueError(f"Unsupported job type: {job['job_type']}")
             if store.complete_job(job["id"], worker, result):

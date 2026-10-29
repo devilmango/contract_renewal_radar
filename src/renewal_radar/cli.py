@@ -11,7 +11,7 @@ from .auth import SUPPORTED_ROLES, create_token_config
 from .drive_ingestion import DocumentSourceError, sync_document_sources
 from .evaluation import evaluate_extractor, load_cases
 from .extractor import configured_llm_providers, get_extractor
-from .jobs import enqueue_reminder_run, enqueue_retention_run, job_record, process_jobs
+from .jobs import enqueue_due_provider_evaluation, enqueue_reminder_run, enqueue_retention_run, job_record, process_jobs
 from .store import Store
 
 
@@ -75,6 +75,10 @@ def main() -> int:
         store = Store()
         job = enqueue_reminder_run(store, args.tenant_id)
         worker_result = process_jobs(store, limit=1, job_id=job["id"])
+        evaluation_job = enqueue_due_provider_evaluation(store, args.tenant_id)
+        if evaluation_job and evaluation_job["status"] in {"queued", "retrying"}:
+            evaluation_result = process_jobs(store, limit=1, job_id=evaluation_job["id"])
+            worker_result = {key: worker_result.get(key, 0) + evaluation_result.get(key, 0) for key in worker_result}
         current = store.get_job(job["id"], args.tenant_id)
         print(json.dumps({"job": job_record(current) if current else job, "worker": worker_result}, indent=2))
         return 0

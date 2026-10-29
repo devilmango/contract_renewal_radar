@@ -17,6 +17,7 @@ from renewal_radar.schemas import (
     ApprovalPlaybookRequest, BulkPortfolioRequest, ContractData, ObligationComplianceRequest,
     ObligationEvidenceRequest, ObligationEvidenceReviewRequest, PlaybookApprovalRequest,
     PlaybookApplyRequest, PlaybookChecklistRequest, SupplierCreateRequest, SupplierRiskUpdateRequest,
+    PortfolioFilterRequest, ProviderEvaluationScheduleRequest,
 )
 from renewal_radar.store import Store
 
@@ -201,6 +202,44 @@ def test_bulk_actions_are_tenant_scoped_and_exports_support_csv_and_xlsx(tmp_pat
     with zipfile.ZipFile(BytesIO(workbook.body)) as archive:
         assert "xl/worksheets/sheet1.xml" in archive.namelist()
         assert "Submit insurance certificate" in archive.read("xl/worksheets/sheet1.xml").decode()
+
+
+def test_bulk_obligation_assignment_and_evidence_review_are_audited(tmp_path):
+    store = Store(str(tmp_path / "bulk-obligations.db"))
+    _contract(store)
+    first, second = _obligation(store), _obligation(store)
+    proofs = [store.submit_obligation_evidence(item["id"], "acme", "owner", "proof.txt", "text/plain", "cHJvb2Y=", "digest", None) for item in (first, second)]
+    app = create_app(store, AuthRegistry([]))
+    bulk = _route(app, "/portfolio/bulk", "POST")
+    reviewer = Principal("reviewer", frozenset({"reviewer"}), "legal@example.com", "acme")
+    assigned = bulk(BulkPortfolioRequest(action="assign_obligations", ids=[first["id"], second["id"]], owner_name="New Owner", owner_email="new@example.com"), reviewer)
+    assert assigned["count"] == 2
+    assert store.get_contract_obligation(first["id"], "acme")["owner_email"] == "new@example.com"
+    reviewed = bulk(BulkPortfolioRequest(action="review_obligations", ids=[proof["id"] for proof in proofs], decision="approved", comment="Verified as a batch"), reviewer)
+    assert reviewed["count"] == 2
+    assert all(store.get_task(item["task_id"], "acme")["status"] == "resolved" for item in (first, second))
+    assert json.loads(store.audit("contract-a", "acme")[-1]["details_json"])["bulk"] is True
+
+
+def test_scheduled_evaluation_and_saved_filter_export_preview(tmp_path):
+    store = Store(str(tmp_path / "portfolio-schedule.db"))
+    task_id = _contract(store)
+    app = create_app(store, AuthRegistry([]))
+    schedule = _route(app, "/evaluations/schedule", "PUT")
+    filters = _route(app, "/portfolio/filters", "POST")
+    preview = _route(app, "/portfolio/export/preview", "GET")
+    reviewer = Principal("reviewer", frozenset({"reviewer"}), "legal@example.com", "acme")
+    saved_schedule = schedule(ProviderEvaluationScheduleRequest(enabled=True, interval_hours=12, alert_emails=["legal@example.com"]), reviewer)
+    assert saved_schedule["interval_hours"] == 12
+    due, _ = store.provider_evaluation_due("acme", "model-v1")
+    assert due
+    store.complete_provider_evaluation_schedule("acme", "model-v1")
+    due, _ = store.provider_evaluation_due("acme", "model-v1")
+    assert not due
+    saved = filters(PortfolioFilterRequest(name="Open renewals", dataset="tasks", filters={"status": "open", "task_kind": "renewal"}), reviewer)
+    result = preview("tasks", saved["id"], reviewer)
+    assert result["row_count"] == 1
+    assert result["sample"][0]["id"] == task_id
 
 
 def test_provider_evaluation_scores_amendment_clause_evidence_and_detects_drift(tmp_path, monkeypatch):

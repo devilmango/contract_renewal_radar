@@ -432,13 +432,14 @@ class ApprovalPlaybookRequest(BaseModel):
 
 
 class BulkPortfolioRequest(BaseModel):
-    action: Literal["assign_tasks", "transition_tasks", "assign_supplier"]
+    action: Literal["assign_tasks", "transition_tasks", "assign_supplier", "assign_obligations", "review_obligations"]
     ids: list[str] = Field(min_length=1, max_length=100)
     owner_name: str | None = Field(default=None, max_length=150)
     owner_email: str | None = Field(default=None, max_length=320)
     workflow_state: Literal["review", "needs_changes", "pending_approval", "notice_in_progress"] | None = None
     supplier_id: str | None = Field(default=None, max_length=100)
     comment: str | None = Field(default=None, max_length=2000)
+    decision: Literal["approved", "rejected"] | None = None
 
     @field_validator("ids")
     @classmethod
@@ -459,7 +460,52 @@ class BulkPortfolioRequest(BaseModel):
             raise ValueError("workflow_state is required to bulk transition tasks")
         if self.action == "assign_supplier" and self.supplier_id is None:
             raise ValueError("supplier_id is required to bulk assign contracts")
+        if self.action == "assign_obligations" and self.owner_email is None:
+            raise ValueError("owner_email is required to bulk assign obligations")
+        if self.action == "review_obligations" and self.decision is None:
+            raise ValueError("decision is required to bulk review obligation evidence")
         return self
+
+
+class ProviderEvaluationScheduleRequest(BaseModel):
+    enabled: bool = True
+    interval_hours: int = Field(default=24, ge=1, le=720)
+    run_on_provider_change: bool = True
+    alert_emails: list[str] = Field(default_factory=list, max_length=50)
+
+    @field_validator("alert_emails")
+    @classmethod
+    def validate_alert_emails(cls, value: list[str]) -> list[str]:
+        emails = [email.strip() for email in value]
+        if any(not email or "@" not in email or email.startswith("@") or email.endswith("@") for email in emails):
+            raise ValueError("alert_emails must contain valid email addresses")
+        if len({email.casefold() for email in emails}) != len(emails):
+            raise ValueError("alert_emails must be unique")
+        return emails
+
+
+class PortfolioFilterRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    dataset: Literal["contracts", "tasks", "suppliers", "obligations"]
+    filters: dict[str, str | bool] = Field(default_factory=dict, max_length=10)
+
+    @field_validator("name")
+    @classmethod
+    def clean_filter_name(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("filters")
+    @classmethod
+    def validate_filter_keys(cls, value: dict[str, str | bool]) -> dict[str, str | bool]:
+        allowed = {
+            "contracts": {"status", "supplier_id", "owner_email", "auto_renew"},
+            "tasks": {"status", "workflow_state", "task_kind", "owner_email", "unassigned"},
+            "suppliers": {"risk_level"},
+            "obligations": {"status", "category", "owner_email", "schedule_status"},
+        }
+        if any(key not in set().union(*allowed.values()) for key in value):
+            raise ValueError("Unsupported portfolio filter")
+        return value
 
 
 class PlaybookApplyRequest(BaseModel):
