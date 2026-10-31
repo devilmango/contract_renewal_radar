@@ -84,7 +84,7 @@ class IntegrationConnectionRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    provider: Literal["google_calendar", "microsoft_calendar", "smtp", "microsoft_email", "gmail"]
+    provider: Literal["google_calendar", "microsoft_calendar", "smtp", "microsoft_email", "gmail", "slack_webhook", "teams_webhook"]
     settings: dict[str, str] = Field(default_factory=dict, max_length=20)
     credentials: dict[str, str] = Field(default_factory=dict, max_length=20)
 
@@ -129,6 +129,14 @@ class EscalationPolicy(BaseModel):
     reminder_days_before: list[int] = Field(default_factory=lambda: [0], max_length=12)
     escalation_steps: list[EscalationStep] = Field(default_factory=list, max_length=10)
     backup_owner_email: str | None = Field(default=None, max_length=320)
+    reminder_recipients: list[str] = Field(default_factory=list, max_length=50)
+    escalation_recipients: list[str] = Field(default_factory=list, max_length=50)
+    approval_recipients: list[str] = Field(default_factory=list, max_length=50)
+    approval_escalation_recipients: list[str] = Field(default_factory=list, max_length=50)
+    reminder_channels: list[Literal["email", "slack", "teams", "log"]] = Field(default_factory=lambda: ["email"], max_length=4)
+    escalation_channels: list[Literal["email", "slack", "teams", "log"]] = Field(default_factory=lambda: ["email"], max_length=4)
+    approval_channels: list[Literal["email", "slack", "teams", "log"]] = Field(default_factory=lambda: ["email"], max_length=4)
+    approval_escalation_channels: list[Literal["email", "slack", "teams", "log"]] = Field(default_factory=lambda: ["email"], max_length=4)
 
     @field_validator("backup_owner_email")
     @classmethod
@@ -153,6 +161,23 @@ class EscalationPolicy(BaseModel):
         if len(set(days)) != len(days):
             raise ValueError("escalation steps must have unique after_due_days values")
         return sorted(value, key=lambda step: step.after_due_days)
+
+    @field_validator("reminder_recipients", "escalation_recipients", "approval_recipients", "approval_escalation_recipients")
+    @classmethod
+    def validate_policy_recipients(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        if any(not value or "@" not in value or value.startswith("@") or value.endswith("@") for value in cleaned):
+            raise ValueError("notification recipients must be valid email addresses")
+        if len({value.casefold() for value in cleaned}) != len(cleaned):
+            raise ValueError("notification recipients must be unique")
+        return cleaned
+
+    @field_validator("reminder_channels", "escalation_channels", "approval_channels", "approval_escalation_channels")
+    @classmethod
+    def validate_policy_channels(cls, values: list[str]) -> list[str]:
+        if not values or len(set(values)) != len(values):
+            raise ValueError("notification channels must be non-empty and unique")
+        return values
 
 
 class EvaluationFeedbackApprovalRequest(BaseModel):

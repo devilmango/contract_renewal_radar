@@ -5,6 +5,8 @@ import smtplib
 import hashlib
 import base64
 import json
+from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, build_opener
 from email.message import EmailMessage
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -16,10 +18,34 @@ from .integrations import access_token, decrypt_credentials
 
 def send_notification(
     task: Any, escalation: bool, recipient_email: str | None = None, escalation_label: str | None = None,
-    store=None,
+    store=None, channel: str | None = None,
 ) -> str:
     """Send through the configured email provider, falling back to a log."""
     tenant_id = task["tenant_id"] if store else None
+    if channel in {"slack", "teams"}:
+        if not store or not tenant_id:
+            raise ValueError("Collaboration notifications require a tenant connection")
+        connection = store.get_integration_connection(tenant_id, channel)
+        if not connection or connection["provider"] != f"{channel}_webhook":
+            raise ValueError(f"The {channel} notification connection is not configured")
+        credentials = decrypt_credentials(tenant_id, channel, connection["credentials_ciphertext"])
+        title = ("Escalation" if escalation else "Reminder") + ": " + task["title"]
+        task_kind = task.get("task_kind", "renewal") if isinstance(task, dict) else task["task_kind"]
+        details = f"Due: {task['due_date']}"
+        if task_kind != "obligation" and task.get("expiration_date"):
+            details += f" · Contract expiration: {task['expiration_date']}"
+        if escalation_label:
+            details += f" · {escalation_label}"
+        if channel == "slack":
+            payload = {"text": f"*{title}*\n{task['title']}\n{details}"}
+        else:
+            payload = {"@type": "MessageCard", "@context": "https://schema.org/extensions",
+                       "summary": title, "title": title, "text": f"{task['title']}<br>{details}"}
+        _post_webhook(credentials.get("webhook_url", ""), payload, channel)
+        return channel
+    if channel == "log":
+        print(f"[notification-log] {'ESCALATION' if escalation else 'REMINDER'} {task['id']} -> {recipient_email or task.get('owner_email') or 'unassigned'}: {task['title']}")
+        return "log"
     connection = store.get_integration_connection(tenant_id, "email") if store and tenant_id else None
     settings: dict[str, str] = {}
     credentials: dict[str, str] = {}
@@ -91,7 +117,15 @@ def send_notification(
     return "email"
 
 
-def delivery_channel(task: Any, escalation: bool, recipient_email: str | None = None, store=None) -> str:
+def delivery_channel(task: Any, escalation: bool, recipient_email: str | None = None, store=None,
+                     requested_channel: str | None = None) -> str:
+    if requested_channel in {"slack", "teams"}:
+        connection = store.get_integration_connection(task["tenant_id"], requested_channel) if store else None
+        if connection and connection["provider"] == f"{requested_channel}_webhook":
+            return requested_channel
+        return requested_channel
+    if requested_channel == "log":
+        return "log"
     recipient = recipient_email or (os.getenv("ESCALATION_EMAIL") if escalation else None) or task["owner_email"]
     tenant_id = task["tenant_id"] if store else None
     connection = store.get_integration_connection(tenant_id, "email") if store and tenant_id else None
@@ -100,6 +134,38 @@ def delivery_channel(task: Any, escalation: bool, recipient_email: str | None = 
         provider = "microsoft"
     configured = (provider == "smtp" and bool(os.getenv("SMTP_HOST", "").strip())) or provider in {"microsoft", "gmail"}
     return "email" if configured and recipient else "log"
+
+
+def _post_webhook(url: str, payload: dict, channel: str) -> None:
+    validate_webhook_url(url, channel)
+    request = Request(url, data=json.dumps(payload).encode(), method="POST",
+                      headers={"Accept": "application/json", "Content-Type": "application/json"})
+    opener = build_opener(_NoRedirectHandler)
+    try:
+        with opener.open(request, timeout=15) as response:
+            response.read(1024)
+            if response.status < 200 or response.status >= 300:
+                raise RuntimeError(f"{channel.capitalize()} webhook returned HTTP {response.status}")
+    except HTTPError as exc:
+        raise RuntimeError(f"{channel.capitalize()} webhook returned HTTP {exc.code}") from exc
+    except (URLError, TimeoutError) as exc:
+        raise RuntimeError(f"{channel.capitalize()} webhook request failed: {type(exc).__name__}") from exc
+
+
+def validate_webhook_url(url: str, channel: str) -> None:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    allowed = host == "hooks.slack.com" if channel == "slack" else any(
+        host == suffix or host.endswith("." + suffix)
+        for suffix in ("webhook.office.com", "webhook.office365.com", "logic.azure.com")
+    )
+    if parsed.scheme != "https" or not allowed or parsed.username or parsed.password:
+        raise ValueError(f"The configured {channel} webhook URL is not an approved HTTPS endpoint")
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        return None
 
 
 def _send_microsoft_email(message: EmailMessage, recipient: str, token: str | None = None, user_id: str | None = None) -> None:

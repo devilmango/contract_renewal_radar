@@ -239,6 +239,8 @@ Approval decisions share the scheduled reminder runner. Set `APPROVAL_SLA_DAYS` 
 
 Reviewers can inspect the active policy with `GET /escalation-policy`; only administrators can update it with `PUT /escalation-policy`. Policies are tenant-scoped and stored in the configured database. `reminder_days_before` schedules reminders relative to the task's notice deadline, `backup_owner_email` receives reminders for unassigned tasks, and `escalation_steps` sends named follow-ups after the deadline to the configured escalation recipient. Each reminder offset and escalation day is persisted as a completed action so daily job retries do not resend a completed step. If a worker misses a scheduled day, all eligible unsent actions are caught up on its next run.
 
+The same policy controls `reminder_recipients`, `escalation_recipients`, `approval_recipients`, and `approval_escalation_recipients`, plus a channel list for each event (`email`, `slack`, `teams`, or `log`). Empty task recipient lists retain owner/backup-owner routing, and empty approval lists retain assigned reviewer routing. `APPROVAL_REVIEWER_EMAILS`, escalation-step recipients, and the existing approval escalation environment setting remain defaults when no tenant override is set. Each selected channel/recipient route has an idempotency key; delivery success and failure are recorded in the operations dashboard and contract audit trail.
+
 ```json
 {
   "reminder_days_before": [90, 30, 7, 0],
@@ -251,6 +253,8 @@ Reviewers can inspect the active policy with `GET /escalation-policy`; only admi
 ```
 
 The default policy sends one reminder on the notice deadline and escalates after `ESCALATION_AFTER_DAYS`, preserving the original behavior. Configured tiers are evaluated by each task's local notice date and use calendar-day offsets.
+
+Configure Slack and Teams incoming webhooks from `/integrations` or `PUT /integrations/connections/slack|teams`. Slack hooks must use `hooks.slack.com`; Teams hooks must use Microsoft `webhook.office.com`, `webhook.office365.com`, or `logic.azure.com` HTTPS endpoints. URLs are encrypted with the tenant integration key and never returned by the connection listing. The settings page's Send test action sends a small test card/message. Production notifications include only the task title and due date. Delivery failures are visible in `/operations` and are written to the audit trail. Configure channel preferences only after the matching webhook connection is saved.
 
 The service also exposes `POST /reminders/run` for a scheduler that enqueues the run through HTTP. Use a token with the `scheduler` or `admin` role.
 
@@ -318,9 +322,9 @@ Call `POST /calendar/sync` after configuration to enqueue a sync job. Contract c
 
 #### Tenant-owned calendar and email connections
 
-Administrators can manage organization-specific provider settings through `GET /integrations/connections`, `PUT /integrations/connections/{calendar|email}`, `POST /integrations/connections/{calendar|email}/check`, and `DELETE /integrations/connections/{calendar|email}`. Reviewer accounts can read connection status; only administrators can save, check, or remove a connection. Supported providers are Google Calendar, Microsoft Calendar, SMTP, Microsoft Graph email, and Gmail. OAuth refresh tokens are used to request fresh short-lived access tokens when available. Saving a connection replaces its credential bundle; credentials are encrypted with AES-GCM and never returned by the API. Connection changes and removals are recorded in the integration audit table.
+Administrators can manage organization-specific provider settings through `GET /integrations/connections`, `PUT /integrations/connections/{calendar|email|slack|teams}`, `POST /integrations/connections/{calendar|email|slack|teams}/check`, and `DELETE /integrations/connections/{calendar|email|slack|teams}`. Reviewer accounts can read connection status; only administrators can save, check, or remove a connection. Supported providers are Google Calendar, Microsoft Calendar, SMTP, Microsoft Graph email, Gmail, Slack incoming webhooks, and Microsoft Teams webhooks. OAuth refresh tokens are used to request fresh short-lived access tokens when available. Saving a connection replaces its credential bundle; credentials are encrypted with AES-GCM and never returned by the API. Connection changes and removals are recorded in the integration audit table.
 
-Administrators can also use the `/integrations` setup page to configure calendar and email providers, view saved connection health, run read-only checks, and remove connections. Secret fields are cleared after save and never populated from stored credentials. Updating a connection replaces the full credential bundle; keep the original credential set available when rotating a provider setup.
+Administrators can also use the `/integrations` setup page to configure calendar, email, Slack, and Teams providers, view saved connection health, run provider checks (webhook checks send a test message), and remove connections. Secret fields are cleared after save and never populated from stored credentials. Updating a connection replaces the full credential bundle; keep the original credential set available when rotating a provider setup.
 
 Set `INTEGRATION_ENCRYPTION_KEY` to a stable, deployment-managed 32-byte key (for example, generate one with `openssl rand -base64 32`) before saving connections. Back it up securely and keep it stable: losing or rotating the key without re-encrypting stored credentials makes those connections unreadable. Tenant credentials are used for that tenant's calendar sync and reminder email; legacy process-wide integration variables remain supported for tenants without a saved connection. The connection check performs a read-only provider request (or SMTP handshake/login) and records health without sending a message or calendar event.
 
@@ -347,7 +351,7 @@ Open `/tasks/inbox` to work from the renewal queue, or use the **Renewal task in
 
 ### Operations and delivery health
 
-Open `/operations` or request `GET /operations/health` with a reviewer, scheduler, or administrator token. The dashboard summarizes queued/running/retrying/dead jobs, overdue queue items, expired leases, integration connection checks, calendar-sync job results, and email/log notification attempts including their durations and failures. It raises alerts for dead letters, stuck jobs, expired leases, failed integration checks, and three or more notification failures in the past hour. An administrator can retry a dead job from the dashboard or through `POST /jobs/{job_id}/retry`; a running worker must process the requeued job. Set the `stuck_after_minutes` query parameter to adjust the queue-wait threshold (1–1440 minutes). Notification history stores task IDs and status diagnostics, not message bodies or recipient addresses. Delivery attempts are recorded before the reminder workflow marks the task notified; email remains at-least-once if a process stops after a successful send but before its state update.
+Open `/operations` or request `GET /operations/health` with a reviewer, scheduler, or administrator token. The dashboard summarizes queued/running/retrying/dead jobs, overdue queue items, expired leases, integration connection checks, calendar-sync job results, and email, Slack, Teams, or log notification attempts including their durations, recipients, and failures. It raises alerts for dead letters, stuck jobs, expired leases, failed integration checks, and three or more notification failures in the past hour. An administrator can retry a dead job from the dashboard or through `POST /jobs/{job_id}/retry`; a running worker must process the requeued job. Set the `stuck_after_minutes` query parameter to adjust the queue-wait threshold (1–1440 minutes). Notification history stores task IDs and delivery diagnostics, not message bodies or provider credentials. Delivery attempts are recorded before the reminder workflow marks the task notified; email and webhook delivery can be repeated if a process stops after successful send but before its state update.
 
 ### Renewal workflow and notice tracking
 
@@ -404,6 +408,8 @@ Configure automatic runs with `PUT /evaluations/schedule`, for example `{"enable
 ### Renewal planning and forecasting
 
 Open `/renewal-forecast` or call `POST /renewal-forecast` with `start_date`, `end_date`, `renewal_increase_pct`, and `renegotiation_savings_pct`. The deterministic report compares renew, renegotiate, and terminate scenarios across confirmed active contracts. It prorates annual values by calendar days, groups money by currency, and includes month-by-month projected costs, renewal notice deadlines, and expirations. Renewal growth defaults to 0%; renegotiation savings defaults to 10%. Termination includes spend through the current expiration date and no spend afterward. Contracts without confirmed annual value are listed as missing from monetary totals. Reviewer-generated forecasts are snapshotted with their assumptions. After outcomes are recorded, `GET /renewal-forecast/accuracy` compares predicted and actual annual values by supplier and scenario, reports signed and absolute variance, and recommends median renewal increase and negotiation savings assumptions from comparable historical outcomes. Reviewers can apply those assumptions to the planning form and generate a new forecast. Accuracy uses an explicitly linked decision forecast when present; otherwise it uses the latest forecast created before the outcome. The report is a planning aid; scenario assumptions do not change contract terms, task status, or provider calendars. The maximum planning period is five years.
+
+Open `/portfolio/performance` or call `GET /portfolio/performance/summary` for portfolio results over time. The report groups recorded renewal outcomes, completed/failed/missed obligations, and approval turnaround by month; current open overdue obligations and SLA-breached sign-offs are shown as backlog measures. Use `start_date`, `end_date`, `supplier_id`, and `owner_email` to filter the results. Approval turnaround includes obligation evidence sign-offs, playbook decisions, and renewal decision reviews. Amounts remain grouped by currency.
 
 Create a notice draft on a task with `POST /tasks/{task_id}/notices`, including a subject, human-reviewed body, recipient, and delivery method. A reviewer must approve it before dispatch can be recorded. `POST /notices/{notice_id}/dispatch` records the sent timestamp, reference, and optional note; it does not send email or submit the notice to a vendor. Record receipt evidence with `POST /notices/{notice_id}/delivery`. Legal content and actual delivery remain under human control while Radar provides a searchable audit record. List notices with `GET /tasks/{task_id}/notices`.
 
@@ -507,7 +513,7 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `GET` | `/contracts/{contract_id}/versions` | `reviewer` or `admin`: view amendment lineage and term changes |
 | `GET` | `/contracts/{contract_id}/amendment-candidates` | `reviewer` or `admin`: get tenant-scoped likely prior agreements for a pending upload |
 | `POST` | `/contracts/{contract_id}/amendment-preview` | `reviewer` or `admin`: preview term changes and task effects before confirmation |
-| `GET` / `PUT` | `/escalation-policy` | `reviewer`: read tenant policy; `admin`: update tenant policy |
+| `GET` / `PUT` | `/escalation-policy` | `reviewer`: read tenant policy; `admin`: update recipients, reminder timing, and channels |
 | `DELETE` | `/contracts/{contract_id}` | `admin`: redact contract data unless a legal hold is active |
 | `GET/POST` | `/contracts/{contract_id}/legal-holds` | `reviewer` or `admin`: list active holds or place a hold |
 | `POST` | `/legal-holds/{hold_id}/release` | `reviewer` or `admin`: release a hold |
@@ -526,6 +532,7 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `GET` | `/renewal-risk/summary` | `reviewer` or `admin`: inspect tenant-scoped renewal risk metrics and backlog |
 | `POST` | `/tasks/{task_id}/outcome` | `reviewer` or `admin`: record a final outcome, actual value/savings, successor, and close the task |
 | `GET` | `/renewal-outcomes/summary` | `reviewer` or `admin`: summarize realized outcomes and monetary metrics by currency |
+| `GET` | `/portfolio/performance/summary` | `reviewer` or `admin`: report renewal, obligation, overdue sign-off, and approval turnaround metrics; filter by date, supplier, and owner |
 | `GET` / `POST` | `/suppliers` | `reviewer` or `admin`: list supplier portfolio rollups or create a canonical supplier |
 | `PUT` | `/suppliers/{supplier_id}/contracts/{contract_id}` | `reviewer` or `admin`: associate a tenant contract with a supplier |
 | `GET` | `/obligations?status=open\|resolved` | `reviewer`, `admin`, or assigned `owner`: list scheduled obligations and evidence |
@@ -547,6 +554,9 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `PUT` | `/integrations/connections/{calendar\|email}` | `admin`: create or replace a tenant provider connection |
 | `POST` | `/integrations/connections/{calendar\|email}/check` | `admin`: run a read-only connection health check |
 | `DELETE` | `/integrations/connections/{calendar\|email}` | `admin`: remove a tenant provider connection |
+| `GET` | `/portfolio/performance` | Portfolio performance dashboard with date, supplier, and owner filters |
+| `PUT` | `/integrations/connections/{slack\|teams}` | `admin`: store an encrypted Slack or Teams incoming webhook |
+| `POST` | `/integrations/connections/{slack\|teams}/check` | `admin`: send a test notification to the saved webhook |
 | `POST` | `/jobs/{job_id}/retry` | `admin`: requeue a dead job |
 | `POST` | `/data-retention/run` | `admin`: enqueue a configured retention sweep (202) |
 | `GET` | `/calendar.ics` | `reviewer` or `admin`: export all tasks; `owner`: export assigned tasks |

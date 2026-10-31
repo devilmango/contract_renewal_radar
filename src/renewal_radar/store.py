@@ -2225,6 +2225,187 @@ class Store:
             "annual_savings_by_currency": {key: str(value) for key, value in savings.items()},
         }
 
+    def portfolio_performance(
+        self, tenant_id: str, start_date: date | None = None, end_date: date | None = None,
+        supplier_id: str | None = None, owner_email: str | None = None,
+        sla_days: int = 3, as_of: date | None = None,
+    ) -> dict[str, Any]:
+        """Aggregate renewal, obligation, and approval performance for a tenant portfolio."""
+        filters = ["o.tenant_id=?"]
+        params: list[Any] = [tenant_id]
+        if supplier_id:
+            filters.append("c.supplier_id=?")
+            params.append(supplier_id)
+        if owner_email:
+            filters.append("lower(COALESCE(t.owner_email,''))=?")
+            params.append(owner_email.strip().casefold())
+        date_sql, date_params = "", []
+        if start_date:
+            date_sql += " AND {event_date}>=?"
+            date_params.append(start_date.isoformat())
+        if end_date:
+            date_sql += " AND {event_date}<=?"
+            date_params.append(end_date.isoformat() + "T23:59:59.999999+00:00")
+        as_of = as_of or date.today()
+        sla_days = max(1, sla_days)
+        with self.connect() as db:
+            outcome_sql = ("SELECT o.outcome,o.actual_annual_value,o.annual_savings,o.currency,o.recorded_at "
+                           "FROM renewal_outcomes o JOIN contracts c ON c.id=o.contract_id AND c.tenant_id=o.tenant_id "
+                           "JOIN tasks t ON t.id=o.task_id AND t.tenant_id=o.tenant_id WHERE " + " AND ".join(filters))
+            outcomes = db.execute(outcome_sql + date_sql.format(event_date="o.recorded_at") + " ORDER BY o.recorded_at", tuple(params + date_params)).fetchall()
+
+            history_sql = ("SELECT h.outcome,h.created_at FROM obligation_compliance_history h "
+                           "JOIN contract_obligations o ON o.id=h.obligation_id AND o.tenant_id=h.tenant_id "
+                           "JOIN contracts c ON c.id=o.contract_id AND c.tenant_id=o.tenant_id "
+                           "JOIN tasks t ON t.id=h.task_id AND t.tenant_id=h.tenant_id WHERE " + " AND ".join(
+                               clause.replace("o.tenant_id", "h.tenant_id").replace("c.supplier_id", "c.supplier_id")
+                               .replace("t.owner_email", "t.owner_email") for clause in filters))
+            compliance = db.execute(history_sql + date_sql.format(event_date="h.created_at") + " ORDER BY h.created_at", tuple(params + date_params)).fetchall()
+
+            overdue_sql = ("SELECT COUNT(*) AS count FROM tasks t JOIN contract_obligations o ON o.task_id=t.id AND o.tenant_id=t.tenant_id "
+                           "JOIN contracts c ON c.id=o.contract_id AND c.tenant_id=o.tenant_id WHERE t.tenant_id=? "
+                           "AND t.status='open' AND t.due_date<?")
+            overdue_params: list[Any] = [tenant_id, as_of.isoformat()]
+            if supplier_id:
+                overdue_sql += " AND c.supplier_id=?"; overdue_params.append(supplier_id)
+            if owner_email:
+                overdue_sql += " AND lower(COALESCE(t.owner_email,''))=?"; overdue_params.append(owner_email.strip().casefold())
+            overdue_obligations = db.execute(overdue_sql, tuple(overdue_params)).fetchone()["count"]
+
+            pending_sql = ("SELECT e.created_at FROM obligation_evidence e JOIN contract_obligations o ON o.id=e.obligation_id "
+                           "JOIN contracts c ON c.id=o.contract_id JOIN tasks t ON t.id=e.task_id "
+                           "WHERE e.tenant_id=? AND e.status='pending_signoff' AND t.status='open'")
+            pending_params: list[Any] = [tenant_id]
+            if supplier_id:
+                pending_sql += " AND c.supplier_id=?"; pending_params.append(supplier_id)
+            if owner_email:
+                pending_sql += " AND lower(COALESCE(t.owner_email,''))=?"; pending_params.append(owner_email.strip().casefold())
+            pending_evidence = db.execute(pending_sql, tuple(pending_params)).fetchall()
+
+            pending_playbook_sql = ("SELECT r.applied_at FROM task_playbook_reviews r JOIN tasks t ON t.id=r.task_id "
+                                    "JOIN contracts c ON c.id=t.contract_id WHERE r.tenant_id=? AND r.status='blocked' AND t.status='open'")
+            pending_playbook_params: list[Any] = [tenant_id]
+            if supplier_id:
+                pending_playbook_sql += " AND c.supplier_id=?"; pending_playbook_params.append(supplier_id)
+            if owner_email:
+                pending_playbook_sql += " AND lower(COALESCE(t.owner_email,''))=?"; pending_playbook_params.append(owner_email.strip().casefold())
+            pending_playbooks = db.execute(pending_playbook_sql, tuple(pending_playbook_params)).fetchall()
+
+            approval_filters = ["e.tenant_id=?", "e.status IN ('approved','rejected')", "e.reviewed_at IS NOT NULL"]
+            approval_params: list[Any] = [tenant_id]
+            if supplier_id:
+                approval_filters.append("c.supplier_id=?"); approval_params.append(supplier_id)
+            if owner_email:
+                approval_filters.append("lower(COALESCE(t.owner_email,''))=?"); approval_params.append(owner_email.strip().casefold())
+            if start_date:
+                approval_filters.append("e.reviewed_at>=?"); approval_params.append(start_date.isoformat())
+            if end_date:
+                approval_filters.append("e.reviewed_at<=?"); approval_params.append(end_date.isoformat() + "T23:59:59.999999+00:00")
+            reviewed_evidence = db.execute(
+                "SELECT e.created_at,e.reviewed_at FROM obligation_evidence e JOIN contract_obligations o ON o.id=e.obligation_id "
+                "JOIN contracts c ON c.id=o.contract_id JOIN tasks t ON t.id=e.task_id WHERE " + " AND ".join(approval_filters),
+                tuple(approval_params),
+            ).fetchall()
+            playbook_filters = ["r.tenant_id=?", "r.status IN ('approved','rejected')"]
+            playbook_params: list[Any] = [tenant_id]
+            if supplier_id:
+                playbook_filters.append("c.supplier_id=?"); playbook_params.append(supplier_id)
+            if owner_email:
+                playbook_filters.append("lower(COALESCE(t.owner_email,''))=?"); playbook_params.append(owner_email.strip().casefold())
+            playbook_rows = db.execute(
+                "SELECT r.applied_at,r.status,r.approvals_json FROM task_playbook_reviews r JOIN tasks t ON t.id=r.task_id "
+                "JOIN contracts c ON c.id=t.contract_id WHERE " + " AND ".join(playbook_filters), tuple(playbook_params),
+            ).fetchall()
+            decision_filters = ["d.tenant_id=?", "d.status IN ('approved','rejected')", "d.reviewed_at IS NOT NULL"]
+            decision_params: list[Any] = [tenant_id]
+            if supplier_id:
+                decision_filters.append("c.supplier_id=?"); decision_params.append(supplier_id)
+            if owner_email:
+                decision_filters.append("lower(COALESCE(t.owner_email,''))=?"); decision_params.append(owner_email.strip().casefold())
+            if start_date:
+                decision_filters.append("d.reviewed_at>=?"); decision_params.append(start_date.isoformat())
+            if end_date:
+                decision_filters.append("d.reviewed_at<=?"); decision_params.append(end_date.isoformat() + "T23:59:59.999999+00:00")
+            renewal_decisions = db.execute(
+                "SELECT COALESCE((SELECT MIN(e.created_at) FROM renewal_decision_events e "
+                "WHERE e.decision_id=d.id AND e.event_type='submitted'),d.created_at) AS submitted_at,d.reviewed_at,d.status "
+                "FROM renewal_decisions d JOIN contracts c ON c.id=d.contract_id "
+                "JOIN tasks t ON t.id=d.task_id WHERE " + " AND ".join(decision_filters), tuple(decision_params),
+            ).fetchall()
+
+        monthly: dict[str, dict[str, Any]] = {}
+        outcome_counts: dict[str, int] = {}
+        savings: dict[str, Decimal] = {}
+        for row in outcomes:
+            month = str(row["recorded_at"])[:7]
+            entry = monthly.setdefault(month, _empty_performance_month())
+            entry["renewal_outcomes"] += 1
+            entry["outcomes_by_type"][row["outcome"]] = entry["outcomes_by_type"].get(row["outcome"], 0) + 1
+            outcome_counts[row["outcome"]] = outcome_counts.get(row["outcome"], 0) + 1
+            if row["currency"]:
+                savings[row["currency"]] = savings.get(row["currency"], Decimal(0)) + Decimal(row["annual_savings"] or "0")
+        compliance_counts = {"completed": 0, "failed": 0, "missed": 0}
+        for row in compliance:
+            outcome = row["outcome"]
+            if outcome not in compliance_counts:
+                continue
+            month = str(row["created_at"])[:7]
+            entry = monthly.setdefault(month, _empty_performance_month())
+            if outcome == "completed":
+                entry["obligations_completed"] += 1
+            elif outcome == "failed":
+                entry["obligations_failed"] += 1
+            elif outcome == "missed":
+                entry["obligations_missed"] += 1
+            compliance_counts[outcome] += 1
+
+        turnaround_days: list[float] = []
+        def add_turnaround(start: str | None, finish: str | None) -> None:
+            if not start or not finish:
+                return
+            try:
+                finish_day = datetime.fromisoformat(finish).date()
+                if (start_date and finish_day < start_date) or (end_date and finish_day > end_date):
+                    return
+                delta = (datetime.fromisoformat(finish) - datetime.fromisoformat(start)).total_seconds() / 86400
+            except ValueError:
+                return
+            if delta < 0:
+                return
+            turnaround_days.append(delta)
+            month = finish[:7]
+            entry = monthly.setdefault(month, _empty_performance_month())
+            entry["approval_decisions"] += 1
+            entry["approval_turnaround_days_total"] += delta
+        for row in reviewed_evidence:
+            add_turnaround(row["created_at"], row["reviewed_at"])
+        for row in playbook_rows:
+            stamps = [item.get("at") for item in json.loads(row["approvals_json"]).values() if item and item.get("at")]
+            add_turnaround(row["applied_at"], max(stamps) if stamps else None)
+        for row in renewal_decisions:
+            add_turnaround(row["submitted_at"], row["reviewed_at"])
+        for entry in monthly.values():
+            count = entry["approval_decisions"]
+            total_days = entry.pop("approval_turnaround_days_total")
+            entry["mean_approval_turnaround_days"] = round(total_days / count, 2) if count else None
+        return {
+            "tenant_id": tenant_id, "as_of": as_of.isoformat(),
+            "filters": {"start_date": iso(start_date), "end_date": iso(end_date), "supplier_id": supplier_id,
+                        "owner_email": owner_email.strip() if owner_email else None},
+            "summary": {
+                "renewal_outcome_count": len(outcomes), "renewal_outcomes_by_type": outcome_counts,
+                "annual_savings_by_currency": {key: _money_string(value) for key, value in savings.items()},
+                "obligations_completed": compliance_counts["completed"], "obligations_failed": compliance_counts["failed"],
+                "obligations_missed": compliance_counts["missed"], "overdue_open_obligations": overdue_obligations,
+                "overdue_signoffs": sum(1 for row in pending_evidence if _approval_age_days(row["created_at"], as_of) >= sla_days)
+                                    + sum(1 for row in pending_playbooks if _approval_age_days(row["applied_at"], as_of) >= sla_days),
+                "pending_signoffs": len(pending_evidence) + len(pending_playbooks),
+                "approval_decisions": len(turnaround_days),
+                "mean_approval_turnaround_days": round(sum(turnaround_days) / len(turnaround_days), 2) if turnaround_days else None,
+            },
+            "monthly": [{"month": month, **monthly[month]} for month in sorted(monthly)],
+        }
+
     def confirm_contract(self, contract_id: str, data: ContractData, actor: str, tenant_id: str = "default") -> str:
         from uuid import uuid4
 
@@ -2691,7 +2872,7 @@ class Store:
                 (tenant_id, hour_ago),
             ).fetchone()["count"]
             recent_deliveries = db.execute(
-                "SELECT task_id, channel, notification_type, status, duration_ms, error_message, attempted_at "
+                "SELECT task_id, recipient, channel, notification_type, status, duration_ms, error_message, attempted_at "
                 "FROM notification_deliveries WHERE tenant_id=? ORDER BY attempted_at DESC LIMIT 50", (tenant_id,),
             ).fetchall()
         by_status: dict[str, int] = {}
@@ -3357,6 +3538,12 @@ def _amendment_match_key(value: str) -> str:
 def _configured_approval_reviewers() -> list[str]:
     configured = os.getenv("APPROVAL_REVIEWER_EMAILS", "")
     return sorted({email.strip().casefold() for email in configured.split(",") if "@" in email})
+
+
+def _empty_performance_month() -> dict[str, Any]:
+    return {"renewal_outcomes": 0, "outcomes_by_type": {}, "obligations_completed": 0,
+            "obligations_failed": 0, "obligations_missed": 0, "approval_decisions": 0,
+            "approval_turnaround_days_total": 0.0, "mean_approval_turnaround_days": None}
 
 
 def _monthly_prorated_costs(annual_value: Decimal, start: date, end: date) -> dict[str, Decimal]:
