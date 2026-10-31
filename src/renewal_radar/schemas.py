@@ -225,6 +225,106 @@ class RenewalOutcomeRequest(BaseModel):
         return self
 
 
+class RenewalDecisionCreateRequest(BaseModel):
+    task_id: str = Field(min_length=1, max_length=100)
+    strategy: Literal["negotiate", "renew", "terminate"]
+    reason: str = Field(min_length=1, max_length=5000)
+    forecast_id: str | None = Field(default=None, max_length=100)
+    owner_name: str | None = Field(default=None, max_length=150)
+    owner_email: str | None = Field(default=None, max_length=320)
+    target_date: date | None = None
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("A decision reason is required")
+        return value.strip()
+
+    @field_validator("owner_email")
+    @classmethod
+    def validate_decision_owner_email(cls, value: str | None) -> str | None:
+        if value and ("@" not in value or value.startswith("@") or value.endswith("@")):
+            raise ValueError("owner_email must be a valid email address")
+        return value
+
+
+class RenewalDecisionUpdateRequest(BaseModel):
+    strategy: Literal["negotiate", "renew", "terminate"] | None = None
+    reason: str | None = Field(default=None, max_length=5000)
+    forecast_id: str | None = Field(default=None, max_length=100)
+    owner_name: str | None = Field(default=None, max_length=150)
+    owner_email: str | None = Field(default=None, max_length=320)
+    target_date: date | None = None
+
+    @field_validator("reason")
+    @classmethod
+    def validate_updated_reason(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("A decision reason cannot be blank")
+        return value.strip() if value is not None else None
+
+    @field_validator("owner_email")
+    @classmethod
+    def validate_updated_owner_email(cls, value: str | None) -> str | None:
+        if value and ("@" not in value or value.startswith("@") or value.endswith("@")):
+            raise ValueError("owner_email must be a valid email address")
+        return value
+
+    @model_validator(mode="after")
+    def require_decision_update(self) -> "RenewalDecisionUpdateRequest":
+        if not self.model_fields_set:
+            raise ValueError("Provide at least one field to update")
+        return self
+
+
+class RenewalDecisionReviewRequest(BaseModel):
+    approved: bool
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+class RenewalDecisionMilestoneRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=250)
+    due_date: date | None = None
+    owner_email: str | None = Field(default=None, max_length=320)
+
+    @field_validator("title")
+    @classmethod
+    def validate_milestone_title(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Milestone title cannot be blank")
+        return value
+
+    @field_validator("owner_email")
+    @classmethod
+    def validate_milestone_owner_email(cls, value: str | None) -> str | None:
+        if value and ("@" not in value or value.startswith("@") or value.endswith("@")):
+            raise ValueError("owner_email must be a valid email address")
+        return value
+
+
+class RenewalDecisionMilestoneUpdateRequest(BaseModel):
+    completed: bool
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+class RenewalDecisionQuoteRequest(BaseModel):
+    supplier: str | None = Field(default=None, max_length=250)
+    amount: Decimal = Field(ge=0, max_digits=16, decimal_places=2)
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    quote_date: date | None = None
+    valid_until: date | None = None
+    reference: str | None = Field(default=None, max_length=250)
+    note: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def validate_quote_dates(self) -> "RenewalDecisionQuoteRequest":
+        if self.quote_date and self.valid_until and self.valid_until < self.quote_date:
+            raise ValueError("valid_until cannot precede quote_date")
+        return self
+
+
 class SupplierCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=250)
     risk_level: Literal["low", "medium", "high", "critical"] = "medium"

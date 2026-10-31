@@ -174,6 +174,62 @@ class Store:
                     annual_contract_value TEXT NOT NULL,
                     PRIMARY KEY (run_id, contract_id)
                 );
+                CREATE TABLE IF NOT EXISTS renewal_decisions (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    contract_id TEXT NOT NULL REFERENCES contracts(id),
+                    task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
+                    forecast_run_id TEXT REFERENCES renewal_forecast_runs(id),
+                    strategy TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'draft',
+                    reason TEXT NOT NULL,
+                    owner_name TEXT,
+                    owner_email TEXT,
+                    target_date TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
+                    review_comment TEXT
+                );
+                CREATE TABLE IF NOT EXISTS renewal_decision_milestones (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    decision_id TEXT NOT NULL REFERENCES renewal_decisions(id),
+                    title TEXT NOT NULL,
+                    due_date TEXT,
+                    owner_email TEXT,
+                    completed INTEGER NOT NULL DEFAULT 0,
+                    completed_by TEXT,
+                    completed_at TEXT,
+                    comment TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS renewal_decision_quotes (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    decision_id TEXT NOT NULL REFERENCES renewal_decisions(id),
+                    supplier TEXT,
+                    amount TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    quote_date TEXT,
+                    valid_until TEXT,
+                    reference TEXT,
+                    note TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS renewal_decision_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT NOT NULL,
+                    decision_id TEXT NOT NULL REFERENCES renewal_decisions(id),
+                    event_type TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     contract_id TEXT NOT NULL REFERENCES contracts(id),
@@ -454,6 +510,32 @@ class Store:
                     amendment_comparison_accuracy REAL,
                     report_json TEXT NOT NULL,
                     created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS portfolio_import_batches (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    dataset TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    field_mapping_json TEXT NOT NULL,
+                    rows_json TEXT NOT NULL,
+                    report_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'previewed',
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    committed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS portfolio_import_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id TEXT NOT NULL REFERENCES portfolio_import_batches(id),
+                    tenant_id TEXT NOT NULL,
+                    row_number INTEGER NOT NULL,
+                    dataset TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    record_id TEXT,
+                    message TEXT,
+                    actor TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS provider_evaluation_schedules (
@@ -1655,6 +1737,43 @@ class Store:
             cursor = db.execute("DELETE FROM portfolio_saved_filters WHERE id=? AND tenant_id=?",(filter_id,tenant_id))
         return cursor.rowcount > 0
 
+    def create_portfolio_import_batch(self, tenant_id: str, dataset: str, filename: str, mapping: dict,
+                                      rows: list[dict], report: dict, actor: str) -> dict[str, Any]:
+        batch_id, now = str(uuid4()), utc_now().isoformat()
+        with self.connect() as db:
+            db.execute("INSERT INTO portfolio_import_batches (id,tenant_id,dataset,filename,field_mapping_json,rows_json,report_json,status,created_by,created_at) "
+                       "VALUES (?,?,?,?,?,?,?,'previewed',?,?)",
+                       (batch_id,tenant_id,dataset,filename,json.dumps(mapping),json.dumps(rows,default=str),json.dumps(report),actor,now))
+        return self.get_portfolio_import_batch(batch_id, tenant_id)
+
+    def get_portfolio_import_batch(self, batch_id: str, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM portfolio_import_batches WHERE id=? AND tenant_id=?",(batch_id,tenant_id)).fetchone()
+            if not row:
+                return None
+            events = db.execute("SELECT * FROM portfolio_import_events WHERE batch_id=? AND tenant_id=? ORDER BY row_number,id",(batch_id,tenant_id)).fetchall()
+        return {**dict(row), "field_mapping": json.loads(row["field_mapping_json"]),
+                "rows": json.loads(row["rows_json"]), "report": json.loads(row["report_json"]),
+                "events": [dict(event) for event in events]}
+
+    def record_portfolio_import_event(self, batch_id: str, tenant_id: str, row_number: int, dataset: str,
+                                     action: str, status: str, record_id: str | None, message: str | None,
+                                     actor: str) -> None:
+        with self.connect() as db:
+            db.execute("INSERT INTO portfolio_import_events (batch_id,tenant_id,row_number,dataset,action,status,record_id,message,actor,created_at) "
+                       "VALUES (?,?,?,?,?,?,?,?,?,?)",(batch_id,tenant_id,row_number,dataset,action,status,record_id,message,actor,utc_now().isoformat()))
+
+    def finish_portfolio_import_batch(self, batch_id: str, tenant_id: str, report: dict, status: str) -> None:
+        with self.connect() as db:
+            db.execute("UPDATE portfolio_import_batches SET report_json=?,status=?,committed_at=? WHERE id=? AND tenant_id=?",
+                       (json.dumps(report),status,utc_now().isoformat(),batch_id,tenant_id))
+
+    def latest_portfolio_import_batches(self, tenant_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute("SELECT id,tenant_id,dataset,filename,status,report_json,created_by,created_at,committed_at "
+                               "FROM portfolio_import_batches WHERE tenant_id=? ORDER BY created_at DESC LIMIT ?",(tenant_id,limit)).fetchall()
+        return [{**dict(row), "report": json.loads(row["report_json"])} for row in rows]
+
     def renewal_forecast(
         self, tenant_id: str, start_date: date, end_date: date,
         renewal_increase_pct: Decimal = Decimal(0), renegotiation_savings_pct: Decimal = Decimal(10),
@@ -1746,6 +1865,204 @@ class Store:
             "contracts": items,
         }
 
+    def create_renewal_decision(self, request: dict[str, Any], actor: str, tenant_id: str) -> dict[str, Any] | None:
+        decision_id, now = str(uuid4()), utc_now().isoformat()
+        with self.connect() as db:
+            task = db.execute("SELECT * FROM tasks WHERE id=? AND tenant_id=?",(request["task_id"],tenant_id)).fetchone()
+            if not task:
+                return None
+            if task["status"] != "open" or task["task_kind"] != "renewal":
+                raise ValueError("Renewal decisions require an open renewal task")
+            if db.execute("SELECT 1 FROM renewal_decisions WHERE task_id=?",(task["id"],)).fetchone():
+                raise ValueError("A renewal decision already exists for this task")
+            forecast_id = request.get("forecast_id")
+            if forecast_id:
+                linked = db.execute("SELECT 1 FROM renewal_forecast_lines WHERE run_id=? AND contract_id=? AND tenant_id=?",
+                                    (forecast_id,task["contract_id"],tenant_id)).fetchone()
+                if not linked:
+                    raise ValueError("Forecast must be a saved tenant forecast that includes this contract")
+            db.execute("INSERT INTO renewal_decisions (id,tenant_id,contract_id,task_id,forecast_run_id,strategy,status,reason,owner_name,owner_email,target_date,created_by,created_at,updated_at) "
+                       "VALUES (?,?,?,?,?,?,'draft',?,?,?,?,?,?,?)",
+                       (decision_id,tenant_id,task["contract_id"],task["id"],forecast_id,request["strategy"],request["reason"],
+                        request.get("owner_name"),request.get("owner_email"),iso(request.get("target_date")),actor,now,now))
+            self._renewal_decision_event(db,tenant_id,decision_id,"created",{key:value for key,value in request.items() if key!="task_id"},actor,now)
+            self.add_audit(db,task["contract_id"],"renewal.decision_created",actor,{"decision_id":decision_id,"task_id":task["id"],"strategy":request["strategy"],"forecast_id":forecast_id},tenant_id)
+        return self.get_renewal_decision(decision_id,tenant_id)
+
+    @staticmethod
+    def _renewal_decision_event(db, tenant_id: str, decision_id: str, event_type: str,
+                                details: dict[str, Any], actor: str, now: str) -> None:
+        db.execute("INSERT INTO renewal_decision_events (tenant_id,decision_id,event_type,details_json,actor,created_at) VALUES (?,?,?,?,?,?)",
+                   (tenant_id,decision_id,event_type,json.dumps(details,default=str),actor,now))
+
+    def _renewal_decision_record(self, row, tenant_id: str) -> dict[str, Any]:
+        decision = dict(row)
+        with self.connect() as db:
+            milestones = db.execute("SELECT * FROM renewal_decision_milestones WHERE decision_id=? AND tenant_id=? ORDER BY due_date,created_at",
+                                    (row["id"],tenant_id)).fetchall()
+            quotes = db.execute("SELECT * FROM renewal_decision_quotes WHERE decision_id=? AND tenant_id=? ORDER BY created_at DESC",
+                                (row["id"],tenant_id)).fetchall()
+            events = db.execute("SELECT * FROM renewal_decision_events WHERE decision_id=? AND tenant_id=? ORDER BY id",
+                                (row["id"],tenant_id)).fetchall()
+            task = db.execute("SELECT title,due_date,expiration_date FROM tasks WHERE id=? AND tenant_id=?",(row["task_id"],tenant_id)).fetchone()
+        decision["task"] = dict(task) if task else None
+        decision["milestones"] = [{**dict(item),"completed":bool(item["completed"])} for item in milestones]
+        decision["quotes"] = [dict(item) for item in quotes]
+        decision["events"] = [{**dict(item),"details":json.loads(item["details_json"])} for item in events]
+        return decision
+
+    def list_renewal_decisions(self, tenant_id: str, status: str | None = None) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            if status:
+                rows = db.execute("SELECT * FROM renewal_decisions WHERE tenant_id=? AND status=? ORDER BY updated_at DESC",(tenant_id,status)).fetchall()
+            else:
+                rows = db.execute("SELECT * FROM renewal_decisions WHERE tenant_id=? ORDER BY updated_at DESC",(tenant_id,)).fetchall()
+        return [self._renewal_decision_record(row,tenant_id) for row in rows]
+
+    def get_renewal_decision(self, decision_id: str, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM renewal_decisions WHERE id=? AND tenant_id=?",(decision_id,tenant_id)).fetchone()
+        return self._renewal_decision_record(row,tenant_id) if row else None
+
+    def update_renewal_decision(self, decision_id: str, tenant_id: str, actor: str, changes: dict[str, Any]) -> dict[str, Any] | None:
+        now = utc_now().isoformat()
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM renewal_decisions WHERE id=? AND tenant_id=?",(decision_id,tenant_id)).fetchone()
+            if not row:
+                return None
+            if row["status"] not in {"draft","in_progress","rejected"}:
+                raise ValueError("Only draft or active decisions can be edited")
+            forecast_id = changes.get("forecast_id",row["forecast_run_id"])
+            if forecast_id:
+                linked = db.execute("SELECT 1 FROM renewal_forecast_lines WHERE run_id=? AND contract_id=? AND tenant_id=?",
+                                    (forecast_id,row["contract_id"],tenant_id)).fetchone()
+                if not linked:
+                    raise ValueError("Forecast must be a saved tenant forecast that includes this contract")
+            assignments, params = [], []
+            for key,value in changes.items():
+                column = "forecast_run_id" if key == "forecast_id" else key
+                if column not in {"strategy","reason","forecast_run_id","owner_name","owner_email","target_date"}:
+                    continue
+                assignments.append(f"{column}=?")
+                params.append(iso(value) if key == "target_date" else value)
+            if assignments:
+                assignments.extend(["status='in_progress'","updated_at=?"])
+                params.extend([now,decision_id,tenant_id])
+                db.execute(f"UPDATE renewal_decisions SET {','.join(assignments)} WHERE id=? AND tenant_id=?",tuple(params))
+                self._renewal_decision_event(db,tenant_id,decision_id,"updated",changes,actor,now)
+                self.add_audit(db,row["contract_id"],"renewal.decision_updated",actor,{"decision_id":decision_id,"changes":changes},tenant_id)
+        return self.get_renewal_decision(decision_id,tenant_id)
+
+    def add_renewal_decision_milestone(self, decision_id: str, tenant_id: str, actor: str, request: dict[str, Any]) -> dict[str, Any] | None:
+        milestone_id,now=str(uuid4()),utc_now().isoformat()
+        with self.connect() as db:
+            decision=db.execute("SELECT * FROM renewal_decisions WHERE id=? AND tenant_id=?",(decision_id,tenant_id)).fetchone()
+            if not decision: return None
+            if decision["status"] in {"approved","rejected","completed"}:
+                raise ValueError("Milestones cannot be changed on a terminal decision")
+            db.execute("INSERT INTO renewal_decision_milestones (id,tenant_id,decision_id,title,due_date,owner_email,created_by,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                       (milestone_id,tenant_id,decision_id,request["title"],iso(request.get("due_date")),request.get("owner_email"),actor,now))
+            self._renewal_decision_event(db,tenant_id,decision_id,"milestone_added",{"milestone_id":milestone_id,**request},actor,now)
+            self.add_audit(db,decision["contract_id"],"renewal.milestone_added",actor,{"decision_id":decision_id,"milestone_id":milestone_id},tenant_id)
+            row=db.execute("SELECT * FROM renewal_decision_milestones WHERE id=?",(milestone_id,)).fetchone()
+        return {**dict(row),"completed":bool(row["completed"])}
+
+    def update_renewal_decision_milestone(self, decision_id: str, milestone_id: str, tenant_id: str,
+                                          actor: str, completed: bool, comment: str | None) -> dict[str, Any] | None:
+        now=utc_now().isoformat()
+        with self.connect() as db:
+            row=db.execute("SELECT m.*,d.contract_id,d.status AS decision_status FROM renewal_decision_milestones m JOIN renewal_decisions d ON d.id=m.decision_id "
+                           "WHERE m.id=? AND m.decision_id=? AND m.tenant_id=?",(milestone_id,decision_id,tenant_id)).fetchone()
+            if not row: return None
+            if row["decision_status"] in {"approved","rejected","completed"}:
+                raise ValueError("Milestones cannot be changed on a terminal decision")
+            db.execute("UPDATE renewal_decision_milestones SET completed=?,completed_by=?,completed_at=?,comment=? WHERE id=? AND tenant_id=?",
+                       (int(completed),actor if completed else None,now if completed else None,comment,milestone_id,tenant_id))
+            self._renewal_decision_event(db,tenant_id,decision_id,"milestone_completed" if completed else "milestone_reopened",
+                                        {"milestone_id":milestone_id,"comment":comment},actor,now)
+            self.add_audit(db,row["contract_id"],"renewal.milestone_updated",actor,{"decision_id":decision_id,"milestone_id":milestone_id,"completed":completed},tenant_id)
+            updated=db.execute("SELECT * FROM renewal_decision_milestones WHERE id=?",(milestone_id,)).fetchone()
+        return {**dict(updated),"completed":bool(updated["completed"])}
+
+    def add_renewal_decision_quote(self, decision_id: str, tenant_id: str, actor: str, request: dict[str, Any]) -> dict[str, Any] | None:
+        quote_id,now=str(uuid4()),utc_now().isoformat()
+        with self.connect() as db:
+            decision=db.execute("SELECT * FROM renewal_decisions WHERE id=? AND tenant_id=?",(decision_id,tenant_id)).fetchone()
+            if not decision: return None
+            if decision["status"] in {"approved","rejected","completed"}:
+                raise ValueError("Quotes cannot be added to a terminal decision")
+            db.execute("INSERT INTO renewal_decision_quotes (id,tenant_id,decision_id,supplier,amount,currency,quote_date,valid_until,reference,note,created_by,created_at) "
+                       "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (quote_id,tenant_id,decision_id,request.get("supplier"),str(request["amount"]),request["currency"],iso(request.get("quote_date")),
+                        iso(request.get("valid_until")),request.get("reference"),request.get("note"),actor,now))
+            self._renewal_decision_event(db,tenant_id,decision_id,"quote_added",{"quote_id":quote_id,"amount":str(request["amount"]),"currency":request["currency"]},actor,now)
+            self.add_audit(db,decision["contract_id"],"renewal.quote_added",actor,{"decision_id":decision_id,"quote_id":quote_id,"amount":str(request["amount"]),"currency":request["currency"]},tenant_id)
+            row=db.execute("SELECT * FROM renewal_decision_quotes WHERE id=?",(quote_id,)).fetchone()
+        return dict(row)
+
+    def submit_renewal_decision(self, decision_id: str, tenant_id: str, actor: str) -> dict[str, Any] | None:
+        now=utc_now().isoformat()
+        with self.connect() as db:
+            row=db.execute("SELECT * FROM renewal_decisions WHERE id=? AND tenant_id=?",(decision_id,tenant_id)).fetchone()
+            if not row: return None
+            if row["status"] not in {"draft","in_progress","rejected"}:
+                raise ValueError("Only draft or active decisions can be submitted for review")
+            db.execute("UPDATE renewal_decisions SET status='pending_approval',updated_at=? WHERE id=? AND tenant_id=?",(now,decision_id,tenant_id))
+            self._renewal_decision_event(db,tenant_id,decision_id,"submitted",{},actor,now)
+            self.add_audit(db,row["contract_id"],"renewal.decision_submitted",actor,{"decision_id":decision_id},tenant_id)
+        return self.get_renewal_decision(decision_id,tenant_id)
+
+    def review_renewal_decision(self, decision_id: str, tenant_id: str, actor: str,
+                                approved: bool, comment: str | None) -> dict[str, Any] | None:
+        now=utc_now().isoformat()
+        with self.connect() as db:
+            row=db.execute("SELECT * FROM renewal_decisions WHERE id=? AND tenant_id=?",(decision_id,tenant_id)).fetchone()
+            if not row: return None
+            if row["status"] != "pending_approval":
+                raise ValueError("Only a decision pending approval can be reviewed")
+            status="approved" if approved else "rejected"
+            db.execute("UPDATE renewal_decisions SET status=?,reviewed_by=?,reviewed_at=?,review_comment=?,updated_at=? WHERE id=? AND tenant_id=?",
+                       (status,actor,now,comment,now,decision_id,tenant_id))
+            self._renewal_decision_event(db,tenant_id,decision_id,"approved" if approved else "rejected",{"comment":comment},actor,now)
+            self.add_audit(db,row["contract_id"],f"renewal.decision_{status}",actor,{"decision_id":decision_id,"comment":comment},tenant_id)
+        return self.get_renewal_decision(decision_id,tenant_id)
+
+    def complete_renewal_decision(self, decision_id: str, tenant_id: str, request: dict[str, Any], actor: str) -> dict[str, Any] | None:
+        now=utc_now().isoformat()
+        with self.connect() as db:
+            decision=db.execute("SELECT * FROM renewal_decisions WHERE id=? AND tenant_id=?",(decision_id,tenant_id)).fetchone()
+            if not decision: return None
+            if decision["status"] != "approved":
+                raise ValueError("Decision must be approved before it can be completed")
+            if decision["strategy"] == "renew" and request["outcome"] != "renewed":
+                raise ValueError("A renew decision must complete with a renewed outcome")
+            if decision["strategy"] == "negotiate" and request["outcome"] != "renegotiated":
+                raise ValueError("A negotiate decision must complete with a renegotiated outcome")
+            if decision["strategy"] == "terminate" and request["outcome"] not in {"terminated","expired","no_action"}:
+                raise ValueError("A terminate decision must complete with a terminated, expired, or no-action outcome")
+            task=db.execute("SELECT * FROM tasks WHERE id=? AND tenant_id=?",(decision["task_id"],tenant_id)).fetchone()
+            if not task or task["status"]!="open": raise ValueError("The renewal task is no longer open")
+            if db.execute("SELECT 1 FROM renewal_outcomes WHERE task_id=?",(task["id"],)).fetchone():
+                raise ValueError("A renewal outcome has already been recorded for this task")
+            successor=request.get("successor_contract_id")
+            if successor and not db.execute("SELECT 1 FROM contracts WHERE id=? AND tenant_id=?",(successor,tenant_id)).fetchone():
+                raise ValueError("Successor contract must belong to this organization")
+            workflow="renewed" if request["outcome"] in {"renewed","renegotiated"} else "cancelled" if request["outcome"]=="no_action" else "terminated"
+            db.execute("INSERT INTO renewal_outcomes (task_id,tenant_id,contract_id,outcome,actual_annual_value,annual_savings,currency,successor_contract_id,actual_expiration_date,notes,recorded_by,recorded_at) "
+                       "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (task["id"],tenant_id,decision["contract_id"],request["outcome"],str(request["actual_annual_value"]) if request.get("actual_annual_value") is not None else None,
+                        str(request["annual_savings"]) if request.get("annual_savings") is not None else None,request.get("currency"),successor,
+                        iso(request.get("actual_expiration_date")),request.get("notes"),actor,now))
+            db.execute("UPDATE tasks SET status='resolved',workflow_state=? WHERE id=? AND tenant_id=?",(workflow,task["id"],tenant_id))
+            db.execute("UPDATE renewal_decisions SET status='completed',updated_at=? WHERE id=? AND tenant_id=?",(now,decision_id,tenant_id))
+            details={key:value for key,value in request.items() if key!="notes"}
+            details.update({"task_id":task["id"],"decision_id":decision_id,"forecast_id":decision["forecast_run_id"]})
+            self._renewal_decision_event(db,tenant_id,decision_id,"completed",details,actor,now)
+            self.add_audit(db,decision["contract_id"],"renewal.outcome_recorded",actor,details,tenant_id)
+        with self.connect() as db:
+            row=db.execute("SELECT * FROM renewal_outcomes WHERE task_id=? AND tenant_id=?",(decision["task_id"],tenant_id)).fetchone()
+        return dict(row)
+
     def record_renewal_outcome(self, task_id: str, request: dict[str, Any], actor: str, tenant_id: str) -> dict[str, Any] | None:
         with self.connect() as db:
             task = db.execute("SELECT * FROM tasks WHERE id=? AND tenant_id=?", (task_id, tenant_id)).fetchone()
@@ -1755,6 +2072,14 @@ class Store:
                 raise ValueError("A renewal outcome has already been recorded for this task")
             if task["status"] != "open":
                 raise ValueError("Only open tasks can have a renewal outcome recorded")
+            decision = db.execute("SELECT * FROM renewal_decisions WHERE task_id=? AND tenant_id=?",(task_id,tenant_id)).fetchone()
+            if decision:
+                if decision["status"] != "approved":
+                    raise ValueError("Renewal decision must be approved before an outcome can be recorded")
+                strategy_outcomes = {"renew":{"renewed"},"negotiate":{"renegotiated"},
+                                     "terminate":{"terminated","expired","no_action"}}
+                if request["outcome"] not in strategy_outcomes[decision["strategy"]]:
+                    raise ValueError("Recorded outcome does not match the approved renewal decision")
             successor_id = request.get("successor_contract_id")
             if successor_id and not db.execute(
                 "SELECT 1 FROM contracts WHERE id=? AND tenant_id=?", (successor_id, tenant_id),
@@ -1773,6 +2098,11 @@ class Store:
                  request.get("notes"), actor, now),
             )
             db.execute("UPDATE tasks SET status='resolved',workflow_state=? WHERE id=?", (workflow_state, task_id))
+            if decision:
+                db.execute("UPDATE renewal_decisions SET status='completed',updated_at=? WHERE id=? AND tenant_id=?",
+                           (now,decision["id"],tenant_id))
+                self._renewal_decision_event(db,tenant_id,decision["id"],"completed",{
+                    "outcome":outcome,"task_id":task_id,"forecast_id":decision["forecast_run_id"]},actor,now)
             details = {key: value for key, value in request.items() if key != "notes"}
             details["task_id"] = task_id
             self.add_audit(db, task["contract_id"], "renewal.outcome_recorded", actor, details, tenant_id)
@@ -1801,12 +2131,20 @@ class Store:
                 )
         return run_id
 
+    def list_renewal_forecast_runs(self, tenant_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows=db.execute("SELECT r.*,COUNT(l.contract_id) AS contract_count FROM renewal_forecast_runs r "
+                            "LEFT JOIN renewal_forecast_lines l ON l.run_id=r.id AND l.tenant_id=r.tenant_id "
+                            "WHERE r.tenant_id=? GROUP BY r.id ORDER BY r.recorded_at DESC",(tenant_id,)).fetchall()
+        return [dict(row) for row in rows]
+
     def renewal_forecast_accuracy(self, tenant_id: str) -> dict[str, Any]:
         """Compare the most recent pre-outcome forecast with actual annualized decisions."""
         with self.connect() as db:
             outcomes = db.execute(
-                "SELECT o.*,c.confirmed_json,c.extracted_json FROM renewal_outcomes o "
+                "SELECT o.*,c.confirmed_json,c.extracted_json,d.forecast_run_id AS decision_forecast_id FROM renewal_outcomes o "
                 "JOIN contracts c ON c.id=o.contract_id AND c.tenant_id=o.tenant_id "
+                "LEFT JOIN renewal_decisions d ON d.task_id=o.task_id AND d.tenant_id=o.tenant_id "
                 "WHERE o.tenant_id=? ORDER BY o.recorded_at", (tenant_id,),
             ).fetchall()
             runs = db.execute(
@@ -1820,6 +2158,8 @@ class Store:
         scored = 0
         for outcome in outcomes:
             candidates = [r for r in runs if r["contract_id"] == outcome["contract_id"] and r["recorded_at"] <= outcome["recorded_at"]]
+            if outcome["decision_forecast_id"]:
+                candidates = [r for r in candidates if r["id"] == outcome["decision_forecast_id"]]
             if not candidates:
                 continue
             run = candidates[-1]
