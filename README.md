@@ -511,6 +511,8 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `GET` | `/contracts?status=pending_review\|active\|rejected\|superseded\|redacted` | `reviewer` or `admin`: list contracts |
 | `GET` | `/contracts/{contract_id}` | `reviewer` or `admin`: view proposal and confirmed terms |
 | `GET` | `/contracts/{contract_id}/versions` | `reviewer` or `admin`: view amendment lineage and term changes |
+| `GET` / `POST` | `/contracts/{contract_id}/relationships` | `reviewer`: view graph/timeline and link master agreements, SOWs, amendments, or renewals |
+| `POST` | `/deadlines/calculate` | `reviewer`: calculate and explain a timezone and jurisdiction-aware notice deadline |
 | `GET` | `/contracts/{contract_id}/amendment-candidates` | `reviewer` or `admin`: get tenant-scoped likely prior agreements for a pending upload |
 | `POST` | `/contracts/{contract_id}/amendment-preview` | `reviewer` or `admin`: preview term changes and task effects before confirmation |
 | `GET` / `PUT` | `/escalation-policy` | `reviewer`: read tenant policy; `admin`: update recipients, reminder timing, and channels |
@@ -551,9 +553,10 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `PATCH` | `/obligations/{obligation_id}/schedule` | `reviewer` or `admin`: pause, resume, end, or change a recurring schedule cadence |
 | `POST` | `/obligations/{obligation_id}/reschedule` | `reviewer` or `admin`: reschedule an open obligation occurrence within the contract term |
 | `GET` | `/integrations/connections` | `reviewer` or `admin`: list tenant provider connections and health without credentials |
-| `PUT` | `/integrations/connections/{calendar\|email}` | `admin`: create or replace a tenant provider connection |
-| `POST` | `/integrations/connections/{calendar\|email}/check` | `admin`: run a read-only connection health check |
-| `DELETE` | `/integrations/connections/{calendar\|email}` | `admin`: remove a tenant provider connection |
+| `GET` | `/integrations/procurement` | Procurement connection setup and sync history page |
+| `PUT` | `/integrations/connections/{calendar\|email\|procurement}` | `admin`: create or replace a tenant provider connection |
+| `POST` | `/integrations/connections/{calendar\|email\|procurement}/check` | `admin`: run a read-only connection health check |
+| `DELETE` | `/integrations/connections/{calendar\|email\|procurement}` | `admin`: remove a tenant provider connection |
 | `GET` | `/portfolio/performance` | Portfolio performance dashboard with date, supplier, and owner filters |
 | `PUT` | `/integrations/connections/{slack\|teams}` | `admin`: store an encrypted Slack or Teams incoming webhook |
 | `POST` | `/integrations/connections/{slack\|teams}/check` | `admin`: send a test notification to the saved webhook |
@@ -561,6 +564,8 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `POST` | `/data-retention/run` | `admin`: enqueue a configured retention sweep (202) |
 | `GET` | `/calendar.ics` | `reviewer` or `admin`: export all tasks; `owner`: export assigned tasks |
 | `POST` | `/calendar/sync` | `reviewer` or `admin`: enqueue live calendar synchronization (202) |
+| `POST` | `/procurement/sync` | `admin`: enqueue Coupa or SAP Ariba contract/supplier reconciliation (202) |
+| `GET` | `/procurement/sync/history` | `reviewer` or `admin`: inspect sync runs, duplicates, revisions, and conflicts |
 | `POST` | `/document-sources/sync` | `reviewer`, `admin`, or `scheduler`: poll configured cloud drives |
 | `POST` | `/tasks/{task_id}/assign` | `reviewer` or `admin`: assign a task owner |
 | `GET/POST` | `/obligations/{obligation_id}/compliance` | `reviewer`, `admin`, or assigned owner: inspect history or record failed/missed compliance |
@@ -673,10 +678,12 @@ contract_renewal_radar/
 │   ├── api.py                 # FastAPI routes and request handling
 │   ├── calendar.py            # iCalendar export
 │   ├── calendar_sync.py       # Microsoft Graph and Google Calendar upserts
+│   ├── deadlines.py           # Deterministic timezone and jurisdiction-aware deadline math
 │   ├── documents.py           # PDF text extraction and OCR
 │   ├── extractor.py            # Rules and optional LLM extraction
 │   ├── jobs.py                 # Durable background-job enqueue and worker loop
 │   ├── notifications.py       # SMTP and log notification delivery
+│   ├── procurement_sync.py    # Coupa and SAP Ariba portfolio reconciliation
 │   ├── reminders.py           # Reminder and escalation runner
 │   ├── schemas.py              # Typed request, response, and evidence models
 │   └── store.py                # Tenant-scoped SQLite persistence and audit events
@@ -695,11 +702,33 @@ contract_renewal_radar/
 - Human confirmation is a required workflow boundary, not an optional quality check.
 - SQLite is intended for a single host. PostgreSQL enables shared multi-instance API/worker storage, but production deployments still need managed database operations, backups, and restore testing.
 - OIDC login uses a short-lived ID-token session and does not refresh expired sessions or provision users. Configure role and tenant claims at the identity provider; users sign in again after token expiration.
-- Business-day counting skips weekends and reviewer-entered holidays. Holiday calendars vary by contract and jurisdiction; reviewers must enter applicable dates before confirming a business-day clause.
+- Business-day counting uses the configured weekend, supported jurisdiction holiday calendar, and reviewer-entered contract-specific holidays. The persisted task deadline includes its timezone, calendar source, and calculation trace; reviewers should still verify local or sector-specific holidays.
 - Calendar access tokens need rotation. Use a secret manager or token broker and least-privilege permissions for the target calendar.
 - Tenant isolation is enforced by application queries. For regulated multi-customer deployments, review the hosting boundary and consider separate databases per organization. Webhook receiver routes currently use one configured `DOCUMENT_SOURCE_WEBHOOK_TENANT_ID`; deploy separate callback configuration or add tenant-aware subscription provisioning before using a shared receiver for multiple organizations.
 - When an external LLM provider is enabled, extracted contract text is sent to that provider's API. Review its data handling, retention, and contractual terms before processing confidential agreements.
 - The reminder runner sends the first notification on or after the calculated task date. Run it on a reliable schedule to avoid missed notifications.
+
+### Contract relationships and effective terms
+
+`GET /contracts/{contract_id}/relationships` returns the tenant-scoped connected contract graph, including explicit master/SOW, amendment, renewal, and related-contract links plus automatically recorded supersession links. The response includes one chronological audit timeline and effective terms with `term_sources` identifying the contract that supplied each inherited value. A SOW inherits missing values from its linked master; explicit child terms take precedence. Create a relationship with `POST /contracts/{contract_id}/relationships` and one of `master_of`, `sow_under`, `amendment_of`, `renewal_of`, or `related_to`. The call is auditable and both contracts must belong to the caller's tenant. Existing `GET /contracts/{contract_id}/versions` remains the focused linear amendment history.
+
+### Coupa and SAP Ariba portfolio synchronization
+
+Configure the tenant's procurement connector with an administrator token. API endpoint paths are relative to `base_url`, and responses may be a JSON array or an array under `items`, `value`, `data`, `results`, or `records`.
+
+```bash
+curl -X PUT http://127.0.0.1:8000/integrations/connections/procurement \
+  -H "Authorization: Bearer $RADAR_ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  --data-binary @- <<JSON
+{"provider":"coupa","settings":{"base_url":"https://acme.coupahost.com/","suppliers_path":"api/suppliers","contracts_path":"api/contracts"},"credentials":{"api_key":"${COUPA_API_KEY}"}}
+JSON
+```
+
+For SAP Ariba, use `provider: sap_ariba`, a tenant-approved HTTPS API base URL, and `credentials.access_token`. Coupa uses its API key header; SAP Ariba uses a bearer token. The connector imports supplier references and structured contracts as **pending review** proposals, maps common name/date/value/currency/notice fields, and associates suppliers when possible. It does not activate or supersede a contract automatically. Use `POST /integrations/connections/procurement/check` to verify read access, `POST /procurement/sync` to enqueue reconciliation, and `GET /procurement/sync/history` to inspect imports, duplicates, failed runs, and changed revisions that need reviewer attention. Runs use durable jobs with bounded retries. Configure narrow read-only credentials and endpoint scopes. The connector rejects non-HTTPS and private/local API targets and does not follow redirects.
+
+### Jurisdiction-aware notice calculations
+
+Reviewers can set `notice_timezone`, `notice_jurisdiction`, `notice_weekend_days` (Monday is `0`, Sunday is `6`), and contract-specific `notice_holidays` on contract confirmation. Built-in public holiday calendars are `US-FEDERAL`, `GB-ENG-WLS`, and `IN-NATIONAL`; add local or contractual dates explicitly. `POST /deadlines/calculate` returns the proposed deadline and a deterministic explanation with the counting convention, timezone, jurisdiction, weekend days, holiday source, and skipped dates. The same calculation trace is retained on the resulting renewal task and included in task API responses and audit events. The deadline is a review aid; confirm jurisdiction-specific exceptions against the contract.
 
 ## Contributing
 

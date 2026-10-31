@@ -9,12 +9,12 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from uuid import uuid4
 import calendar
 from statistics import median
 
 from .schemas import ContractData
+from .deadlines import calculate_deadline
 
 
 def utc_now() -> datetime:
@@ -122,6 +122,8 @@ class Store:
                     notice_day_type TEXT NOT NULL DEFAULT 'calendar',
                     notice_timezone TEXT NOT NULL DEFAULT 'UTC',
                     notice_holidays_json TEXT NOT NULL DEFAULT '[]',
+                    notice_jurisdiction TEXT,
+                    deadline_calculation_json TEXT NOT NULL DEFAULT '{}',
                     workflow_state TEXT NOT NULL DEFAULT 'review',
                     tenant_id TEXT NOT NULL DEFAULT 'default',
                     task_kind TEXT NOT NULL DEFAULT 'renewal'
@@ -372,6 +374,39 @@ class Store:
                     UNIQUE (prior_contract_id, tenant_id),
                     CHECK (contract_id <> prior_contract_id)
                 );
+                CREATE TABLE IF NOT EXISTS contract_relationships (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    contract_id TEXT NOT NULL REFERENCES contracts(id),
+                    related_contract_id TEXT NOT NULL REFERENCES contracts(id),
+                    relationship_type TEXT NOT NULL,
+                    note TEXT,
+                    linked_by TEXT NOT NULL,
+                    linked_at TEXT NOT NULL,
+                    CHECK (contract_id <> related_contract_id),
+                    UNIQUE (tenant_id, contract_id, related_contract_id, relationship_type)
+                );
+                CREATE TABLE IF NOT EXISTS procurement_sync_runs (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    suppliers_seen INTEGER NOT NULL DEFAULT 0,
+                    contracts_seen INTEGER NOT NULL DEFAULT 0,
+                    imported INTEGER NOT NULL DEFAULT 0,
+                    duplicates INTEGER NOT NULL DEFAULT 0,
+                    conflicts_json TEXT NOT NULL DEFAULT '[]',
+                    error_message TEXT,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS procurement_supplier_records (
+                    tenant_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    supplier_id TEXT NOT NULL REFERENCES suppliers(id),
+                    PRIMARY KEY (tenant_id, provider, external_id)
+                );
                 CREATE TABLE IF NOT EXISTS tenant_policies (
                     tenant_id TEXT PRIMARY KEY,
                     policy_json TEXT NOT NULL,
@@ -603,6 +638,8 @@ class Store:
                         db.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS notice_day_type TEXT NOT NULL DEFAULT 'calendar'")
                         db.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS notice_timezone TEXT NOT NULL DEFAULT 'UTC'")
                         db.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS notice_holidays_json TEXT NOT NULL DEFAULT '[]'")
+                        db.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS notice_jurisdiction TEXT")
+                        db.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline_calculation_json TEXT NOT NULL DEFAULT '{}'")
                         db.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS workflow_state TEXT NOT NULL DEFAULT 'review'")
                         db.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS task_kind TEXT NOT NULL DEFAULT 'renewal'")
                 else:
@@ -617,6 +654,10 @@ class Store:
                         db.execute("ALTER TABLE tasks ADD COLUMN notice_timezone TEXT NOT NULL DEFAULT 'UTC'")
                     if table == "tasks" and "notice_holidays_json" not in columns:
                         db.execute("ALTER TABLE tasks ADD COLUMN notice_holidays_json TEXT NOT NULL DEFAULT '[]'")
+                    if table == "tasks" and "notice_jurisdiction" not in columns:
+                        db.execute("ALTER TABLE tasks ADD COLUMN notice_jurisdiction TEXT")
+                    if table == "tasks" and "deadline_calculation_json" not in columns:
+                        db.execute("ALTER TABLE tasks ADD COLUMN deadline_calculation_json TEXT NOT NULL DEFAULT '{}'")
                     if table == "tasks" and "workflow_state" not in columns:
                         db.execute("ALTER TABLE tasks ADD COLUMN workflow_state TEXT NOT NULL DEFAULT 'review'")
                     if table == "tasks" and "task_kind" not in columns:
@@ -644,6 +685,7 @@ class Store:
             db.execute("CREATE INDEX IF NOT EXISTS idx_notification_tenant ON notification_deliveries(tenant_id, attempted_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_feedback_tenant ON review_feedback(tenant_id, status, captured_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_contract_versions_prior ON contract_versions(tenant_id, prior_contract_id)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_contract_relationships_tenant ON contract_relationships(tenant_id,contract_id,related_contract_id)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_task_notification_tenant ON task_notification_state(tenant_id, sent_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_supplier_tenant ON suppliers(tenant_id, normalized_name)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_outcome_tenant_date ON renewal_outcomes(tenant_id, recorded_at)")
@@ -705,6 +747,67 @@ class Store:
                 "source_key": source_key, "external_id": external_id, "revision": revision, "source_url": source_url,
             }, tenant_id)
             return contract_id, True
+
+    def find_or_create_procurement_supplier(self, tenant_id: str, provider: str, external_id: str, name: str) -> dict[str, Any]:
+        normalized = self._supplier_key(name)
+        with self.connect() as db:
+            linked = db.execute(
+                "SELECT s.* FROM procurement_supplier_records p JOIN suppliers s ON s.id=p.supplier_id "
+                "WHERE p.tenant_id=? AND p.provider=? AND p.external_id=?",
+                (tenant_id, provider, external_id),
+            ).fetchone()
+            if linked:
+                return dict(linked)
+            existing = db.execute("SELECT * FROM suppliers WHERE tenant_id=? AND normalized_name=?", (tenant_id, normalized)).fetchone()
+        supplier = dict(existing) if existing else self.create_supplier(name, f"integration:{provider}", tenant_id)
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO procurement_supplier_records (tenant_id,provider,external_id,supplier_id) VALUES (?,?,?,?) "
+                "ON CONFLICT(tenant_id,provider,external_id) DO NOTHING",
+                (tenant_id, provider, external_id, supplier["id"]),
+            )
+            row = db.execute(
+                "SELECT s.* FROM procurement_supplier_records p JOIN suppliers s ON s.id=p.supplier_id "
+                "WHERE p.tenant_id=? AND p.provider=? AND p.external_id=?",
+                (tenant_id, provider, external_id),
+            ).fetchone()
+            return dict(row)
+
+    def procurement_contract_revision(self, tenant_id: str, provider: str, external_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT revision,contract_id,ingested_at FROM external_documents "
+                "WHERE tenant_id=? AND provider=? AND source_key='contracts' AND external_id=? "
+                "ORDER BY ingested_at DESC LIMIT 1",
+                (tenant_id, provider, external_id),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def start_procurement_sync(self, run_id: str, tenant_id: str, provider: str) -> None:
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO procurement_sync_runs (id,tenant_id,provider,status,started_at) VALUES (?,?,?,'running',?)",
+                (run_id, tenant_id, provider, utc_now().isoformat()),
+            )
+
+    def finish_procurement_sync(self, run_id: str, tenant_id: str, status: str,
+                                summary: dict[str, Any], error_message: str | None = None) -> None:
+        with self.connect() as db:
+            db.execute(
+                "UPDATE procurement_sync_runs SET status=?,suppliers_seen=?,contracts_seen=?,imported=?,duplicates=?,"
+                "conflicts_json=?,error_message=?,finished_at=? WHERE id=? AND tenant_id=?",
+                (status, summary.get("suppliers_seen", 0), summary.get("contracts_seen", 0),
+                 summary.get("imported", 0), summary.get("duplicates", 0), json.dumps(summary.get("conflicts", [])),
+                 error_message, utc_now().isoformat(), run_id, tenant_id),
+            )
+
+    def procurement_sync_history(self, tenant_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM procurement_sync_runs WHERE tenant_id=? ORDER BY started_at DESC LIMIT ?",
+                (tenant_id, max(1, min(200, limit))),
+            ).fetchall()
+        return [{**dict(row), "conflicts": json.loads(row["conflicts_json"])} for row in rows]
 
     def get_integration_cursor(self, tenant_id: str, provider: str, source_key: str) -> str | None:
         with self.connect() as db:
@@ -2419,11 +2522,12 @@ class Store:
                 raise ValueError("expiration_date is required before a contract can be activated")
             if data.auto_renew and data.renewal_notice_days is None:
                 raise ValueError("renewal_notice_days is required for an auto-renewing contract")
-            due = calculate_notice_deadline(data.expiration_date, data.renewal_notice_days or 0, data.notice_day_type, set(data.notice_holidays))
-            try:
-                ZoneInfo(data.notice_timezone)
-            except ZoneInfoNotFoundError as exc:
-                raise ValueError(f"Unknown IANA timezone: {data.notice_timezone}") from exc
+            deadline_calculation = calculate_deadline(
+                data.expiration_date, data.renewal_notice_days or 0, data.notice_day_type,
+                timezone=data.notice_timezone, jurisdiction=data.notice_jurisdiction,
+                holidays=set(data.notice_holidays), weekend_days=set(data.notice_weekend_days),
+            )
+            due = date.fromisoformat(deadline_calculation["due_date"])
             superseded = None
             if data.supersedes_contract_id:
                 superseded = db.execute(
@@ -2448,8 +2552,8 @@ class Store:
                 (data.model_dump_json(), now, contract_id),
             )
             db.execute(
-                "INSERT INTO tasks (id, contract_id, title, owner_name, owner_email, due_date, expiration_date, status, created_at, tenant_id, notice_day_type, notice_timezone, notice_holidays_json) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
-                (task_id, contract_id, f"Review renewal: {data.contract or row['filename']}", data.owner_name, data.owner_email, due.isoformat(), data.expiration_date.isoformat(), now, tenant_id, data.notice_day_type, data.notice_timezone, json.dumps([d.isoformat() for d in data.notice_holidays])),
+                "INSERT INTO tasks (id, contract_id, title, owner_name, owner_email, due_date, expiration_date, status, created_at, tenant_id, notice_day_type, notice_timezone, notice_holidays_json, notice_jurisdiction, deadline_calculation_json) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)",
+                (task_id, contract_id, f"Review renewal: {data.contract or row['filename']}", data.owner_name, data.owner_email, due.isoformat(), data.expiration_date.isoformat(), now, tenant_id, data.notice_day_type, data.notice_timezone, json.dumps([d.isoformat() for d in data.notice_holidays]), data.notice_jurisdiction, json.dumps(deadline_calculation)),
             )
             scored_fields = ("start_date", "expiration_date", "renewal_notice_days", "notice_day_type", "auto_renew", "termination_notice")
             proposed_data = ContractData.model_validate_json(row["extracted_json"]).model_dump(mode="json")
@@ -2466,7 +2570,7 @@ class Store:
                 (str(uuid4()), contract_id, tenant_id, row["provider"], json.dumps(proposed), json.dumps(reviewed), json.dumps(corrections), actor, now),
             )
             self.add_audit(db, contract_id, "contract.confirmed", actor, {"contract": data.model_dump(mode="json"), "task_id": task_id}, tenant_id)
-            self.add_audit(db, contract_id, "task.created", "system", {"task_id": task_id, "due_date": due.isoformat(), "notice_day_type": data.notice_day_type, "notice_timezone": data.notice_timezone}, tenant_id)
+            self.add_audit(db, contract_id, "task.created", "system", {"task_id": task_id, "due_date": due.isoformat(), "notice_day_type": data.notice_day_type, "notice_timezone": data.notice_timezone, "notice_jurisdiction": data.notice_jurisdiction, "deadline_calculation": deadline_calculation}, tenant_id)
             return task_id
 
     def amendment_candidates(self, contract_id: str, tenant_id: str = "default", limit: int = 5) -> list[dict[str, Any]]:
@@ -2529,14 +2633,12 @@ class Store:
                 raise ValueError("expiration_date is required before a contract can be activated")
             if data.auto_renew and data.renewal_notice_days is None:
                 raise ValueError("renewal_notice_days is required for an auto-renewing contract")
-            due = calculate_notice_deadline(
-                data.expiration_date, data.renewal_notice_days or 0,
-                data.notice_day_type, set(data.notice_holidays),
+            deadline_calculation = calculate_deadline(
+                data.expiration_date, data.renewal_notice_days or 0, data.notice_day_type,
+                timezone=data.notice_timezone, jurisdiction=data.notice_jurisdiction,
+                holidays=set(data.notice_holidays), weekend_days=set(data.notice_weekend_days),
             )
-            try:
-                ZoneInfo(data.notice_timezone)
-            except ZoneInfoNotFoundError as exc:
-                raise ValueError(f"Unknown IANA timezone: {data.notice_timezone}") from exc
+            due = date.fromisoformat(deadline_calculation["due_date"])
             previous = None
             previous_tasks = []
             if data.supersedes_contract_id:
@@ -2565,7 +2667,8 @@ class Store:
         before = json.loads(previous["confirmed_json"] or previous["extracted_json"]) if previous else {}
         compared_fields = (
             "contract", "start_date", "expiration_date", "renewal_notice_days", "notice_day_type",
-            "notice_timezone", "notice_holidays", "notice_method", "notice_recipient", "auto_renew",
+            "notice_timezone", "notice_holidays", "notice_jurisdiction", "notice_weekend_days",
+            "notice_method", "notice_recipient", "auto_renew",
             "termination_notice", "owner_name", "owner_email", "annual_contract_value", "currency",
         )
         changes = {
@@ -2617,7 +2720,7 @@ class Store:
                 "new_task": {
                     "title": f"Review renewal: {data.contract or proposal['filename']}",
                     "due_date": due.isoformat(), "expiration_date": data.expiration_date.isoformat(),
-                    "owner_email": data.owner_email,
+                    "owner_email": data.owner_email, "deadline_calculation": deadline_calculation,
                 },
             },
         }
@@ -2671,7 +2774,8 @@ class Store:
         previous_terms: dict[str, Any] | None = None
         compared_fields = (
             "contract", "start_date", "expiration_date", "renewal_notice_days", "notice_day_type",
-            "notice_timezone", "notice_holidays", "notice_method", "notice_recipient", "auto_renew",
+            "notice_timezone", "notice_holidays", "notice_jurisdiction", "notice_weekend_days",
+            "notice_method", "notice_recipient", "auto_renew",
             "termination_notice",
         )
         for version_id in chain:
@@ -2703,6 +2807,154 @@ class Store:
             })
             previous_terms = current_terms
         return result
+
+    def link_contracts(self, contract_id: str, related_contract_id: str, relationship_type: str,
+                       actor: str, tenant_id: str, note: str | None = None) -> dict[str, Any]:
+        allowed = {"master_of", "sow_under", "amendment_of", "renewal_of", "related_to"}
+        if relationship_type not in allowed:
+            raise ValueError("Unsupported contract relationship type")
+        if contract_id == related_contract_id:
+            raise ValueError("A contract cannot be related to itself")
+        now = utc_now().isoformat()
+        relationship_id = str(uuid4())
+        with self.connect() as db:
+            contracts = db.execute(
+                "SELECT id FROM contracts WHERE tenant_id=? AND id IN (?,?)",
+                (tenant_id, contract_id, related_contract_id),
+            ).fetchall()
+            if len(contracts) != 2:
+                raise KeyError("Both contracts must belong to this organization")
+            child_id, parent_id = ((related_contract_id, contract_id) if relationship_type == "master_of"
+                                   else (contract_id, related_contract_id))
+            if relationship_type in {"master_of", "sow_under", "amendment_of", "renewal_of"}:
+                existing_edges = db.execute(
+                    "SELECT contract_id,related_contract_id,relationship_type FROM contract_relationships WHERE tenant_id=?",
+                    (tenant_id,),
+                ).fetchall()
+                parents: dict[str, set[str]] = {}
+                for edge in existing_edges:
+                    if edge["relationship_type"] in {"sow_under", "amendment_of", "renewal_of"}:
+                        parents.setdefault(edge["contract_id"], set()).add(edge["related_contract_id"])
+                    elif edge["relationship_type"] == "master_of":
+                        parents.setdefault(edge["related_contract_id"], set()).add(edge["contract_id"])
+                for version in db.execute(
+                    "SELECT contract_id,prior_contract_id FROM contract_versions WHERE tenant_id=?", (tenant_id,),
+                ).fetchall():
+                    parents.setdefault(version["contract_id"], set()).add(version["prior_contract_id"])
+                if parent_id in parents.get(child_id, set()):
+                    raise ValueError("This contract already inherits terms from that linked contract")
+                if parents.get(child_id):
+                    raise ValueError("A contract can inherit terms from only one linked parent")
+                pending, visited = [parent_id], set()
+                while pending:
+                    ancestor = pending.pop()
+                    if ancestor == child_id:
+                        raise ValueError("Contract inheritance relationships cannot contain cycles")
+                    if ancestor not in visited:
+                        visited.add(ancestor)
+                        pending.extend(parents.get(ancestor, set()))
+            existing = db.execute(
+                "SELECT * FROM contract_relationships WHERE tenant_id=? AND contract_id=? AND related_contract_id=? AND relationship_type=?",
+                (tenant_id, contract_id, related_contract_id, relationship_type),
+            ).fetchone()
+            if existing:
+                return dict(existing)
+            db.execute(
+                "INSERT INTO contract_relationships (id,tenant_id,contract_id,related_contract_id,relationship_type,note,linked_by,linked_at) VALUES (?,?,?,?,?,?,?,?)",
+                (relationship_id, tenant_id, contract_id, related_contract_id, relationship_type, note, actor, now),
+            )
+            self.add_audit(db, contract_id, "contract.relationship_linked", actor, {
+                "related_contract_id": related_contract_id, "relationship_type": relationship_type, "note": note,
+            }, tenant_id)
+            self.add_audit(db, related_contract_id, "contract.relationship_linked", actor, {
+                "related_contract_id": contract_id, "relationship_type": relationship_type, "note": note,
+            }, tenant_id)
+            return {"id": relationship_id, "tenant_id": tenant_id, "contract_id": contract_id,
+                    "related_contract_id": related_contract_id, "relationship_type": relationship_type,
+                    "note": note, "linked_by": actor, "linked_at": now}
+
+    def contract_relationship_graph(self, contract_id: str, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            root = db.execute("SELECT * FROM contracts WHERE id=? AND tenant_id=?", (contract_id, tenant_id)).fetchone()
+            if not root:
+                return None
+            raw_edges = [dict(row) for row in db.execute(
+                "SELECT id,contract_id,related_contract_id,relationship_type,note,linked_by,linked_at FROM contract_relationships WHERE tenant_id=?",
+                (tenant_id,),
+            ).fetchall()]
+            version_edges = [dict(row) for row in db.execute(
+                "SELECT contract_id,prior_contract_id,linked_by,linked_at FROM contract_versions WHERE tenant_id=?",
+                (tenant_id,),
+            ).fetchall()]
+            edges = raw_edges + [{"id": None, "contract_id": edge["contract_id"],
+                                  "related_contract_id": edge["prior_contract_id"],
+                                  "relationship_type": "supersedes", "note": None,
+                                  "linked_by": edge["linked_by"], "linked_at": edge["linked_at"]}
+                                 for edge in version_edges]
+            component = {contract_id}
+            changed = True
+            while changed:
+                changed = False
+                for edge in edges:
+                    left, right = edge["contract_id"], edge["related_contract_id"]
+                    if left in component and right not in component:
+                        component.add(right); changed = True
+                    elif right in component and left not in component:
+                        component.add(left); changed = True
+            ids = sorted(component)
+            placeholders = ",".join("?" for _ in ids)
+            nodes = db.execute(
+                f"SELECT * FROM contracts WHERE tenant_id=? AND id IN ({placeholders})",
+                (tenant_id, *ids),
+            ).fetchall()
+            audits = db.execute(
+                f"SELECT contract_id,event_type,actor,details_json,created_at FROM audit_events WHERE tenant_id=? AND contract_id IN ({placeholders}) ORDER BY created_at,id",
+                (tenant_id, *ids),
+            ).fetchall()
+        node_map = {}
+        for row in nodes:
+            terms = json.loads(row["confirmed_json"] or row["extracted_json"])
+            node_map[row["id"]] = {"id": row["id"], "filename": row["filename"], "status": row["status"],
+                                    "created_at": row["created_at"], "confirmed_at": row["confirmed_at"], "terms": terms}
+        visible_edges = [edge for edge in edges if edge["contract_id"] in component and edge["related_contract_id"] in component]
+        parents: dict[str, list[str]] = {}
+        for edge in visible_edges:
+            if edge["relationship_type"] in {"sow_under", "amendment_of", "renewal_of", "supersedes"}:
+                parents.setdefault(edge["contract_id"], []).append(edge["related_contract_id"])
+            elif edge["relationship_type"] == "master_of":
+                parents.setdefault(edge["related_contract_id"], []).append(edge["contract_id"])
+        effective: dict[str, Any] = {}
+        sources: dict[str, str] = {}
+        active: set[str] = set()
+        inheritable_terms = {
+            "start_date", "expiration_date", "renewal_notice_days", "notice_day_type", "notice_timezone",
+            "notice_holidays", "notice_jurisdiction", "notice_weekend_days", "notice_method",
+            "notice_recipient", "auto_renew", "termination_notice", "annual_contract_value", "currency",
+        }
+        def resolve(node_id: str) -> tuple[dict[str, Any], dict[str, str]]:
+            if node_id in active:
+                return {}, {}
+            active.add(node_id)
+            inherited, inherited_sources = {}, {}
+            for parent in sorted(parents.get(node_id, [])):
+                values, origins = resolve(parent)
+                for key in inheritable_terms:
+                    if values.get(key) is not None and key not in inherited:
+                        inherited[key], inherited_sources[key] = values[key], origins[key]
+            active.remove(node_id)
+            terms = node_map[node_id]["terms"]
+            for key, value in terms.items():
+                if value is not None and value != [] and value != {}:
+                    inherited[key], inherited_sources[key] = value, node_id
+            return inherited, inherited_sources
+        for node_id in ids:
+            effective[node_id], sources[node_id] = resolve(node_id)
+        timeline = [{"contract_id": row["contract_id"], "event_type": row["event_type"], "actor": row["actor"],
+                     "details": json.loads(row["details_json"]), "created_at": row["created_at"]} for row in audits]
+        timeline.sort(key=lambda item: (item["created_at"], item["contract_id"]))
+        return {"root_contract_id": contract_id, "nodes": [node_map[node_id] for node_id in ids],
+                "edges": visible_edges, "effective_terms": effective[contract_id],
+                "term_sources": sources[contract_id], "timeline": timeline}
 
     def get_review_feedback(self, contract_id: str, tenant_id: str) -> sqlite3.Row | None:
         with self.connect() as db:
@@ -3619,15 +3871,6 @@ def _add_months(value: date, months: int) -> date:
 
 def calculate_notice_deadline(expiration: date, notice_days: int, day_type: str, holidays: set[date] | None = None) -> date:
     """Calculate the action deadline using the explicit contract counting convention."""
-    if day_type == "calendar":
-        return date.fromordinal(expiration.toordinal() - notice_days)
-    if day_type != "business":
-        raise ValueError("notice_day_type must be 'calendar' or 'business'")
-    current = expiration
-    holidays = holidays or set()
-    remaining = notice_days
-    while remaining:
-        current = date.fromordinal(current.toordinal() - 1)
-        if current.weekday() < 5 and current not in holidays:
-            remaining -= 1
-    return current
+    return date.fromisoformat(calculate_deadline(
+        expiration, notice_days, day_type, holidays=holidays,
+    )["due_date"])

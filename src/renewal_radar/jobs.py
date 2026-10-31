@@ -48,6 +48,16 @@ def enqueue_calendar_sync(store: Store, tenant_id: str) -> dict:
     return job_record(row)
 
 
+def enqueue_procurement_sync(store: Store, tenant_id: str) -> dict:
+    row = store.enqueue_job(
+        tenant_id, "procurement.sync", {"tenant_id": tenant_id},
+        f"procurement-sync:{tenant_id}:{date.today().isoformat()}:{uuid4()}", max_attempts=_max_attempts(),
+    )
+    if row["status"] == "dead":
+        row = store.retry_dead_job(row["id"], tenant_id) or row
+    return job_record(row)
+
+
 def enqueue_retention_run(store: Store, tenant_id: str, retention_days: int) -> dict:
     day = date.today().isoformat()
     row = store.enqueue_job(
@@ -88,6 +98,9 @@ def process_jobs(store: Store, limit: int = 20, worker_id: str | None = None, jo
                 result = run_reminders(store, today=as_of, tenant_id=job["tenant_id"])
             elif job["job_type"] == "calendar.sync":
                 result = sync_calendar(store, job["tenant_id"])
+            elif job["job_type"] == "procurement.sync":
+                from .procurement_sync import sync_procurement
+                result = sync_procurement(store, job["tenant_id"])
             elif job["job_type"] == "retention.purge":
                 result = {"contracts_redacted": store.redact_expired_contracts(int(payload["retention_days"]), tenant_id=job["tenant_id"])}
             elif job["job_type"] == "document_sources.sync":

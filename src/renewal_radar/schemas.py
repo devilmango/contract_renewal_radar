@@ -53,6 +53,8 @@ class ContractData(BaseModel):
     notice_day_type: Literal["calendar", "business"] = "calendar"
     notice_timezone: str = "UTC"
     notice_holidays: list[date] = Field(default_factory=list)
+    notice_jurisdiction: str | None = Field(default=None, max_length=32)
+    notice_weekend_days: list[int] = Field(default_factory=lambda: [5, 6], max_length=7)
     notice_method: str | None = Field(default=None, max_length=250)
     notice_recipient: str | None = Field(default=None, max_length=500)
     auto_renew: bool | None = None
@@ -78,13 +80,20 @@ class ContractData(BaseModel):
             raise ValueError("expiration_date must be after start_date")
         return self
 
+    @field_validator("notice_weekend_days")
+    @classmethod
+    def validate_weekend_days(cls, value: list[int]) -> list[int]:
+        if any(day < 0 or day > 6 for day in value) or len(set(value)) != len(value):
+            raise ValueError("notice_weekend_days must contain unique weekday numbers from 0 (Monday) to 6 (Sunday)")
+        return value
+
 
 class IntegrationConnectionRequest(BaseModel):
     """Tenant-owned provider configuration; credentials are encrypted before persistence."""
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    provider: Literal["google_calendar", "microsoft_calendar", "smtp", "microsoft_email", "gmail", "slack_webhook", "teams_webhook"]
+    provider: Literal["google_calendar", "microsoft_calendar", "smtp", "microsoft_email", "gmail", "slack_webhook", "teams_webhook", "coupa", "sap_ariba"]
     settings: dict[str, str] = Field(default_factory=dict, max_length=20)
     credentials: dict[str, str] = Field(default_factory=dict, max_length=20)
 
@@ -110,6 +119,33 @@ class ContractRecord(BaseModel):
 
 class ConfirmationRequest(BaseModel):
     contract: ContractData
+
+
+class ContractRelationshipRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    related_contract_id: str = Field(min_length=1, max_length=100)
+    relationship_type: Literal["master_of", "sow_under", "amendment_of", "renewal_of", "related_to"]
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class DeadlineCalculationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expiration_date: date
+    notice_days: int = Field(ge=0, le=3650)
+    day_type: Literal["calendar", "business"] = "calendar"
+    timezone: str = Field(default="UTC", max_length=64)
+    jurisdiction: str | None = Field(default=None, max_length=32)
+    holidays: list[date] = Field(default_factory=list, max_length=500)
+    weekend_days: list[int] = Field(default_factory=lambda: [5, 6], max_length=7)
+
+    @field_validator("weekend_days")
+    @classmethod
+    def validate_weekend_days(cls, value: list[int]) -> list[int]:
+        if any(day < 0 or day > 6 for day in value) or len(set(value)) != len(value):
+            raise ValueError("weekend_days must contain unique weekday numbers from 0 (Monday) to 6 (Sunday)")
+        return value
 
 
 class EscalationStep(BaseModel):
@@ -219,6 +255,8 @@ class ReminderTask(BaseModel):
     notice_day_type: Literal["calendar", "business"] = "calendar"
     notice_timezone: str = "UTC"
     notice_holidays: list[date] = Field(default_factory=list)
+    notice_jurisdiction: str | None = None
+    deadline_calculation: dict = Field(default_factory=dict)
     workflow_state: Literal["review", "needs_changes", "pending_approval", "notice_in_progress", "renewed", "terminated", "cancelled", "resolved"] = "review"
     kind: Literal["renewal", "obligation"] = "renewal"
 
