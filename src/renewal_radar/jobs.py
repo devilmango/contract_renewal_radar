@@ -58,11 +58,18 @@ def enqueue_procurement_sync(store: Store, tenant_id: str) -> dict:
     return job_record(row)
 
 
-def enqueue_retention_run(store: Store, tenant_id: str, retention_days: int) -> dict:
+def enqueue_retention_run(store: Store, tenant_id: str, retention_days: int | None = None) -> dict:
     day = date.today().isoformat()
+    payload = {"tenant_id": tenant_id}
+    if retention_days is not None:
+        payload["retention_days"] = retention_days
+        policy_version = f"legacy-{retention_days}"
+    else:
+        policy = store.get_data_retention_policy(tenant_id)
+        policy_version = policy["updated_at"] if policy else "unconfigured"
     row = store.enqueue_job(
-        tenant_id, "retention.purge", {"tenant_id": tenant_id, "retention_days": retention_days},
-        f"retention:{tenant_id}:{day}", max_attempts=_max_attempts(),
+        tenant_id, "retention.purge", payload,
+        f"retention:{tenant_id}:{day}:{policy_version}", max_attempts=_max_attempts(),
     )
     if row["status"] == "dead":
         row = store.retry_dead_job(row["id"], tenant_id) or row
@@ -102,7 +109,10 @@ def process_jobs(store: Store, limit: int = 20, worker_id: str | None = None, jo
                 from .procurement_sync import sync_procurement
                 result = sync_procurement(store, job["tenant_id"])
             elif job["job_type"] == "retention.purge":
-                result = {"contracts_redacted": store.redact_expired_contracts(int(payload["retention_days"]), tenant_id=job["tenant_id"])}
+                if payload.get("retention_days") is not None:
+                    result = {"contracts_redacted": store.redact_expired_contracts(int(payload["retention_days"]), tenant_id=job["tenant_id"])}
+                else:
+                    result = store.run_data_retention(job["tenant_id"])
             elif job["job_type"] == "document_sources.sync":
                 from .drive_ingestion import sync_document_sources
                 result = sync_document_sources(store, job["tenant_id"], provider=payload["provider"])

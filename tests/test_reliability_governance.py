@@ -142,6 +142,13 @@ def test_api_registers_durable_job_and_governance_routes(tmp_path):
     routes = {(route.path, tuple(sorted(route.methods or ()))) for route in app.routes}
     assert ("/jobs/{job_id}/retry", ("POST",)) in routes
     assert ("/data-retention/run", ("POST",)) in routes
+    assert ("/data-retention/policy", ("GET",)) in routes
+    assert ("/data-retention/policy", ("PUT",)) in routes
+    assert ("/audit/export", ("GET",)) in routes
+    assert ("/renewal-scenarios", ("GET",)) in routes
+    assert ("/data-governance", ("GET",)) in routes
+    assert ("/tasks/{task_id}/scenario-plans", ("POST",)) in routes
+    assert ("/tasks/{task_id}/scenario-plans", ("GET",)) in routes
     assert ("/access-history", ("GET",)) in routes
     assert ("/contracts/{contract_id}/legal-holds", ("GET",)) in routes
     assert ("/contracts/{contract_id}/legal-holds", ("POST",)) in routes

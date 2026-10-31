@@ -346,6 +346,28 @@ class RenewalDecisionReviewRequest(BaseModel):
     comment: str | None = Field(default=None, max_length=2000)
 
 
+class RenewalScenarioPlanRequest(BaseModel):
+    renewal_increase_pct: Decimal = Field(default=Decimal("0"), ge=Decimal("-100"), le=Decimal("1000"))
+    renegotiation_savings_pct: Decimal = Field(default=Decimal("10"), ge=Decimal("0"), le=Decimal("100"))
+    termination_transition_cost: Decimal = Field(default=Decimal("0"), ge=Decimal("0"), le=Decimal("1000000000000"))
+    horizon_months: int = Field(default=12, ge=1, le=60)
+    as_of_date: date | None = None
+    forecast_id: str | None = Field(default=None, max_length=100)
+    assumptions_note: str = Field(default="", max_length=5000)
+
+
+class DataRetentionPolicyRequest(BaseModel):
+    contract_days: int = Field(default=0, ge=0, le=36500)
+    evidence_days: int = Field(default=0, ge=0, le=36500)
+    provider_evaluation_days: int = Field(default=0, ge=0, le=36500)
+
+
+class DataRetentionPolicyRecord(DataRetentionPolicyRequest):
+    tenant_id: str
+    updated_by: str
+    updated_at: datetime
+
+
 class RenewalDecisionMilestoneRequest(BaseModel):
     title: str = Field(min_length=1, max_length=250)
     due_date: date | None = None

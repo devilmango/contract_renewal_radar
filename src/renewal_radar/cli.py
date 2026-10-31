@@ -99,11 +99,17 @@ def main() -> int:
         return 0
 
     if args.command == "run-retention":
-        retention_days = int(os.getenv("CONTRACT_RETENTION_DAYS", "0"))
-        if retention_days <= 0:
-            print(json.dumps({"error": "Set CONTRACT_RETENTION_DAYS to a positive number first."}), file=sys.stderr)
-            return 2
         store = Store()
+        policy = store.get_data_retention_policy(args.tenant_id)
+        if policy:
+            enabled = any(int(policy[key]) > 0 for key in ("contract_days", "evidence_days", "provider_evaluation_days"))
+            retention_days = None
+        else:
+            retention_days = int(os.getenv("CONTRACT_RETENTION_DAYS", "0"))
+            enabled = retention_days > 0
+        if not enabled:
+            print(json.dumps({"error": "Configure a positive tenant retention period or set CONTRACT_RETENTION_DAYS."}), file=sys.stderr)
+            return 2
         job = enqueue_retention_run(store, args.tenant_id, retention_days)
         worker_result = process_jobs(store, limit=1, job_id=job["id"])
         current = store.get_job(job["id"], args.tenant_id)

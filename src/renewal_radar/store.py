@@ -232,6 +232,35 @@ class Store:
                     actor TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS renewal_scenario_plans (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    contract_id TEXT NOT NULL REFERENCES contracts(id),
+                    task_id TEXT NOT NULL REFERENCES tasks(id),
+                    forecast_run_id TEXT REFERENCES renewal_forecast_runs(id),
+                    assumptions_json TEXT NOT NULL,
+                    results_json TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS data_retention_policies (
+                    tenant_id TEXT PRIMARY KEY,
+                    contract_days INTEGER NOT NULL DEFAULT 0,
+                    evidence_days INTEGER NOT NULL DEFAULT 0,
+                    provider_evaluation_days INTEGER NOT NULL DEFAULT 0,
+                    updated_by TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS governance_audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    entity_id TEXT,
+                    actor TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     contract_id TEXT NOT NULL REFERENCES contracts(id),
@@ -691,6 +720,8 @@ class Store:
             db.execute("CREATE INDEX IF NOT EXISTS idx_outcome_tenant_date ON renewal_outcomes(tenant_id, recorded_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_forecast_tenant_date ON renewal_forecast_runs(tenant_id, recorded_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_forecast_lines_contract ON renewal_forecast_lines(tenant_id, contract_id)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_scenario_tenant_task ON renewal_scenario_plans(tenant_id,task_id,created_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_governance_audit_tenant_time ON governance_audit_events(tenant_id,created_at)")
             if self.is_postgres:
                 db.execute("ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS risk_level TEXT NOT NULL DEFAULT 'medium'")
             else:
@@ -1991,6 +2022,136 @@ class Store:
             self._renewal_decision_event(db,tenant_id,decision_id,"created",{key:value for key,value in request.items() if key!="task_id"},actor,now)
             self.add_audit(db,task["contract_id"],"renewal.decision_created",actor,{"decision_id":decision_id,"task_id":task["id"],"strategy":request["strategy"],"forecast_id":forecast_id},tenant_id)
         return self.get_renewal_decision(decision_id,tenant_id)
+
+    def create_renewal_scenario_plan(self, task_id: str, tenant_id: str, actor: str,
+                                     assumptions: dict[str, Any]) -> dict[str, Any] | None:
+        """Save a deterministic, auditable comparison of renewal strategies for one task."""
+        as_of = assumptions.get("as_of_date") or date.today()
+        if isinstance(as_of, str):
+            as_of = date.fromisoformat(as_of)
+        horizon_months = int(assumptions.get("horizon_months", 12))
+        end_month = as_of.month - 1 + horizon_months
+        end_year = as_of.year + end_month // 12
+        end_month = end_month % 12 + 1
+        horizon_end = date(end_year, end_month, min(as_of.day, calendar.monthrange(end_year, end_month)[1])) - timedelta(days=1)
+        increase = Decimal(str(assumptions.get("renewal_increase_pct", 0))) / Decimal(100)
+        savings = Decimal(str(assumptions.get("renegotiation_savings_pct", 10))) / Decimal(100)
+        transition = Decimal(str(assumptions.get("termination_transition_cost", 0)))
+        plan_id, now = str(uuid4()), utc_now().isoformat()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT t.id AS task_id,t.contract_id,t.due_date,t.expiration_date,c.filename,c.confirmed_json,c.extracted_json,"
+                "c.supplier_id,s.name AS supplier_name,s.risk_level FROM tasks t JOIN contracts c ON c.id=t.contract_id "
+                "LEFT JOIN suppliers s ON s.id=c.supplier_id AND s.tenant_id=c.tenant_id "
+                "WHERE t.id=? AND t.tenant_id=? AND t.task_kind='renewal'", (task_id, tenant_id),
+            ).fetchone()
+            if not row:
+                return None
+            terms = json.loads(row["confirmed_json"] or row["extracted_json"] or "{}")
+            annual_value = Decimal(str(terms["annual_contract_value"])) if terms.get("annual_contract_value") is not None else None
+            currency = terms.get("currency")
+            contract_start = date.fromisoformat(terms["start_date"]) if terms.get("start_date") else as_of
+            expiration = date.fromisoformat(terms["expiration_date"]) if terms.get("expiration_date") else date.fromisoformat(row["expiration_date"])
+            forecast_id = assumptions.get("forecast_id")
+            forecast_value = None
+            if forecast_id:
+                forecast = db.execute(
+                    "SELECT r.id,l.annual_contract_value,l.currency FROM renewal_forecast_runs r "
+                    "JOIN renewal_forecast_lines l ON l.run_id=r.id AND l.tenant_id=r.tenant_id "
+                    "WHERE r.id=? AND r.tenant_id=? AND l.contract_id=?",
+                    (forecast_id, tenant_id, row["contract_id"]),
+                ).fetchone()
+                if not forecast:
+                    raise ValueError("Forecast must be a saved tenant forecast that includes this contract")
+                forecast_value = {"annual_contract_value": forecast["annual_contract_value"], "currency": forecast["currency"]}
+            history = db.execute(
+                "SELECT r.id,r.period_start,r.period_end,l.annual_contract_value,l.currency,r.renewal_increase_pct,"
+                "r.renegotiation_savings_pct FROM renewal_forecast_runs r JOIN renewal_forecast_lines l "
+                "ON l.run_id=r.id AND l.tenant_id=r.tenant_id WHERE r.tenant_id=? AND l.contract_id=? "
+                "ORDER BY r.recorded_at DESC LIMIT 10", (tenant_id, row["contract_id"]),
+            ).fetchall()
+            outcomes = db.execute(
+                "SELECT outcome,actual_annual_value,annual_savings,currency,recorded_at FROM renewal_outcomes "
+                "WHERE tenant_id=? AND task_id IN (SELECT id FROM tasks WHERE contract_id=? AND tenant_id=?) "
+                "ORDER BY recorded_at DESC LIMIT 10", (tenant_id, row["contract_id"], tenant_id),
+            ).fetchall()
+            decision = db.execute("SELECT id FROM renewal_decisions WHERE task_id=? AND tenant_id=?", (task_id, tenant_id)).fetchone()
+            milestones = db.execute(
+                "SELECT title,due_date,completed FROM renewal_decision_milestones WHERE decision_id=? AND tenant_id=? ORDER BY due_date",
+                (decision["id"], tenant_id),
+            ).fetchall() if decision else []
+            baseline_cost = Decimal(0)
+            if annual_value is not None:
+                current_end = min(expiration, horizon_end)
+                current_start = max(as_of, contract_start)
+                if current_end >= current_start:
+                    current_days = (current_end - current_start).days + 1
+                    current_year_days = 366 if calendar.isleap(current_start.year) else 365
+                    baseline_cost = annual_value * Decimal(current_days) / Decimal(current_year_days)
+            renewal_start = max(as_of, expiration + timedelta(days=1))
+            tail_cost = Decimal(0)
+            if annual_value is not None and renewal_start <= horizon_end:
+                tail_days = (horizon_end - renewal_start).days + 1
+                tail_cost = annual_value * Decimal(tail_days) / Decimal(366 if calendar.isleap(renewal_start.year) else 365)
+            scenario_costs = {
+                "renew": baseline_cost + tail_cost * (Decimal(1) + increase),
+                "renegotiate": baseline_cost + tail_cost * (Decimal(1) - savings),
+                "terminate": baseline_cost + transition,
+            }
+            risk = row["risk_level"] or "unrated"
+            risk_implications = {
+                "renew": f"Continues supplier dependency at current risk rating ({risk}).",
+                "renegotiate": f"Continues supplier dependency at current risk rating ({risk}) while seeking lower spend.",
+                "terminate": f"Reduces supplier dependency; validate transition and continuity risks (current supplier rating: {risk}).",
+            }
+            deadline = date.fromisoformat(row["due_date"])
+            schedule = [{"title": item["title"], "due_date": item["due_date"], "completed": bool(item["completed"])} for item in milestones]
+            late_milestones = [item["title"] for item in schedule if item["due_date"] and date.fromisoformat(item["due_date"]) > deadline and not item["completed"]]
+            results = {
+                "contract_id": row["contract_id"], "contract": terms.get("contract") or row["filename"],
+                "supplier": row["supplier_name"], "supplier_risk": risk, "currency": currency,
+                "annual_contract_value": str(annual_value) if annual_value is not None else None,
+                "start_date": contract_start.isoformat(), "as_of_date": as_of.isoformat(), "horizon_end": horizon_end.isoformat(),
+                "expiration_date": expiration.isoformat(), "notice_deadline": deadline.isoformat(),
+                "scenarios": {key: {"projected_cost": (str(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if annual_value is not None else None),
+                                    "cost_complete": annual_value is not None,
+                                    "transition_cost": (str(transition.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if key == "terminate" else "0.00"),
+                                    "risk_implication": risk_implications[key]} for key, value in scenario_costs.items()},
+                "inputs": {"baseline_current_term_cost": str(baseline_cost.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+                           "post_expiration_baseline_cost": str(tail_cost.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+                           "forecast": forecast_value,
+                           "forecast_history": [dict(item) for item in history],
+                           "recorded_outcomes": [dict(item) for item in outcomes],
+                           "milestones": schedule,
+                           "milestone_warnings": ([f"Uncompleted milestone(s) fall after notice deadline: {', '.join(late_milestones)}"] if late_milestones else [])},
+                "method": "Calendar-day proration over an inclusive planning horizon; renewal increase and renegotiation savings apply after expiration; termination adds transition cost (assumed in the contract currency) and ends post-expiration contract spend. Projected cost is incomplete when annual contract value is missing.",
+            }
+            stored_assumptions = {**assumptions, "as_of_date": as_of.isoformat(),
+                                  "renewal_increase_pct": str(assumptions.get("renewal_increase_pct", 0)),
+                                  "renegotiation_savings_pct": str(assumptions.get("renegotiation_savings_pct", 10)),
+                                  "termination_transition_cost": str(transition), "horizon_months": horizon_months}
+            db.execute("INSERT INTO renewal_scenario_plans (id,tenant_id,contract_id,task_id,forecast_run_id,assumptions_json,results_json,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                       (plan_id,tenant_id,row["contract_id"],task_id,forecast_id,json.dumps(stored_assumptions),json.dumps(results,default=str),actor,now))
+            self.add_audit(db,row["contract_id"],"renewal.scenario_plan_created",actor,{"plan_id":plan_id,"task_id":task_id,"forecast_id":forecast_id,"assumptions":stored_assumptions},tenant_id)
+            self._governance_event(db,tenant_id,"renewal.scenario_plan_created","renewal_scenario_plan",plan_id,actor,{"contract_id":row["contract_id"],"task_id":task_id},now)
+        return self.get_renewal_scenario_plan(plan_id, tenant_id)
+
+    @staticmethod
+    def _scenario_plan_record(row) -> dict[str, Any]:
+        record = dict(row)
+        record["assumptions"] = json.loads(record.pop("assumptions_json"))
+        record["results"] = json.loads(record.pop("results_json"))
+        return record
+
+    def get_renewal_scenario_plan(self, plan_id: str, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM renewal_scenario_plans WHERE id=? AND tenant_id=?", (plan_id,tenant_id)).fetchone()
+        return self._scenario_plan_record(row) if row else None
+
+    def list_renewal_scenario_plans(self, task_id: str, tenant_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM renewal_scenario_plans WHERE task_id=? AND tenant_id=? ORDER BY created_at DESC",(task_id,tenant_id)).fetchall()
+        return [self._scenario_plan_record(row) for row in rows]
 
     @staticmethod
     def _renewal_decision_event(db, tenant_id: str, decision_id: str, event_type: str,
@@ -3664,6 +3825,91 @@ class Store:
             return db.execute(
                 "SELECT * FROM access_events WHERE tenant_id=? ORDER BY id DESC LIMIT ?", (tenant_id, limit),
             ).fetchall()
+
+    @staticmethod
+    def _governance_event(db, tenant_id: str, event_type: str, entity_type: str,
+                          entity_id: str | None, actor: str, details: dict[str, Any], now: str | None = None) -> None:
+        db.execute("INSERT INTO governance_audit_events (tenant_id,event_type,entity_type,entity_id,actor,details_json,created_at) VALUES (?,?,?,?,?,?,?)",
+                   (tenant_id,event_type,entity_type,entity_id,actor,json.dumps(details,default=str),now or utc_now().isoformat()))
+
+    def get_data_retention_policy(self, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM data_retention_policies WHERE tenant_id=?",(tenant_id,)).fetchone()
+        return dict(row) if row else None
+
+    def save_data_retention_policy(self, tenant_id: str, config: dict[str, Any], actor: str) -> dict[str, Any]:
+        now = utc_now().isoformat()
+        with self.connect() as db:
+            prior = db.execute("SELECT * FROM data_retention_policies WHERE tenant_id=?",(tenant_id,)).fetchone()
+            db.execute("INSERT INTO data_retention_policies (tenant_id,contract_days,evidence_days,provider_evaluation_days,updated_by,updated_at) VALUES (?,?,?,?,?,?) "
+                       "ON CONFLICT(tenant_id) DO UPDATE SET contract_days=excluded.contract_days,evidence_days=excluded.evidence_days,provider_evaluation_days=excluded.provider_evaluation_days,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+                       (tenant_id,int(config["contract_days"]),int(config["evidence_days"]),int(config["provider_evaluation_days"]),actor,now))
+            self._governance_event(db,tenant_id,"data_retention.policy_updated","retention_policy",tenant_id,actor,
+                                   {"before":dict(prior) if prior else None,"after":config},now)
+        return self.get_data_retention_policy(tenant_id) or {}
+
+    def run_data_retention(self, tenant_id: str, actor: str = "system") -> dict[str, int]:
+        policy = self.get_data_retention_policy(tenant_id)
+        result = {"contracts_redacted":0,"evidence_deleted":0,"provider_evaluations_deleted":0}
+        if not policy:
+            return result
+        if int(policy["contract_days"]) > 0:
+            result["contracts_redacted"] = self.redact_expired_contracts(int(policy["contract_days"]),actor,tenant_id)
+        with self.connect() as db:
+            now = utc_now().isoformat()
+            evidence_days = int(policy["evidence_days"])
+            if evidence_days > 0:
+                cutoff = (utc_now() - timedelta(days=evidence_days)).isoformat()
+                expired = db.execute("SELECT e.id,e.obligation_id,o.contract_id FROM obligation_evidence e "
+                                     "JOIN contract_obligations o ON o.id=e.obligation_id AND o.tenant_id=e.tenant_id "
+                                     "WHERE e.tenant_id=? AND e.created_at<=? AND NOT EXISTS (SELECT 1 FROM legal_holds h "
+                                     "WHERE h.contract_id=o.contract_id AND h.tenant_id=o.tenant_id AND h.released_at IS NULL)",
+                                     (tenant_id,cutoff)).fetchall()
+                for item in expired:
+                    db.execute("DELETE FROM obligation_evidence WHERE id=? AND tenant_id=?",(item["id"],tenant_id))
+                    self.add_audit(db,item["contract_id"],"obligation.evidence_purged",actor,
+                                   {"evidence_id":item["id"],"obligation_id":item["obligation_id"]},tenant_id)
+                    self._governance_event(db,tenant_id,"obligation.evidence_purged","evidence",item["id"],actor,
+                                           {"contract_id":item["contract_id"],"obligation_id":item["obligation_id"]},now)
+                    result["evidence_deleted"] += 1
+            evaluation_days = int(policy["provider_evaluation_days"])
+            if evaluation_days > 0:
+                cutoff = (utc_now() - timedelta(days=evaluation_days)).isoformat()
+                rows = db.execute("SELECT id,provider,model,created_at FROM provider_evaluation_runs WHERE tenant_id=? AND created_at<=?",(tenant_id,cutoff)).fetchall()
+                for item in rows:
+                    self._governance_event(db,tenant_id,"provider_evaluation.purged","provider_evaluation",item["id"],actor,
+                                           {"provider":item["provider"],"model":item["model"],"created_at":item["created_at"]},now)
+                    db.execute("DELETE FROM provider_evaluation_runs WHERE id=? AND tenant_id=?",(item["id"],tenant_id))
+                    result["provider_evaluations_deleted"] += 1
+        return result
+
+    def audit_export_rows(self, tenant_id: str, actor: str, from_date: date | None = None,
+                          to_date: date | None = None) -> list[dict[str, Any]]:
+        """Export tenant audit metadata only; source text and evidence payloads are excluded."""
+        start = from_date.isoformat()+"T00:00:00" if from_date else None
+        end = (to_date+timedelta(days=1)).isoformat()+"T00:00:00" if to_date else None
+        with self.connect() as db:
+            self._governance_event(db,tenant_id,"audit.exported","tenant",tenant_id,actor,
+                                   {"from_date":from_date,"to_date":to_date})
+            output: list[dict[str, Any]] = []
+            def allowed(stamp: str) -> bool:
+                return (not start or stamp >= start) and (not end or stamp < end)
+            for row in db.execute("SELECT contract_id,event_type,actor,details_json,created_at FROM audit_events WHERE tenant_id=? ORDER BY id",(tenant_id,)).fetchall():
+                if allowed(row["created_at"]):
+                    output.append({"source":"contract_audit","entity_type":"contract","entity_id":row["contract_id"],"event_type":row["event_type"],"actor":row["actor"],"details":json.loads(row["details_json"]),"created_at":row["created_at"]})
+            for row in db.execute("SELECT event_type,entity_type,entity_id,actor,details_json,created_at FROM governance_audit_events WHERE tenant_id=? ORDER BY id",(tenant_id,)).fetchall():
+                if allowed(row["created_at"]):
+                    output.append({"source":"governance_audit","entity_type":row["entity_type"],"entity_id":row["entity_id"],"event_type":row["event_type"],"actor":row["actor"],"details":json.loads(row["details_json"]),"created_at":row["created_at"]})
+            for row in db.execute("SELECT h.obligation_id,h.task_id,h.outcome,h.comment,h.actor,h.evidence_id,h.created_at,o.contract_id FROM obligation_compliance_history h JOIN contract_obligations o ON o.id=h.obligation_id AND o.tenant_id=h.tenant_id WHERE h.tenant_id=? ORDER BY h.id",(tenant_id,)).fetchall():
+                if allowed(row["created_at"]):
+                    output.append({"source":"obligation_compliance","entity_type":"evidence","entity_id":row["evidence_id"],"contract_id":row["contract_id"],"event_type":row["outcome"],"actor":row["actor"],"details":{"obligation_id":row["obligation_id"],"task_id":row["task_id"],"comment":row["comment"]},"created_at":row["created_at"]})
+            for row in db.execute("SELECT id,provider,model,dataset_fingerprint,cases_scored,exact_accuracy,evidence_support_accuracy,clause_accuracy,amendment_comparison_accuracy,created_by,created_at FROM provider_evaluation_runs WHERE tenant_id=? ORDER BY created_at",(tenant_id,)).fetchall():
+                if allowed(row["created_at"]):
+                    output.append({"source":"provider_evaluation","entity_type":"provider_evaluation","entity_id":row["id"],"event_type":"evaluation.recorded","actor":row["created_by"],"details":{key:row[key] for key in ("provider","model","dataset_fingerprint","cases_scored","exact_accuracy","evidence_support_accuracy","clause_accuracy","amendment_comparison_accuracy")},"created_at":row["created_at"]})
+            for row in db.execute("SELECT actor,action,entity_type,entity_id,accessed_at FROM access_events WHERE tenant_id=? ORDER BY id",(tenant_id,)).fetchall():
+                if allowed(row["accessed_at"]):
+                    output.append({"source":"access_audit","entity_type":row["entity_type"],"entity_id":row["entity_id"],"event_type":row["action"],"actor":row["actor"],"details":{},"created_at":row["accessed_at"]})
+        return sorted(output,key=lambda item:item["created_at"])
 
     def place_legal_hold(self, contract_id: str, tenant_id: str, actor: str, reason: str) -> sqlite3.Row | None:
         hold_id = str(uuid4())
