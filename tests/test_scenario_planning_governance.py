@@ -1,12 +1,19 @@
 import base64
+import io
 import json
 import sqlite3
+import sys
+import zipfile
 from datetime import date
 from decimal import Decimal
+import pytest
+from renewal_radar import cli
 
 from renewal_radar.schemas import ContractData
 from renewal_radar.store import Store
 from renewal_radar.jobs import enqueue_retention_run, process_jobs
+from renewal_radar.audit_archive import build_audit_archive, verify_audit_archive
+from renewal_radar.cli import main as cli_main
 
 
 def _contract(store, contract_id="agreement", tenant="acme"):
@@ -73,6 +80,134 @@ def test_scenario_sensitivity_returns_bounded_transparent_comparisons(tmp_path):
     assert row["calculation_components"]["formula"].startswith("renew = current term")
     assert row["assumptions"]["horizon_months"] == 12
     assert store.list_renewal_scenario_plans(task_id, "acme") == []
+
+
+def test_selected_scenario_links_to_approved_decision_and_scores_actual_outcome(tmp_path):
+    store = Store(str(tmp_path / "scenario-feedback.db"))
+    _terms, task_id = _contract(store)
+    plan = store.create_renewal_scenario_plan(task_id, "acme", "reviewer", {
+        "renewal_increase_pct": Decimal("5"), "renegotiation_savings_pct": Decimal("10"),
+        "termination_transition_cost": Decimal("2500"), "horizon_months": 24,
+        "as_of_date": date(2026, 1, 1),
+    })
+    decision = store.create_renewal_decision({
+        "task_id": task_id, "strategy": "negotiate", "reason": "Use the negotiated option",
+    }, "reviewer", "acme")
+    linked = store.update_renewal_decision(decision["id"], "acme", "reviewer", {
+        "scenario_plan_id": plan["id"],
+    })
+    assert linked["scenario_plan"]["id"] == plan["id"]
+
+    assert store.update_renewal_decision(decision["id"], "other", "reviewer", {
+        "scenario_plan_id": plan["id"],
+    }) is None
+    _other_terms, other_task_id = _contract(store, "other-agreement")
+    other_plan = store.create_renewal_scenario_plan(other_task_id, "acme", "reviewer", {
+        "renewal_increase_pct": Decimal("0"), "horizon_months": 12,
+        "as_of_date": date(2026, 1, 1),
+    })
+    with pytest.raises(ValueError, match="belong to this renewal task"):
+        store.update_renewal_decision(decision["id"], "acme", "reviewer", {
+            "scenario_plan_id": other_plan["id"],
+        })
+
+    store.submit_renewal_decision(decision["id"], "acme", "reviewer")
+    approved = store.review_renewal_decision(decision["id"], "acme", "approver", True, "Approved")
+    assert approved["scenario_plan_id"] == plan["id"]
+    recorded = store.complete_renewal_decision(decision["id"], "acme", {
+        "outcome": "renegotiated", "actual_annual_value": Decimal("10500"),
+        "annual_savings": Decimal("1500"), "currency": "USD",
+        "actual_expiration_date": date(2028, 1, 1),
+    }, "reviewer")
+    assert recorded["outcome_feedback"]["annual_value_variance"] == "-300.00"
+
+    completed = store.get_renewal_decision(decision["id"], "acme")
+    feedback = completed["outcome_feedback"]
+    assert feedback["scenario_plan_id"] == plan["id"]
+    assert feedback["decision_matches_outcome"] is True
+    assert feedback["predicted_annual_value"] == "10800.00"
+    assert feedback["annual_value_variance"] == "-300.00"
+    assert feedback["predicted_annual_savings"] == "1200.00"
+    assert feedback["annual_savings_variance"] == "300.00"
+    assert feedback["annual_price_change_variance"] == "-300.00"
+    assert feedback["assumed_adjustment_pct"] == "-10.00"
+    assert feedback["actual_adjustment_pct"] == "-12.50"
+    assert feedback["adjustment_variance_percentage_points"] == "-2.50"
+    summary = store.renewal_scenario_outcome_feedback("acme")
+    assert summary["linked_outcome_count"] == 1
+    metric = summary["by_supplier_and_scenario"][0]
+    assert metric["mean_absolute_annual_value_error"] == "300.00"
+    assert metric["mean_adjustment_error_percentage_points"] == "-2.50"
+    assert store.renewal_scenario_outcome_feedback("other")["linked_outcome_count"] == 0
+
+
+def test_audit_archive_manifest_verification_and_cli_detect_tampering(tmp_path, monkeypatch, capsys):
+    store = Store(str(tmp_path / "audit-archive.db"))
+    _terms, _task_id = _contract(store)
+    rows = store.audit_export_rows("acme", "auditor")
+    payload = build_audit_archive(rows, "acme", "2026-01-01", "2026-12-31")
+    archive_path = tmp_path / "audit.zip"
+    archive_path.write_bytes(payload)
+
+    verified = verify_audit_archive(archive_path)
+    assert verified["valid"] is True
+    assert verified["record_count"] == len(rows)
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        original = archive.read("audit-records.jsonl")
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("audit-records.jsonl", original + b'{"tampered":true}\n')
+        with zipfile.ZipFile(io.BytesIO(payload)) as source:
+            archive.writestr("manifest.json", source.read("manifest.json"))
+    assert verify_audit_archive(archive_path)["valid"] is False
+
+    monkeypatch.setattr(sys, "argv", ["renewal-radar", "verify-audit-archive", str(archive_path)])
+    assert cli_main() == 1
+    assert json.loads(capsys.readouterr().out)["valid"] is False
+
+
+def test_termination_feedback_compares_recorded_transition_cost(tmp_path):
+    store = Store(str(tmp_path / "termination-feedback.db"))
+    _terms, task_id = _contract(store)
+    plan = store.create_renewal_scenario_plan(task_id, "acme", "reviewer", {
+        "termination_transition_cost": Decimal("2500"), "horizon_months": 18,
+        "as_of_date": date(2026, 1, 1),
+    })
+    decision = store.create_renewal_decision({
+        "task_id": task_id, "strategy": "terminate", "reason": "Switch providers",
+    }, "reviewer", "acme")
+    store.update_renewal_decision(decision["id"], "acme", "reviewer", {"scenario_plan_id": plan["id"]})
+    store.submit_renewal_decision(decision["id"], "acme", "reviewer")
+    store.review_renewal_decision(decision["id"], "acme", "approver", True, None)
+    store.complete_renewal_decision(decision["id"], "acme", {
+        "outcome": "terminated", "actual_transition_cost": Decimal("3250"), "currency": "USD",
+    }, "reviewer")
+    feedback = store.get_renewal_decision(decision["id"], "acme")["outcome_feedback"]
+    assert feedback["predicted_transition_cost"] == "2500.00"
+    assert feedback["actual_transition_cost"] == "3250.00"
+    assert feedback["transition_cost_variance"] == "750.00"
+
+
+def test_audit_archive_rejects_overwrite_for_cli_output(tmp_path, monkeypatch, capsys):
+    archive_path = tmp_path / "already-there.zip"
+    archive_path.write_bytes(b"preserve")
+    monkeypatch.setattr(sys, "argv", ["renewal-radar", "export-audit-archive", "--output", str(archive_path)])
+    assert cli_main() == 2
+    assert archive_path.read_bytes() == b"preserve"
+
+
+def test_cli_exports_audit_archive_that_passes_its_verifier(tmp_path, monkeypatch, capsys):
+    store = Store(str(tmp_path / "cli-export.db"))
+    _terms, _task_id = _contract(store)
+    archive_path = tmp_path / "tenant-archive.zip"
+    monkeypatch.setattr(cli, "Store", lambda: store)
+    monkeypatch.setattr(sys, "argv", [
+        "renewal-radar", "export-audit-archive", "--tenant-id", "acme",
+        "--from-date", "2026-01-01", "--to-date", "2026-12-31", "--output", str(archive_path),
+    ])
+    assert cli_main() == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["tenant_id"] == "acme"
+    assert verify_audit_archive(archive_path)["valid"] is True
 
 
 def test_retention_policy_upgrade_adds_version_to_existing_database(tmp_path):

@@ -274,6 +274,7 @@ class RenewalOutcomeRequest(BaseModel):
     outcome: Literal["renewed", "renegotiated", "terminated", "expired", "no_action"]
     actual_annual_value: Decimal | None = Field(default=None, ge=0, max_digits=16, decimal_places=2)
     annual_savings: Decimal | None = Field(default=None, ge=0, max_digits=16, decimal_places=2)
+    actual_transition_cost: Decimal | None = Field(default=None, ge=0, max_digits=16, decimal_places=2)
     currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
     successor_contract_id: str | None = Field(default=None, max_length=100)
     actual_expiration_date: date | None = None
@@ -281,7 +282,7 @@ class RenewalOutcomeRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_amount_currency(self) -> "RenewalOutcomeRequest":
-        if (self.actual_annual_value is not None or self.annual_savings is not None) and not self.currency:
+        if (self.actual_annual_value is not None or self.annual_savings is not None or self.actual_transition_cost is not None) and not self.currency:
             raise ValueError("currency is required when recording an actual value or savings")
         if self.outcome in {"renewed", "renegotiated"} and self.actual_expiration_date is None:
             raise ValueError("actual_expiration_date is required for renewed or renegotiated contracts")
@@ -316,6 +317,7 @@ class RenewalDecisionUpdateRequest(BaseModel):
     strategy: Literal["negotiate", "renew", "terminate"] | None = None
     reason: str | None = Field(default=None, max_length=5000)
     forecast_id: str | None = Field(default=None, max_length=100)
+    scenario_plan_id: str | None = Field(default=None, max_length=100)
     owner_name: str | None = Field(default=None, max_length=150)
     owner_email: str | None = Field(default=None, max_length=320)
     target_date: date | None = None

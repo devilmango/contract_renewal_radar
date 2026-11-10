@@ -1,12 +1,14 @@
 from datetime import date
+from io import BytesIO
 import json
 import sqlite3
+import zipfile
 
 import pytest
 
 from renewal_radar import jobs
 from renewal_radar.api import create_app
-from renewal_radar.auth import AuthRegistry
+from renewal_radar.auth import AuthRegistry, Principal
 from renewal_radar.evaluation import _evidence_supports, load_cases
 from renewal_radar.extractor import ExtractionError, RulesExtractor, get_extractor
 from renewal_radar.schemas import ContractData
@@ -148,6 +150,8 @@ def test_api_registers_durable_job_and_governance_routes(tmp_path):
     assert ("/data-retention/receipts", ("GET",)) in routes
     assert ("/data-retention/receipts/{receipt_id}", ("GET",)) in routes
     assert ("/audit/export", ("GET",)) in routes
+    assert ("/audit/archive", ("GET",)) in routes
+    assert ("/renewal-scenario-feedback", ("GET",)) in routes
     assert ("/renewal-scenarios", ("GET",)) in routes
     assert ("/renewal-sensitivity", ("GET",)) in routes
     assert ("/data-governance", ("GET",)) in routes
@@ -157,3 +161,17 @@ def test_api_registers_durable_job_and_governance_routes(tmp_path):
     assert ("/access-history", ("GET",)) in routes
     assert ("/contracts/{contract_id}/legal-holds", ("GET",)) in routes
     assert ("/contracts/{contract_id}/legal-holds", ("POST",)) in routes
+
+    reviewer = Principal("auditor", frozenset({"reviewer"}), tenant_id="acme")
+    archive_route = next(route.endpoint for route in app.routes if route.path == "/audit/archive")
+    response = archive_route(principal=reviewer)
+    assert response.media_type == "application/zip"
+    with zipfile.ZipFile(BytesIO(response.body)) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        assert manifest["tenant_id"] == "acme"
+        assert manifest["records_file"] == "audit-records.jsonl"
+
+    feedback_route = next(route.endpoint for route in app.routes if route.path == "/renewal-scenario-feedback")
+    assert feedback_route(principal=reviewer)["linked_outcome_count"] == 0
+    page_route = next(route.endpoint for route in app.routes if route.path == "/renewal-decisions/workspace")
+    assert "Link scenario comparison" in page_route().body.decode()

@@ -151,6 +151,7 @@ class Store:
                     outcome TEXT NOT NULL,
                     actual_annual_value TEXT,
                     annual_savings TEXT,
+                    actual_transition_cost TEXT,
                     currency TEXT,
                     successor_contract_id TEXT REFERENCES contracts(id),
                     actual_expiration_date TEXT,
@@ -183,6 +184,7 @@ class Store:
                     contract_id TEXT NOT NULL REFERENCES contracts(id),
                     task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
                     forecast_run_id TEXT REFERENCES renewal_forecast_runs(id),
+                    scenario_plan_id TEXT,
                     strategy TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'draft',
                     reason TEXT NOT NULL,
@@ -660,6 +662,8 @@ class Store:
                 db.execute("ALTER TABLE renewal_playbooks ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'")
                 db.execute("ALTER TABLE task_playbook_reviews ADD COLUMN IF NOT EXISTS playbook_snapshot_json TEXT NOT NULL DEFAULT '{}'")
                 db.execute("ALTER TABLE data_retention_policies ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1")
+                db.execute("ALTER TABLE renewal_decisions ADD COLUMN IF NOT EXISTS scenario_plan_id TEXT")
+                db.execute("ALTER TABLE renewal_outcomes ADD COLUMN IF NOT EXISTS actual_transition_cost TEXT")
             else:
                 for table, column, declaration in (
                     ("notification_deliveries", "recipient", "TEXT"),
@@ -667,6 +671,8 @@ class Store:
                     ("renewal_playbooks", "status", "TEXT NOT NULL DEFAULT 'active'"),
                     ("task_playbook_reviews", "playbook_snapshot_json", "TEXT NOT NULL DEFAULT '{}'"),
                     ("data_retention_policies", "version", "INTEGER NOT NULL DEFAULT 1"),
+                    ("renewal_decisions", "scenario_plan_id", "TEXT"),
+                    ("renewal_outcomes", "actual_transition_cost", "TEXT"),
                 ):
                     columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
                     if column not in columns:
@@ -2244,11 +2250,108 @@ class Store:
             events = db.execute("SELECT * FROM renewal_decision_events WHERE decision_id=? AND tenant_id=? ORDER BY id",
                                 (row["id"],tenant_id)).fetchall()
             task = db.execute("SELECT title,due_date,expiration_date FROM tasks WHERE id=? AND tenant_id=?",(row["task_id"],tenant_id)).fetchone()
+            plan = None
+            if row["scenario_plan_id"]:
+                plan_row = db.execute(
+                    "SELECT * FROM renewal_scenario_plans WHERE id=? AND task_id=? AND tenant_id=?",
+                    (row["scenario_plan_id"], row["task_id"], tenant_id),
+                ).fetchone()
+                plan = self._scenario_plan_record(plan_row) if plan_row else None
+            outcome_row = db.execute(
+                "SELECT * FROM renewal_outcomes WHERE task_id=? AND tenant_id=?", (row["task_id"], tenant_id),
+            ).fetchone()
         decision["task"] = dict(task) if task else None
         decision["milestones"] = [{**dict(item),"completed":bool(item["completed"])} for item in milestones]
         decision["quotes"] = [dict(item) for item in quotes]
         decision["events"] = [{**dict(item),"details":json.loads(item["details_json"])} for item in events]
+        decision["scenario_plan"] = plan
+        decision["outcome"] = dict(outcome_row) if outcome_row else None
+        if plan and outcome_row:
+            feedback_outcome = dict(outcome_row)
+            feedback_outcome["decision_strategy"] = row["strategy"]
+            decision["outcome_feedback"] = self._scenario_outcome_feedback(plan, feedback_outcome)
+        else:
+            decision["outcome_feedback"] = None
         return decision
+
+    @staticmethod
+    def _scenario_outcome_feedback(plan: dict[str, Any], outcome: dict[str, Any]) -> dict[str, Any]:
+        """Compare a saved strategy estimate with the recorded result in the same currency."""
+        assumptions, results = plan["assumptions"], plan["results"]
+        strategy = {"renew": "renew", "negotiate": "renegotiate", "terminate": "terminate"}[
+            outcome.get("decision_strategy") or assumptions.get("strategy") or "renew"
+        ]
+        base_raw = results.get("annual_contract_value")
+        base = Decimal(str(base_raw)) if base_raw is not None else None
+        outcome_value = outcome.get("actual_annual_value")
+        actual_value = Decimal(str(outcome_value)) if outcome_value is not None else None
+        actual_savings_raw = outcome.get("annual_savings")
+        actual_savings = Decimal(str(actual_savings_raw)) if actual_savings_raw is not None else None
+        predicted_value = None
+        modeled_adjustment = None
+        if base is not None:
+            if strategy == "renew":
+                modeled_adjustment = Decimal(str(assumptions.get("renewal_increase_pct", 0)))
+                predicted_value = base * (Decimal(1) + modeled_adjustment / Decimal(100))
+            elif strategy == "renegotiate":
+                modeled_adjustment = -Decimal(str(assumptions.get("renegotiation_savings_pct", 10)))
+                predicted_value = base * (Decimal(1) + modeled_adjustment / Decimal(100))
+            else:
+                predicted_value = Decimal(0)
+
+        has_actual_money = any(value is not None for value in (actual_value, actual_savings, outcome.get("actual_transition_cost")))
+        same_currency = (outcome.get("currency") == results.get("currency")) if has_actual_money else True
+        annual_variance = actual_value - predicted_value if (
+            actual_value is not None and predicted_value is not None and same_currency and strategy != "terminate"
+        ) else None
+        actual_adjustment = ((actual_value / base - 1) * 100) if (
+            actual_value is not None and base is not None and base > 0 and same_currency and strategy != "terminate"
+        ) else ((-actual_savings / base) * 100 if actual_savings is not None and base is not None and base > 0 and same_currency and strategy == "renegotiate" else None)
+        modeled_annual_delta = predicted_value - base if predicted_value is not None and base is not None and strategy != "terminate" else None
+        actual_annual_delta = actual_value - base if actual_value is not None and base is not None and same_currency and strategy != "terminate" else (
+            -actual_savings if actual_savings is not None and base is not None and same_currency and strategy == "renegotiate" else None
+        )
+        annual_delta_variance = actual_annual_delta - modeled_annual_delta if actual_annual_delta is not None and modeled_annual_delta is not None else None
+        predicted_savings = base * Decimal(str(assumptions.get("renegotiation_savings_pct", 10))) / Decimal(100) if base is not None and strategy == "renegotiate" else None
+        savings_variance = actual_savings - predicted_savings if actual_savings is not None and predicted_savings is not None and same_currency else None
+        actual_transition = Decimal(str(outcome["actual_transition_cost"])) if outcome.get("actual_transition_cost") is not None else None
+        predicted_transition = Decimal(str(assumptions.get("termination_transition_cost", 0))) if strategy == "terminate" else None
+        transition_variance = actual_transition - predicted_transition if actual_transition is not None and predicted_transition is not None and same_currency else None
+
+        def money(value: Decimal | None) -> str | None:
+            return _money_string(value) if value is not None else None
+
+        def percent(value: Decimal | None) -> str | None:
+            return str(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if value is not None else None
+
+        actual_outcome = outcome.get("outcome")
+        expected_outcomes = {"renew": {"renewed"}, "renegotiate": {"renegotiated"},
+                             "terminate": {"terminated", "expired", "no_action"}}
+        return {
+            "scenario_plan_id": plan["id"], "scenario": strategy,
+            "outcome": actual_outcome,
+            "decision_matches_outcome": actual_outcome in expected_outcomes[strategy],
+            "currency": results.get("currency"), "actual_currency": outcome.get("currency"),
+            "currency_comparable": same_currency,
+            "assumed_adjustment_pct": percent(modeled_adjustment),
+            "actual_adjustment_pct": percent(actual_adjustment),
+            "adjustment_variance_percentage_points": percent(actual_adjustment - modeled_adjustment) if actual_adjustment is not None and modeled_adjustment is not None else None,
+            "predicted_annual_value": money(predicted_value),
+            "actual_annual_value": money(actual_value),
+            "annual_value_variance": money(annual_variance),
+            "annual_variance_direction": ("actual_above_estimate" if annual_variance > 0 else "actual_below_estimate" if annual_variance < 0 else "on_estimate") if annual_variance is not None else None,
+            "modeled_annual_price_change": money(modeled_annual_delta),
+            "actual_annual_price_change": money(actual_annual_delta),
+            "annual_price_change_variance": money(annual_delta_variance),
+            "predicted_annual_savings": money(predicted_savings),
+            "actual_annual_savings": money(actual_savings),
+            "annual_savings_variance": money(savings_variance),
+            "predicted_transition_cost": money(predicted_transition),
+            "actual_transition_cost": money(actual_transition),
+            "transition_cost_variance": money(transition_variance),
+            "projected_horizon_cost": results.get("scenarios", {}).get(strategy, {}).get("projected_cost"),
+            "comparison_note": "Annual values compare the selected scenario's modeled post-expiration value with the recorded actual annual value. Transition costs are compared only when an actual transition cost was recorded; horizon cost is shown as context because outcomes do not capture realized total spend over that horizon.",
+        }
 
     def list_renewal_decisions(self, tenant_id: str, status: str | None = None) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -2277,10 +2380,17 @@ class Store:
                                     (forecast_id,row["contract_id"],tenant_id)).fetchone()
                 if not linked:
                     raise ValueError("Forecast must be a saved tenant forecast that includes this contract")
+            if "scenario_plan_id" in changes and changes["scenario_plan_id"]:
+                scenario = db.execute(
+                    "SELECT assumptions_json FROM renewal_scenario_plans WHERE id=? AND task_id=? AND tenant_id=?",
+                    (changes["scenario_plan_id"], row["task_id"], tenant_id),
+                ).fetchone()
+                if not scenario:
+                    raise ValueError("Scenario plan must belong to this renewal task and organization")
             assignments, params = [], []
             for key,value in changes.items():
                 column = "forecast_run_id" if key == "forecast_id" else key
-                if column not in {"strategy","reason","forecast_run_id","owner_name","owner_email","target_date"}:
+                if column not in {"strategy","reason","forecast_run_id","scenario_plan_id","owner_name","owner_email","target_date"}:
                     continue
                 assignments.append(f"{column}=?")
                 params.append(iso(value) if key == "target_date" else value)
@@ -2387,10 +2497,12 @@ class Store:
             if successor and not db.execute("SELECT 1 FROM contracts WHERE id=? AND tenant_id=?",(successor,tenant_id)).fetchone():
                 raise ValueError("Successor contract must belong to this organization")
             workflow="renewed" if request["outcome"] in {"renewed","renegotiated"} else "cancelled" if request["outcome"]=="no_action" else "terminated"
-            db.execute("INSERT INTO renewal_outcomes (task_id,tenant_id,contract_id,outcome,actual_annual_value,annual_savings,currency,successor_contract_id,actual_expiration_date,notes,recorded_by,recorded_at) "
-                       "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            db.execute("INSERT INTO renewal_outcomes (task_id,tenant_id,contract_id,outcome,actual_annual_value,annual_savings,actual_transition_cost,currency,successor_contract_id,actual_expiration_date,notes,recorded_by,recorded_at) "
+                       "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                        (task["id"],tenant_id,decision["contract_id"],request["outcome"],str(request["actual_annual_value"]) if request.get("actual_annual_value") is not None else None,
-                        str(request["annual_savings"]) if request.get("annual_savings") is not None else None,request.get("currency"),successor,
+                        str(request["annual_savings"]) if request.get("annual_savings") is not None else None,
+                        str(request["actual_transition_cost"]) if request.get("actual_transition_cost") is not None else None,
+                        request.get("currency"),successor,
                         iso(request.get("actual_expiration_date")),request.get("notes"),actor,now))
             db.execute("UPDATE tasks SET status='resolved',workflow_state=? WHERE id=? AND tenant_id=?",(workflow,task["id"],tenant_id))
             db.execute("UPDATE renewal_decisions SET status='completed',updated_at=? WHERE id=? AND tenant_id=?",(now,decision_id,tenant_id))
@@ -2400,7 +2512,11 @@ class Store:
             self.add_audit(db,decision["contract_id"],"renewal.outcome_recorded",actor,details,tenant_id)
         with self.connect() as db:
             row=db.execute("SELECT * FROM renewal_outcomes WHERE task_id=? AND tenant_id=?",(decision["task_id"],tenant_id)).fetchone()
-        return dict(row)
+        outcome_record = dict(row)
+        decision_record = self.get_renewal_decision(decision_id, tenant_id)
+        if decision_record and decision_record.get("outcome_feedback"):
+            outcome_record["outcome_feedback"] = decision_record["outcome_feedback"]
+        return outcome_record
 
     def record_renewal_outcome(self, task_id: str, request: dict[str, Any], actor: str, tenant_id: str) -> dict[str, Any] | None:
         with self.connect() as db:
@@ -2428,11 +2544,12 @@ class Store:
             workflow_state = "renewed" if outcome in {"renewed", "renegotiated"} else "cancelled" if outcome == "no_action" else "terminated"
             now = utc_now().isoformat()
             db.execute(
-                "INSERT INTO renewal_outcomes (task_id,tenant_id,contract_id,outcome,actual_annual_value,annual_savings,currency,successor_contract_id,actual_expiration_date,notes,recorded_by,recorded_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO renewal_outcomes (task_id,tenant_id,contract_id,outcome,actual_annual_value,annual_savings,actual_transition_cost,currency,successor_contract_id,actual_expiration_date,notes,recorded_by,recorded_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (task_id, tenant_id, task["contract_id"], outcome,
                  str(request["actual_annual_value"]) if request.get("actual_annual_value") is not None else None,
                  str(request["annual_savings"]) if request.get("annual_savings") is not None else None,
+                 str(request["actual_transition_cost"]) if request.get("actual_transition_cost") is not None else None,
                  request.get("currency"), successor_id, iso(request.get("actual_expiration_date")),
                  request.get("notes"), actor, now),
             )
@@ -2445,7 +2562,15 @@ class Store:
             details = {key: value for key, value in request.items() if key != "notes"}
             details["task_id"] = task_id
             self.add_audit(db, task["contract_id"], "renewal.outcome_recorded", actor, details, tenant_id)
-            return dict(db.execute("SELECT * FROM renewal_outcomes WHERE task_id=?", (task_id,)).fetchone())
+        with self.connect() as db:
+            outcome_record = dict(db.execute(
+                "SELECT * FROM renewal_outcomes WHERE task_id=? AND tenant_id=?", (task_id, tenant_id),
+            ).fetchone())
+        if decision:
+            decision_record = self.get_renewal_decision(decision["id"], tenant_id)
+            if decision_record and decision_record.get("outcome_feedback"):
+                outcome_record["outcome_feedback"] = decision_record["outcome_feedback"]
+        return outcome_record
 
     def record_renewal_forecast(self, tenant_id: str, forecast: dict[str, Any], actor: str) -> str:
         """Persist a reviewer-generated forecast so later outcomes can be scored against it."""
@@ -2541,6 +2666,50 @@ class Store:
                 "renegotiation_savings_pct": _percent_string(median(savings)) if savings else None,
                 "renewal_samples": len(increases), "renegotiation_samples": len(savings),
             },
+        }
+
+    def renewal_scenario_outcome_feedback(self, tenant_id: str) -> dict[str, Any]:
+        """Summarize observed error for scenario plans explicitly linked to completed decisions."""
+        decisions = self.list_renewal_decisions(tenant_id, "completed")
+        groups: dict[tuple[str | None, str, str | None], list[dict[str, Any]]] = {}
+        unlinked = 0
+        for decision in decisions:
+            feedback = decision.get("outcome_feedback")
+            if not feedback:
+                unlinked += 1
+                continue
+            supplier = decision.get("scenario_plan", {}).get("results", {}).get("supplier")
+            key = (supplier, feedback["scenario"], feedback.get("currency"))
+            groups.setdefault(key, []).append(feedback)
+
+        def mean(values: list[Decimal]) -> str | None:
+            return _money_string(sum(values, Decimal(0)) / len(values)) if values else None
+
+        metrics = []
+        for (supplier, scenario, currency), rows in sorted(
+            groups.items(), key=lambda item: (item[0][0] or "", item[0][1], item[0][2] or ""),
+        ):
+            annual_errors = [Decimal(row["annual_value_variance"]) for row in rows if row.get("annual_value_variance") is not None]
+            adjustment_errors = [Decimal(row["adjustment_variance_percentage_points"])
+                                 for row in rows if row.get("adjustment_variance_percentage_points") is not None]
+            transition_errors = [Decimal(row["transition_cost_variance"]) for row in rows if row.get("transition_cost_variance") is not None]
+            alignments = [row["decision_matches_outcome"] for row in rows]
+            metrics.append({
+                "supplier": supplier, "scenario": scenario, "currency": currency,
+                "outcome_count": len(rows),
+                "annual_value_comparison_count": len(annual_errors),
+                "mean_annual_value_variance": mean(annual_errors),
+                "mean_absolute_annual_value_error": mean([abs(value) for value in annual_errors]),
+                "mean_adjustment_error_percentage_points": str((sum(adjustment_errors, Decimal(0)) / len(adjustment_errors)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if adjustment_errors else None,
+                "mean_transition_cost_variance": mean(transition_errors),
+                "decision_outcome_alignment_rate": str((Decimal(sum(alignments)) / Decimal(len(alignments))).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)) if alignments else None,
+            })
+        return {
+            "completed_decision_count": len(decisions),
+            "linked_outcome_count": sum(len(rows) for rows in groups.values()),
+            "unlinked_outcome_count": unlinked,
+            "by_supplier_and_scenario": metrics,
+            "interpretation": "Annual value variance is actual minus estimated annual value; positive means actual spend exceeded the selected scenario estimate. Adjustment error is actual percentage change from the saved plan's baseline minus the assumed percentage change. Transition variance is actual minus assumed transition cost. Currency groups are never combined.",
         }
 
     def renewal_outcome_summary(self, tenant_id: str) -> dict[str, Any]:

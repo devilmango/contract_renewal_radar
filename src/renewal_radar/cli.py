@@ -5,9 +5,11 @@ import json
 import os
 import sys
 import time
+from datetime import date
 from pathlib import Path
 
 from .auth import SUPPORTED_ROLES, create_token_config
+from .audit_archive import build_audit_archive, verify_audit_archive
 from .drive_ingestion import DocumentSourceError, sync_document_sources
 from .evaluation import evaluate_extractor, load_cases
 from .extractor import configured_llm_providers, get_extractor
@@ -62,6 +64,19 @@ def main() -> int:
     )
     export_feedback.add_argument("--tenant-id", default="default")
     export_feedback.add_argument("--output", type=Path, required=True, help="Evaluation cases directory to receive approved JSON fixtures")
+
+    audit_archive = subparsers.add_parser(
+        "export-audit-archive", help="Write a tenant-scoped audit ZIP with a SHA-256 manifest (never overwrite)",
+    )
+    audit_archive.add_argument("--tenant-id", default="default")
+    audit_archive.add_argument("--from-date", type=date.fromisoformat)
+    audit_archive.add_argument("--to-date", type=date.fromisoformat)
+    audit_archive.add_argument("--output", type=Path, required=True, help="New .zip path; existing files are not overwritten")
+
+    verify_archive = subparsers.add_parser(
+        "verify-audit-archive", help="Verify the audit records in a checksummed archive against its manifest",
+    )
+    verify_archive.add_argument("archive", type=Path)
 
     args = parser.parse_args()
 
@@ -143,6 +158,42 @@ def main() -> int:
             exported += 1
         print(json.dumps({"tenant_id": args.tenant_id, "exported": exported, "directory": str(args.output)}, indent=2))
         return 0
+
+    if args.command == "export-audit-archive":
+        if args.from_date and args.to_date and args.to_date < args.from_date:
+            print(json.dumps({"error": "--to-date must be on or after --from-date"}), file=sys.stderr)
+            return 2
+        if args.output.exists():
+            print(json.dumps({"error": f"Refusing to overwrite existing archive: {args.output}"}), file=sys.stderr)
+            return 2
+        try:
+            store = Store()
+            rows = store.audit_export_rows(args.tenant_id, "cli-audit-archive", args.from_date, args.to_date)
+            archive = build_audit_archive(
+                rows, args.tenant_id,
+                args.from_date.isoformat() if args.from_date else None,
+                args.to_date.isoformat() if args.to_date else None,
+            )
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            with args.output.open("xb") as output:
+                output.write(archive)
+        except FileExistsError:
+            print(json.dumps({"error": f"Refusing to overwrite existing archive: {args.output}"}), file=sys.stderr)
+            return 2
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(json.dumps({"error": str(exc)}), file=sys.stderr)
+            return 2
+        print(json.dumps({"archive": str(args.output), "tenant_id": args.tenant_id, "record_count": len(rows)}, indent=2))
+        return 0
+
+    if args.command == "verify-audit-archive":
+        try:
+            result = verify_audit_archive(args.archive)
+        except ValueError as exc:
+            print(json.dumps({"valid": False, "error": str(exc)}, indent=2), file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2))
+        return 0 if result["valid"] else 1
 
     try:
         cases = load_cases(args.dataset)
