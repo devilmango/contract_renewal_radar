@@ -109,10 +109,10 @@ def process_jobs(store: Store, limit: int = 20, worker_id: str | None = None, jo
                 from .procurement_sync import sync_procurement
                 result = sync_procurement(store, job["tenant_id"])
             elif job["job_type"] == "retention.purge":
-                if payload.get("retention_days") is not None:
-                    result = {"contracts_redacted": store.redact_expired_contracts(int(payload["retention_days"]), tenant_id=job["tenant_id"])}
-                else:
-                    result = store.run_data_retention(job["tenant_id"])
+                result = store.run_data_retention(
+                    job["tenant_id"], legacy_contract_days=(int(payload["retention_days"])
+                    if payload.get("retention_days") is not None else None),
+                )
             elif job["job_type"] == "document_sources.sync":
                 from .drive_ingestion import sync_document_sources
                 result = sync_document_sources(store, job["tenant_id"], provider=payload["provider"])

@@ -356,6 +356,57 @@ class RenewalScenarioPlanRequest(BaseModel):
     assumptions_note: str = Field(default="", max_length=5000)
 
 
+class RenewalScenarioSensitivityRequest(BaseModel):
+    renewal_increase_pcts: list[Decimal] = Field(
+        default_factory=lambda: [Decimal("0"), Decimal("5"), Decimal("10")], min_length=1, max_length=12,
+    )
+    renegotiation_savings_pcts: list[Decimal] = Field(
+        default_factory=lambda: [Decimal("5"), Decimal("10"), Decimal("15")], min_length=1, max_length=12,
+    )
+    termination_transition_costs: list[Decimal] = Field(
+        default_factory=lambda: [Decimal("0"), Decimal("25000")], min_length=1, max_length=12,
+    )
+    horizon_months: list[int] = Field(default_factory=lambda: [12, 24, 36], min_length=1, max_length=12)
+    as_of_date: date | None = None
+    forecast_id: str | None = Field(default=None, max_length=100)
+
+    @field_validator("renewal_increase_pcts")
+    @classmethod
+    def validate_renewal_increase_axis(cls, values: list[Decimal]) -> list[Decimal]:
+        if any(value < -100 or value > 1000 for value in values):
+            raise ValueError("renewal increase values must be between -100 and 1000 percent")
+        return sorted(set(values))
+
+    @field_validator("renegotiation_savings_pcts")
+    @classmethod
+    def validate_savings_axis(cls, values: list[Decimal]) -> list[Decimal]:
+        if any(value < 0 or value > 100 for value in values):
+            raise ValueError("renegotiation savings values must be between 0 and 100 percent")
+        return sorted(set(values))
+
+    @field_validator("termination_transition_costs")
+    @classmethod
+    def validate_transition_axis(cls, values: list[Decimal]) -> list[Decimal]:
+        if any(value < 0 or value > Decimal("1000000000000") for value in values):
+            raise ValueError("transition costs must be between 0 and 1,000,000,000,000")
+        return sorted(set(values))
+
+    @field_validator("horizon_months")
+    @classmethod
+    def validate_horizon_axis(cls, values: list[int]) -> list[int]:
+        if any(value < 1 or value > 60 for value in values):
+            raise ValueError("planning horizons must be between 1 and 60 months")
+        return sorted(set(values))
+
+    @model_validator(mode="after")
+    def limit_sensitivity_matrix(self) -> "RenewalScenarioSensitivityRequest":
+        combinations = (len(self.renewal_increase_pcts) * len(self.renegotiation_savings_pcts)
+                        * len(self.termination_transition_costs) * len(self.horizon_months))
+        if combinations > 250:
+            raise ValueError("Sensitivity analysis is limited to 250 assumption combinations")
+        return self
+
+
 class DataRetentionPolicyRequest(BaseModel):
     contract_days: int = Field(default=0, ge=0, le=36500)
     evidence_days: int = Field(default=0, ge=0, le=36500)
@@ -364,6 +415,7 @@ class DataRetentionPolicyRequest(BaseModel):
 
 class DataRetentionPolicyRecord(DataRetentionPolicyRequest):
     tenant_id: str
+    version: int
     updated_by: str
     updated_at: datetime
 
