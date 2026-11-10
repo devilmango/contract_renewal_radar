@@ -57,6 +57,10 @@ An extraction is always a proposal. The service does not activate a contract or 
 - **Portfolio operations:** Bulk-assign task owners, move eligible tasks into review, associate contracts with suppliers, and export tenant-scoped portfolios as CSV or Excel workbooks.
 - **Provider drift monitoring:** Compare rules and configured LLM providers on the same redacted fixtures, including field accuracy, evidence support, amendment clause coverage, and provider-extracted amendment term changes; surface score drops against each provider's prior run.
 - **Contract-data governance:** Enforce an LLM provider allowlist, record authenticated access history, support legal holds, and redact eligible contract records on demand or by retention policy.
+- **Immutable audit archive storage:** Upload checksummed audit ZIPs to versioned S3 Object Lock buckets in governance or compliance mode, verify the exact object version and retention, and retain tenant-scoped upload/failure records.
+- **E-signature handoff:** Send approved renewal agreements through DocuSign or link existing envelopes, verify Connect webhook HMACs, track sent/signed/declined/voided events, and attach completed PDFs to contract document history.
+- **SCIM provisioning:** Provision and deactivate users and groups, map identity-provider group identifiers to Radar roles, and apply SCIM deactivation promptly to OIDC and configured local bearer identities.
+- **Forecast calibration:** Review linked decision-to-outcome estimate errors over time, filter supplier and reporting windows, and adopt reviewer-rationalized assumptions with an audit event for future scenario plans.
 - **Evidence-quality evaluation:** Measure whether field values are supported by their evidence, track synthetic and OCR fixture results separately, and gate evidence quality in CI.
 - **Organization isolation:** Contract, task, source text, audit, and calendar records are scoped by tenant ID.
 - **OIDC token validation:** Verify signed RS256 or ES256 JWT access tokens against configured issuer, audience, and JWKS settings.
@@ -516,6 +520,42 @@ renewal-radar evaluate --provider all --dataset evaluation/internal-cases --outp
 
 The service rejects common email and US government-ID patterns and checks evidence grounding/value support. This automated scan is only a guardrail; the approving reviewer remains responsible for broader de-identification and governance. Contract redaction and retention also remove captured feedback for that contract.
 
+## Enterprise integrations
+
+### Immutable S3 Object Lock archives
+
+Configure an `audit_storage` integration with provider `s3_object_lock` through `PUT /integrations/connections/audit_storage`. Supply the bucket, AWS region, retention period in days, and retention mode (`GOVERNANCE` or `COMPLIANCE`). Credentials may be empty when the process has an IAM role; alternatively provide both `access_key_id` and `secret_access_key`, with an optional `session_token`. S3-compatible endpoints can be supplied as `endpoint_url` and must use HTTPS. Install the optional SDK with:
+
+```bash
+pip install -e '.[audit-s3]'
+```
+
+The bucket must have versioning and Object Lock enabled. `POST /audit/archive/store` creates a tenant-scoped object key, uploads with the requested retention, then verifies the returned version's size, SHA-256 metadata, S3 checksum, Object Lock mode, and retention date. The response and `GET /audit/archive/uploads` expose the object version, retention date, and verification state. Upload and verification failures are recorded with a bounded error summary. Only tenant administrators with integration-management permission can create an archive upload.
+
+S3 Object Lock preserves each exported archive until its retention date, independent of later changes or redaction in the live Radar database. Select the mode and period to match the organization's retention and legal-hold policy. Governance mode can be bypassed by privileged principals; compliance mode cannot be shortened. Protect the bucket and its IAM policies.
+
+### DocuSign renewal handoff
+
+Save a `signature` integration with provider `docusign`, an account ID and HTTPS DocuSign API base URI, plus an access token and Connect HMAC secret. Call `POST /renewal-decisions/{decision_id}/signature-envelope` after the decision has been approved. Provide signer name and email to create a sent envelope from the retained source PDF, or provide `envelope_id` to link an envelope created elsewhere. Configure DocuSign Connect to send status events to:
+
+```text
+POST /webhooks/docusign/{tenant_id}
+```
+
+Radar checks the `X-DocuSign-Signature-1` or `X-DocuSign-Signature-2` HMAC-SHA256 header before accepting events. Duplicate deliveries are idempotent. A signed event downloads the combined PDF and stores it as a `signed_agreement` contract document. Review document metadata at `GET /contracts/{contract_id}/documents`; download an item from `/contracts/{contract_id}/documents/{document_id}/content` with contract-source permission. Webhook verification or attachment errors remain visible in signature and contract audit history.
+
+### SCIM provisioning and role mapping
+
+An administrator can rotate the tenant's one-time SCIM bearer secret with `POST /scim/credentials`; only its SHA-256 digest is stored. Use that secret with the SCIM 2.0 resources at `/scim/v2/Users` and `/scim/v2/Groups` for create, list, update, soft-deactivate, group membership, and deprovision operations. Resources are tenant-scoped by the credential and support `startIndex` and `count` pagination.
+
+Map IdP group claim values to supported Radar roles through `PUT /scim/group-role-mappings` as an administrator; remove a mapping with `DELETE /scim/group-role-mappings?group_identifier=...`. Set `OIDC_GROUPS_CLAIM` if the IdP uses a claim other than `groups`. When mappings exist for a tenant, authentication requires an active provisioned user and at least one mapped group; mapped roles replace token role claims. Deactivating a SCIM user blocks subsequent requests immediately, even while an upstream token is unexpired. Provisioning and mapping changes appear in the governance audit export.
+
+### Forecast calibration
+
+Open `/renewal-scenario-feedback/report` to review linked estimate errors by supplier and scenario over time. Filter by reporting dates and supplier, then copy historical recommendations or enter revised values. Adoption requires a rationale and records the report window, number of linked outcomes, reviewer, and timestamp. Adopted values become the starting assumptions in the scenario planner; reviewers can override them for an individual plan. Existing forecasts and saved plans are not rewritten.
+
+The endpoints are `GET /renewal-scenario-feedback`, `GET /renewal-forecast/calibration`, and `POST /renewal-forecast/calibration/adopt`. Calibration compares completed decisions linked to saved scenario plans with recorded outcomes. Currency-specific spend errors remain separate, and a recommendation is absent when its historical measurement is unavailable.
+
 ## API reference
 
 | Method | Endpoint | Permission |
@@ -535,6 +575,8 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `POST` | `/legal-holds/{hold_id}/release` | `reviewer` or `admin`: release a hold |
 | `GET` | `/access-history` | `reviewer` or `admin`: read authenticated access events in the current tenant |
 | `GET` | `/contracts/{contract_id}/source` | `reviewer` or `admin`: view extracted contract text |
+| `GET` | `/contracts/{contract_id}/documents` | `reviewer` or `admin`: inspect source and signed-agreement document metadata |
+| `GET` | `/contracts/{contract_id}/documents/{document_id}/content` | `reviewer` or `admin`: download a tenant-owned source or signed PDF |
 | `POST` | `/contracts/{contract_id}/confirm` | `reviewer` or `admin`: confirm terms and create a task |
 | `POST` | `/contracts/{contract_id}/reject` | `reviewer` or `admin`: reject a pending proposal |
 | `GET` | `/contracts/{contract_id}/audit` | `reviewer` or `admin`: read contract event history |
@@ -570,6 +612,8 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `GET` / `POST` | `/renewal-decisions` | `reviewer` or `admin`: list or create a strategy decision for an open renewal task |
 | `GET` / `PATCH` | `/renewal-decisions/{decision_id}` | `reviewer` or `admin`: inspect or update a draft renewal decision |
 | `GET` | `/renewal-scenario-feedback` | `reviewer` or `admin`: compare linked scenario estimates with recorded outcomes |
+| `GET` | `/renewal-scenario-feedback/report` | Forecast calibration report and assumption adoption workspace |
+| `GET` / `POST` | `/renewal-forecast/calibration` or `/renewal-forecast/calibration/adopt` | `reviewer` or `admin`: view or audit-adopt future planning assumptions |
 | `POST` | `/renewal-decisions/{decision_id}/milestones` | `reviewer` or `admin`: add an owned, dated decision milestone |
 | `PATCH` | `/renewal-decisions/{decision_id}/milestones/{milestone_id}` | `reviewer` or `admin`: complete or reopen a milestone with a note |
 | `POST` | `/renewal-decisions/{decision_id}/quotes` | `reviewer` or `admin`: attach a supplier quote to a decision |
@@ -583,6 +627,13 @@ The service rejects common email and US government-ID patterns and checks eviden
 | `PUT` | `/integrations/connections/{calendar\|email\|procurement}` | `admin`: create or replace a tenant provider connection |
 | `POST` | `/integrations/connections/{calendar\|email\|procurement}/check` | `admin`: run a read-only connection health check |
 | `DELETE` | `/integrations/connections/{calendar\|email\|procurement}` | `admin`: remove a tenant provider connection |
+| `POST` | `/audit/archive/store` | `admin`: upload and verify an audit ZIP in configured S3 Object Lock storage |
+| `GET` | `/audit/archive/uploads` | `reviewer` or `admin`: inspect immutable archive versions and failures |
+| `POST` | `/renewal-decisions/{decision_id}/signature-envelope` | `reviewer` or `admin`: send or link an envelope for an approved decision |
+| `GET` | `/renewal-decisions/{decision_id}/signature-envelopes` | `reviewer` or `admin`: inspect envelope status and Connect events |
+| `POST` | `/scim/credentials` and `PUT /scim/group-role-mappings` | `admin`: rotate tenant SCIM secret and map groups to Radar roles |
+| `GET/POST/PUT/PATCH/DELETE` | `/scim/v2/Users` and `/scim/v2/Groups` | SCIM bearer: tenant user/group provisioning and deprovisioning |
+| `POST` | `/webhooks/docusign/{tenant_id}` | DocuSign Connect HMAC: receive signature state changes |
 | `GET` | `/portfolio/performance` | Portfolio performance dashboard with date, supplier, and owner filters |
 | `PUT` | `/integrations/connections/{slack\|teams}` | `admin`: store an encrypted Slack or Teams incoming webhook |
 | `POST` | `/integrations/connections/{slack\|teams}/check` | `admin`: send a test notification to the saved webhook |
@@ -648,6 +699,8 @@ OpenAPI and interactive request examples are available at `/docs` while the serv
 | `OIDC_SCOPES` | `openid profile email` | Requested OIDC scopes |
 | `OIDC_ROLES_CLAIM` | `roles` | JWT claim containing Radar role names |
 | `OIDC_TENANT_CLAIM` | `tenant_id` | JWT claim used to scope organization data |
+| `OIDC_GROUPS_CLAIM` | `groups` | JWT group claim consumed by SCIM group-to-role mappings |
+| `INTEGRATION_ENCRYPTION_KEY` | unset | Stable 32-byte key used to encrypt tenant integration credentials; required when saving connections |
 | `RADAR_COOKIE_SECURE` | `true` | Mark the OIDC session cookie Secure; disable only for local HTTP |
 | `LLM_PROVIDER` | `auto` | Provider selection: `auto`, `rules`, `openai`, `anthropic`, `google`, `mistral`, `cohere`, or `xai` |
 | `LLM_ALLOWED_PROVIDERS` | `*` when unset | Comma-separated allowlist of extraction providers permitted to receive contract text; `rules` is local |
@@ -688,6 +741,8 @@ OpenAPI and interactive request examples are available at `/docs` while the serv
 | `GOOGLE_DRIVE_WEBHOOK_TOKEN` | unset | Shared token expected in the Google Drive callback's `X-Goog-Channel-Token` header |
 | `MS_GRAPH_WEBHOOK_CLIENT_STATE` | unset | Shared `clientState` value required on every Graph notification |
 | `DOCUMENT_SOURCE_WEBHOOK_TENANT_ID` | `default` | Tenant whose configured source credentials and delta cursors are reconciled by webhook-triggered jobs |
+
+S3 archive storage also needs the optional `audit-s3` Python extra. The application uses the AWS SDK's normal credential chain when explicit keys are not saved in an integration connection.
 
 Copy [.env.example](.env.example) to `.env` to start configuring local integrations. Do not commit real credentials.
 

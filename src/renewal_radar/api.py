@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import hmac
 import os
 import secrets
 import base64
@@ -10,12 +11,13 @@ import csv
 import io
 import zipfile
 from xml.sax.saxutils import escape
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from fastapi import Cookie, Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi import Cookie, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 
 from .auth import AuthRegistry, Principal
@@ -47,6 +49,7 @@ from .schemas import (
     ProviderEvaluationScheduleRequest, PortfolioFilterRequest,
     RenewalDecisionCreateRequest, RenewalDecisionUpdateRequest, RenewalDecisionReviewRequest,
     RenewalDecisionMilestoneRequest, RenewalDecisionMilestoneUpdateRequest, RenewalDecisionQuoteRequest,
+    SignatureEnvelopeRequest, ScimGroupRoleMappingRequest, RenewalCalibrationAdoptionRequest,
 )
 from .store import Store
 
@@ -57,6 +60,7 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
     app = FastAPI(title="Contract Renewal Radar", version="0.2.0", description="Extract, review, and track contract renewal obligations.")
     app.state.store = db
     app.state.auth_registry = auth
+    auth.bind_store(db)
 
     def authenticate(
         authorization: str | None = Header(default=None),
@@ -76,6 +80,37 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
     def require_scope(principal: Principal, scope: str) -> None:
         if not principal.has_scope(scope):
             raise HTTPException(status_code=403, detail=f"The authenticated user lacks the '{scope}' permission.")
+
+    def scim_tenant(authorization: str | None) -> str:
+        scheme, separator, token = (authorization or "").partition(" ")
+        if not separator or scheme.casefold() != "bearer" or not token.strip():
+            raise HTTPException(status_code=401, detail="A SCIM bearer credential is required.")
+        tenant_id = db.scim_tenant_for_token(hashlib.sha256(token.strip().encode()).hexdigest())
+        if not tenant_id:
+            raise HTTPException(status_code=401, detail="The SCIM bearer credential is invalid.")
+        return tenant_id
+
+    def scim_user_resource(user: dict[str, Any]) -> dict[str, Any]:
+        resource = {
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "id": user["id"], "userName": user["user_name"], "active": bool(user["active"]),
+            "displayName": user.get("display_name"), "externalId": user.get("external_id"),
+            "meta": {"resourceType":"User","created":user["created_at"],"lastModified":user["updated_at"]},
+        }
+        if user.get("email"):
+            resource["emails"] = [{"value":user["email"],"primary":True,"type":"work"}]
+        if user.get("groups"):
+            resource["groups"] = [{"value":g["id"],"display":g["display_name"],"$ref":f"/scim/v2/Groups/{g['id']}"} for g in user["groups"]]
+        resource.update(user.get("attributes",{}))
+        return resource
+
+    def scim_group_resource(group: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "schemas":["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "id":group["id"],"externalId":group.get("external_id"),"displayName":group["display_name"],
+            "members":[{"value":m["id"],"display":m.get("display_name") or m["user_name"],"$ref":f"/scim/v2/Users/{m['id']}"} for m in group["members"]],
+            "meta":{"resourceType":"Group","created":group["created_at"],"lastModified":group["updated_at"]},
+        }
 
     def task_for_principal(task_id: str, principal: Principal):
         row = db.get_task(task_id, principal.tenant_id)
@@ -412,6 +447,27 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
         if not row:
             raise HTTPException(status_code=404, detail="Contract not found")
         return {"text": row["raw_text"]}
+
+    @app.get("/contracts/{contract_id}/documents")
+    def list_contract_documents(contract_id: str, principal: Principal = Depends(authenticate)) -> list[dict]:
+        require_scope(principal, "contracts:read")
+        if not db.get_contract(contract_id, principal.tenant_id):
+            raise HTTPException(status_code=404, detail="Contract not found")
+        return db.list_contract_documents(contract_id, principal.tenant_id)
+
+    @app.get("/contracts/{contract_id}/documents/{document_id}/content")
+    def download_contract_document(contract_id: str, document_id: str, principal: Principal = Depends(authenticate)) -> Response:
+        require_scope(principal, "contracts:source")
+        contract = db.get_contract(contract_id, principal.tenant_id)
+        if not contract:
+            raise HTTPException(status_code=404, detail="Contract not found")
+        document = db.get_contract_document(document_id, principal.tenant_id, include_content=True)
+        if not document or document["contract_id"] != contract_id:
+            raise HTTPException(status_code=404, detail="Contract document not found")
+        return Response(document["content"], media_type=document["content_type"], headers={
+            "Content-Disposition": f'attachment; filename="{Path(document["filename"]).name}"',
+            "Cache-Control": "no-store",
+        })
 
     @app.post("/contracts/{contract_id}/confirm", response_model=ContractRecord)
     def confirm_contract(
@@ -791,15 +847,44 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
         require_scope(principal, "contracts:read")
         return db.renewal_forecast_accuracy(principal.tenant_id)
 
-    @app.get("/renewal-scenario-feedback")
-    def renewal_scenario_feedback(principal: Principal = Depends(authenticate)) -> dict:
-        require_scope(principal, "contracts:read")
-        return db.renewal_scenario_outcome_feedback(principal.tenant_id)
-
     @app.get("/renewal-forecast/runs")
     def list_renewal_forecast_runs(principal: Principal = Depends(authenticate)) -> list[dict]:
         require_scope(principal,"contracts:read")
         return db.list_renewal_forecast_runs(principal.tenant_id)
+
+    @app.get("/renewal-scenario-feedback/report", response_class=HTMLResponse, include_in_schema=False)
+    def renewal_scenario_feedback_workspace() -> HTMLResponse:
+        return HTMLResponse(_RENEWAL_CALIBRATION_HTML)
+
+    @app.get("/renewal-forecast/calibration")
+    def get_renewal_forecast_calibration(principal: Principal = Depends(authenticate)) -> dict:
+        require_scope(principal, "contracts:read")
+        return {"profile":db.get_renewal_calibration(principal.tenant_id)}
+
+    @app.post("/renewal-forecast/calibration/adopt", status_code=201)
+    def adopt_renewal_forecast_calibration(
+        request: RenewalCalibrationAdoptionRequest, principal: Principal = Depends(authenticate),
+    ) -> dict:
+        require_scope(principal, "contracts:review")
+        report = db.renewal_scenario_outcome_feedback(
+            principal.tenant_id, request.report_window_start, request.report_window_end,
+        )
+        return db.adopt_renewal_calibration(
+            principal.tenant_id, request.model_dump(mode="python"), principal.actor,
+            report["linked_outcome_count"],
+        )
+
+    @app.get("/renewal-scenario-feedback")
+    def renewal_scenario_feedback(
+        from_date: date | None = None, to_date: date | None = None,
+        supplier: str | None = Query(default=None, max_length=250),
+        strategy: str | None = Query(default=None, pattern="^(renew|renegotiate|terminate)$"),
+        principal: Principal = Depends(authenticate),
+    ) -> dict:
+        require_scope(principal, "contracts:read")
+        if from_date and to_date and to_date < from_date:
+            raise HTTPException(status_code=422, detail="to_date must be on or after from_date")
+        return db.renewal_scenario_outcome_feedback(principal.tenant_id,from_date,to_date,supplier,strategy)
 
     @app.post("/tasks/{task_id}/scenario-plans", status_code=201)
     def create_scenario_plan(task_id: str, request: RenewalScenarioPlanRequest,
@@ -872,6 +957,45 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
             "Content-Disposition": "attachment; filename=renewal-radar-audit.zip",
             "Cache-Control": "no-store",
         })
+
+    @app.post("/audit/archive/store", status_code=201)
+    def store_audit_archive_in_s3(
+        from_date: date | None = None,to_date: date | None = None,
+        principal: Principal = Depends(authenticate),
+    ) -> dict:
+        require_scope(principal,"settings:manage")
+        if not principal.is_admin:
+            raise HTTPException(status_code=403,detail="Only tenant administrators can store audit archives")
+        if from_date and to_date and to_date<from_date:
+            raise HTTPException(status_code=422,detail="to_date must be on or after from_date")
+        connection=db.get_integration_connection(principal.tenant_id,"audit_storage")
+        if not connection or connection["provider"]!="s3_object_lock":
+            raise HTTPException(status_code=409,detail="Configure an S3 Object Lock connection first")
+        rows=db.audit_export_rows(principal.tenant_id,principal.actor,from_date,to_date)
+        archive=build_audit_archive(rows,principal.tenant_id,from_date.isoformat() if from_date else None,to_date.isoformat() if to_date else None)
+        settings=connection["settings"]
+        retention_days=int(settings["retention_days"])
+        retention_mode=settings["retention_mode"]
+        retain_until=(datetime.now(timezone.utc)+timedelta(days=retention_days)).isoformat()
+        prefix=settings.get("prefix","").strip("/")
+        stamp=datetime.now(timezone.utc)
+        object_key="/".join(part for part in (prefix,principal.tenant_id,stamp.strftime("%Y/%m/%d"),f"audit-{stamp.strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(8)}.zip") if part)
+        checksum=hashlib.sha256(archive).hexdigest()
+        upload=db.record_audit_archive_upload(principal.tenant_id,settings["bucket"],object_key,checksum,len(rows),retention_mode,retain_until,principal.actor)
+        try:
+            credentials=decrypt_credentials(principal.tenant_id,"audit_storage",connection["credentials_ciphertext"])
+            from .archive_storage import s3_client,upload_and_verify_archive
+            client=s3_client(settings,credentials)
+            result=upload_and_verify_archive(client,settings["bucket"],object_key,archive,retention_days,retention_mode)
+        except Exception as exc:
+            db.update_audit_archive_upload(upload["id"],principal.tenant_id,principal.actor,status="failed",verification_status="failed",failure_detail=f"{type(exc).__name__}: {str(exc)[:300]}")
+            raise HTTPException(status_code=502,detail={"message":"S3 archive upload or verification failed","archive_upload_id":upload["id"],"error":type(exc).__name__}) from exc
+        return db.update_audit_archive_upload(upload["id"],principal.tenant_id,principal.actor,status="stored",version_id=result["object_version_id"],verification_status=result["verification_status"],failure_detail=None,retain_until=result["retain_until"])
+
+    @app.get("/audit/archive/uploads")
+    def list_audit_archive_uploads(limit: int = Query(default=100,ge=1,le=500),principal: Principal = Depends(authenticate)) -> list[dict]:
+        require_scope(principal,"audit:read")
+        return db.list_audit_archive_uploads(principal.tenant_id,limit)
 
     @app.post("/tasks/{task_id}/outcome")
     def record_renewal_outcome(
@@ -976,6 +1100,112 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
         if not result: raise HTTPException(status_code=404,detail="Renewal decision not found")
         enqueue_calendar_sync_if_configured(principal.tenant_id)
         return result
+
+    @app.post("/renewal-decisions/{decision_id}/signature-envelope",status_code=201)
+    def handoff_renewal_for_signature(
+        decision_id: str,request: SignatureEnvelopeRequest,principal: Principal = Depends(authenticate),
+    ) -> dict:
+        require_scope(principal,"contracts:review")
+        decision=db.get_renewal_decision(decision_id,principal.tenant_id)
+        if not decision:
+            raise HTTPException(status_code=404,detail="Renewal decision not found")
+        if decision["status"]!="approved":
+            raise HTTPException(status_code=409,detail="Only an approved renewal decision can be sent for signature")
+        if request.envelope_id:
+            try:
+                return db.create_signature_envelope_record(decision_id,principal.tenant_id,request.envelope_id,principal.actor,"sent")
+            except ValueError as exc:
+                raise HTTPException(status_code=409,detail=str(exc)) from exc
+        connection=db.get_integration_connection(principal.tenant_id,"signature")
+        if not connection or connection["provider"]!="docusign":
+            raise HTTPException(status_code=409,detail="Configure a DocuSign signature connection first")
+        source=db.latest_contract_document(decision["contract_id"],principal.tenant_id)
+        if not source or source["content_type"]!="application/pdf":
+            raise HTTPException(status_code=409,detail="The contract has no retained source PDF to send for signature")
+        try:
+            credentials=decrypt_credentials(principal.tenant_id,"signature",connection["credentials_ciphertext"])
+            from .docusign import create_envelope
+            response=create_envelope(
+                connection["settings"]["base_uri"],connection["settings"]["account_id"],
+                credentials["access_token"],source["content"],source["filename"],
+                request.signer_name or "",request.signer_email or "",request.email_subject,
+            )
+            record=db.create_signature_envelope_record(decision_id,principal.tenant_id,response["envelopeId"],principal.actor,"sent")
+            db.update_integration_health(principal.tenant_id,"signature","healthy")
+            return record
+        except Exception as exc:
+            db.update_integration_health(principal.tenant_id,"signature","error",f"{type(exc).__name__}: {str(exc)[:300]}")
+            raise HTTPException(status_code=502,detail=f"DocuSign envelope handoff failed: {type(exc).__name__}") from exc
+
+    @app.get("/renewal-decisions/{decision_id}/signature-envelopes")
+    def list_renewal_signature_envelopes(decision_id: str,principal: Principal = Depends(authenticate)) -> list[dict]:
+        require_scope(principal,"contracts:read")
+        if not db.get_renewal_decision(decision_id,principal.tenant_id):
+            raise HTTPException(status_code=404,detail="Renewal decision not found")
+        return db.list_signature_envelopes(decision_id,principal.tenant_id)
+
+    @app.post("/webhooks/docusign/{tenant_id}",status_code=202,include_in_schema=False)
+    async def docusign_connect_webhook(
+        tenant_id: str,request: Request,
+        signature_1: str | None = Header(default=None,alias="X-DocuSign-Signature-1"),
+        signature_2: str | None = Header(default=None,alias="X-DocuSign-Signature-2"),
+    ) -> dict:
+        connection=db.get_integration_connection(tenant_id,"signature")
+        if not connection or connection["provider"]!="docusign":
+            raise HTTPException(status_code=503,detail="DocuSign connection is not configured for this tenant")
+        try:
+            credentials=decrypt_credentials(tenant_id,"signature",connection["credentials_ciphertext"])
+        except Exception as exc:
+            raise HTTPException(status_code=503,detail="DocuSign webhook verification is unavailable") from exc
+        raw=await request.body()
+        expected=hmac.new(credentials["hmac_secret"].encode(),raw,hashlib.sha256).digest()
+        valid=False
+        for supplied in (signature_1,signature_2):
+            if supplied:
+                try:
+                    valid=valid or hmac.compare_digest(base64.b64decode(supplied,validate=True),expected)
+                except (ValueError,binascii.Error):
+                    continue
+        if not valid:
+            raise HTTPException(status_code=401,detail="DocuSign webhook HMAC signature is invalid")
+        try:
+            payload=json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400,detail="DocuSign webhook body is not valid JSON") from exc
+        data=payload.get("data") or {}
+        envelope_id=data.get("envelopeId") or (data.get("envelopeSummary") or {}).get("envelopeId") or payload.get("envelopeId")
+        event_type=str(payload.get("event") or payload.get("eventType") or "").casefold()
+        raw_status=str(data.get("status") or (data.get("envelopeSummary") or {}).get("status") or "").casefold()
+        status=("signed" if event_type in {"envelope-completed","envelope_completed"} or raw_status=="completed" else
+                "declined" if event_type in {"envelope-declined","envelope_declined"} or raw_status=="declined" else
+                "voided" if event_type in {"envelope-voided","envelope_voided"} or raw_status in {"voided","void"} else
+                "sent" if event_type in {"envelope-sent","envelope_sent"} or raw_status in {"sent","delivered"} else None)
+        if not isinstance(envelope_id,str) or not envelope_id or not status:
+            raise HTTPException(status_code=400,detail="DocuSign event has no supported envelope status")
+        event_id=str(payload.get("eventId") or hashlib.sha256(raw).hexdigest())
+        record=db.record_signature_envelope_event(
+            tenant_id,envelope_id,event_id,event_type or raw_status,status,
+            {"event":event_type,"status":raw_status,"generatedDateTime":payload.get("generatedDateTime")},
+        )
+        if not record:
+            raise HTTPException(status_code=404,detail="No renewal decision is linked to this DocuSign envelope")
+        attachment_status="not_applicable"
+        if status=="signed" and not db.contract_document_source_exists(record["contract_id"],tenant_id,"signed_agreement",envelope_id):
+            try:
+                from .docusign import download_completed_document
+                pdf=download_completed_document(
+                    connection["settings"]["base_uri"],connection["settings"]["account_id"],
+                    envelope_id,credentials["access_token"],
+                )
+                db.save_contract_document(
+                    record["contract_id"],tenant_id,f"signed-renewal-{envelope_id[:32]}.pdf","application/pdf",pdf,
+                    hashlib.sha256(pdf).hexdigest(),"docusign-connect","signed_agreement",envelope_id,
+                )
+                attachment_status="attached"
+            except Exception as exc:
+                db.fail_signature_envelope(record["id"],tenant_id,"docusign-connect",f"{type(exc).__name__}: {str(exc)[:300]}")
+                attachment_status="failed"
+        return {"accepted":True,"status":status,"envelope_record_id":record["id"],"signed_document":attachment_status}
 
     @app.get("/suppliers")
     def list_suppliers(principal: Principal = Depends(authenticate)) -> list[dict]:
@@ -1367,11 +1597,13 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
         integration: str, request: IntegrationConnectionRequest, principal: Principal = Depends(authenticate),
     ) -> dict:
         require_scope(principal, "settings:manage")
-        family = integration if integration in {"calendar", "email", "slack", "teams", "procurement"} else None
+        family = integration if integration in {"calendar", "email", "slack", "teams", "procurement", "audit_storage", "signature"} else None
         expected_family = ("calendar" if request.provider.endswith("calendar") else
                            "slack" if request.provider == "slack_webhook" else
                            "teams" if request.provider == "teams_webhook" else
-                           "procurement" if request.provider in {"coupa", "sap_ariba"} else "email")
+                           "procurement" if request.provider in {"coupa", "sap_ariba"} else
+                           "audit_storage" if request.provider == "s3_object_lock" else
+                           "signature" if request.provider == "docusign" else "email")
         if family is None or family != expected_family:
             raise HTTPException(status_code=422, detail="Integration name must match the selected provider family.")
         required_settings = {
@@ -1379,9 +1611,31 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
             "smtp": ("host",), "microsoft_email": ("user_id",), "gmail": (),
             "slack_webhook": (), "teams_webhook": (),
             "coupa": ("base_url",), "sap_ariba": ("base_url",),
+            "s3_object_lock": ("bucket", "region", "retention_days", "retention_mode"),
+            "docusign": ("account_id", "base_uri"),
         }[request.provider]
-        if any(not request.settings.get(key) for key in required_settings) or not request.credentials:
+        if any(not request.settings.get(key) for key in required_settings) or (not request.credentials and request.provider != "s3_object_lock"):
             raise HTTPException(status_code=422, detail="The selected provider requires its connection settings and credentials.")
+        if request.provider == "s3_object_lock":
+            try:
+                if not 1 <= int(request.settings["retention_days"]) <= 36500:
+                    raise ValueError("retention_days must be between 1 and 36500")
+                if request.settings["retention_mode"] not in {"GOVERNANCE","COMPLIANCE"}:
+                    raise ValueError("retention_mode must be GOVERNANCE or COMPLIANCE")
+                if request.settings.get("endpoint_url") and not request.settings["endpoint_url"].startswith("https://"):
+                    raise ValueError("endpoint_url must use HTTPS")
+                if bool(request.credentials.get("access_key_id")) != bool(request.credentials.get("secret_access_key")):
+                    raise ValueError("Both access_key_id and secret_access_key are required when using explicit S3 credentials")
+            except (ValueError, RuntimeError) as exc:
+                raise HTTPException(status_code=422,detail=str(exc)) from exc
+        if request.provider == "docusign":
+            if not request.credentials.get("access_token") or not request.credentials.get("hmac_secret"):
+                raise HTTPException(status_code=422,detail="DocuSign access_token and hmac_secret are required")
+            try:
+                from .docusign import api_base_uri
+                api_base_uri(request.settings["base_uri"])
+            except (ValueError, RuntimeError) as exc:
+                raise HTTPException(status_code=422,detail=str(exc)) from exc
         if request.provider in {"coupa", "sap_ariba"}:
             required_credential = "api_key" if request.provider == "coupa" else "access_token"
             if not request.credentials.get(required_credential):
@@ -1409,7 +1663,7 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
     @app.delete("/integrations/connections/{integration}", status_code=204)
     def delete_integration_connection(integration: str, principal: Principal = Depends(authenticate)) -> Response:
         require_scope(principal, "settings:manage")
-        if integration not in {"calendar", "email", "slack", "teams", "procurement"}:
+        if integration not in {"calendar", "email", "slack", "teams", "procurement", "audit_storage", "signature"}:
             raise HTTPException(status_code=404, detail="Integration not found")
         if not db.delete_integration_connection(principal.tenant_id, integration, principal.actor):
             raise HTTPException(status_code=404, detail="Integration connection not found")
@@ -1436,6 +1690,18 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
             elif provider in {"coupa", "sap_ariba"}:
                 from .procurement_sync import check_procurement_connection
                 result = check_procurement_connection(principal.tenant_id, row)
+            elif provider == "s3_object_lock":
+                from .archive_storage import s3_client
+                client=s3_client(row["settings"],credentials)
+                versioning=client.get_bucket_versioning(Bucket=row["settings"]["bucket"])
+                lock=client.get_object_lock_configuration(Bucket=row["settings"]["bucket"]).get("ObjectLockConfiguration",{})
+                if versioning.get("Status")!="Enabled" or lock.get("ObjectLockEnabled")!="Enabled":
+                    raise RuntimeError("S3 bucket must have versioning and Object Lock enabled")
+                result={"versioning_enabled":True,"object_lock_enabled":True}
+            elif provider == "docusign":
+                from .docusign import get_account
+                account=get_account(row["settings"]["base_uri"],row["settings"]["account_id"],credentials["access_token"])
+                result={"account_id":account.get("accountId"),"account_name":account.get("accountName")}
             elif provider in {"google_calendar", "microsoft_calendar", "microsoft_email", "gmail"}:
                 token = access_token(provider, credentials)
                 if provider == "google_calendar":
@@ -1462,7 +1728,7 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
                     if credentials.get("username"):
                         client.login(credentials["username"], credentials.get("password", ""))
             db.update_integration_health(principal.tenant_id, integration, "healthy")
-            return {"integration": integration, "status": "healthy", "checked_at": db.get_integration_connection(principal.tenant_id, integration)["last_checked_at"], **(result if provider in {"coupa", "sap_ariba"} else {})}
+            return {"integration": integration, "status": "healthy", "checked_at": db.get_integration_connection(principal.tenant_id, integration)["last_checked_at"], **(result if provider in {"coupa", "sap_ariba", "s3_object_lock", "docusign"} else {})}
         except Exception as exc:
             db.update_integration_health(principal.tenant_id, integration, "error", f"{type(exc).__name__}: {str(exc)[:300]}")
             raise HTTPException(status_code=502, detail=f"Connection check failed: {type(exc).__name__}") from exc
@@ -1540,6 +1806,181 @@ def create_app(store: Store | None = None, auth_registry: AuthRegistry | None = 
             return sync_document_sources(db, principal.tenant_id)
         except DocumentSourceError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/scim/credentials", status_code=201)
+    def create_scim_credential(principal: Principal = Depends(authenticate)) -> dict:
+        require_scope(principal, "settings:manage")
+        if not principal.is_admin:
+            raise HTTPException(status_code=403, detail="Only tenant administrators can rotate SCIM credentials")
+        token = secrets.token_urlsafe(40)
+        db.save_scim_credential(principal.tenant_id,hashlib.sha256(token.encode()).hexdigest(),principal.actor)
+        return {"tenant_id":principal.tenant_id,"bearer_token":token,"note":"Copy this token now; only its digest is stored."}
+
+    @app.put("/scim/group-role-mappings")
+    def put_scim_group_role_mapping(request: ScimGroupRoleMappingRequest,principal: Principal = Depends(authenticate)) -> dict:
+        require_scope(principal,"settings:manage")
+        if not principal.is_admin:
+            raise HTTPException(status_code=403,detail="Only tenant administrators can map SCIM groups to roles")
+        return db.save_scim_group_role_mapping(
+            principal.tenant_id,request.group_identifier.strip(),request.roles,principal.actor,
+        )
+
+    @app.delete("/scim/group-role-mappings")
+    def delete_scim_group_role_mapping(
+        group_identifier: str = Query(min_length=1,max_length=200),
+        principal: Principal = Depends(authenticate),
+    ) -> Response:
+        require_scope(principal,"settings:manage")
+        if not principal.is_admin:
+            raise HTTPException(status_code=403,detail="Only tenant administrators can remove SCIM group role mappings")
+        if not db.delete_scim_group_role_mapping(principal.tenant_id,group_identifier.strip(),principal.actor):
+            raise HTTPException(status_code=404,detail="SCIM group role mapping not found")
+        return Response(status_code=204)
+
+    @app.get("/scim/v2/Users")
+    def list_scim_users(
+        startIndex: int = Query(default=1,ge=1), count: int = Query(default=100,ge=1,le=200),
+        authorization: str | None = Header(default=None),
+    ) -> dict:
+        tenant_id=scim_tenant(authorization)
+        rows,total=db.list_scim_users(tenant_id,startIndex,count)
+        return {"schemas":["urn:ietf:params:scim:api:messages:2.0:ListResponse"],"totalResults":total,
+                "startIndex":startIndex,"itemsPerPage":len(rows),"Resources":[scim_user_resource(row) for row in rows]}
+
+    @app.post("/scim/v2/Users",status_code=201)
+    def create_scim_user(payload: dict,authorization: str | None = Header(default=None)) -> Response:
+        tenant_id=scim_tenant(authorization)
+        try:
+            user=scim_user_resource(db.scim_upsert_user(tenant_id,payload,"scim"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400,detail=str(exc)) from exc
+        return Response(json.dumps(user),status_code=201,media_type="application/scim+json",
+                        headers={"Location":f"/scim/v2/Users/{user['id']}"})
+
+    @app.put("/scim/v2/Users/{user_id}")
+    def replace_scim_user(user_id: str,payload: dict,authorization: str | None = Header(default=None)) -> dict:
+        tenant_id=scim_tenant(authorization)
+        current=db.get_scim_user(user_id,tenant_id)
+        if not current:
+            raise HTTPException(status_code=404,detail="SCIM user not found")
+        values=dict(payload)
+        values["id"]=user_id
+        values.setdefault("groups",[{"value":group["id"]} for group in current["groups"]])
+        try:
+            return scim_user_resource(db.scim_upsert_user(tenant_id,values,"scim"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400,detail=str(exc)) from exc
+
+    @app.get("/scim/v2/Users/{user_id}")
+    def get_scim_user(user_id: str,authorization: str | None = Header(default=None)) -> dict:
+        tenant_id=scim_tenant(authorization)
+        user=db.get_scim_user(user_id,tenant_id)
+        if not user:
+            raise HTTPException(status_code=404,detail="SCIM user not found")
+        return scim_user_resource(user)
+
+    @app.patch("/scim/v2/Users/{user_id}")
+    def patch_scim_user(user_id: str,payload: dict,authorization: str | None = Header(default=None)) -> dict:
+        tenant_id=scim_tenant(authorization)
+        current=db.get_scim_user(user_id,tenant_id)
+        if not current:
+            raise HTTPException(status_code=404,detail="SCIM user not found")
+        values={"id":user_id,"externalId":current.get("external_id"),"userName":current["user_name"],
+                "displayName":current.get("display_name"),"active":current["active"],
+                "emails":[{"value":current["email"],"primary":True}] if current.get("email") else [],
+                "groups":[{"value":g["id"]} for g in current["groups"]]}
+        operations=payload.get("Operations") or payload.get("operations") or []
+        if not isinstance(operations,list):
+            raise HTTPException(status_code=400,detail="SCIM PATCH Operations must be an array")
+        for operation in operations:
+            path=str(operation.get("path","")).casefold()
+            op=str(operation.get("op","replace")).casefold()
+            value=operation.get("value")
+            if path=="active": values["active"]=bool(value)
+            elif path=="username": values["userName"]=str(value)
+            elif path=="displayname": values["displayName"]=str(value)
+            elif path in {"emails","emails[type eq \"work\"].value"}:
+                values["emails"]=[{"value":value,"primary":True}] if isinstance(value,str) else value
+            elif not path and isinstance(value,dict):
+                values.update({key:value[key] for key in ("active","userName","displayName","emails") if key in value})
+            else:
+                raise HTTPException(status_code=400,detail=f"Unsupported SCIM user PATCH path: {path}")
+            if op=="remove" and path=="active": values["active"]=False
+        try:
+            return scim_user_resource(db.scim_upsert_user(tenant_id,values,"scim"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400,detail=str(exc)) from exc
+
+    @app.delete("/scim/v2/Users/{user_id}",status_code=204)
+    def delete_scim_user(user_id: str,authorization: str | None = Header(default=None)) -> Response:
+        tenant_id=scim_tenant(authorization)
+        if not db.scim_set_user_active(user_id,tenant_id,False,"scim"):
+            raise HTTPException(status_code=404,detail="SCIM user not found")
+        return Response(status_code=204)
+
+    @app.get("/scim/v2/Groups")
+    def list_scim_groups(
+        startIndex: int = Query(default=1,ge=1),count: int = Query(default=100,ge=1,le=200),
+        authorization: str | None = Header(default=None),
+    ) -> dict:
+        tenant_id=scim_tenant(authorization)
+        rows,total=db.list_scim_groups(tenant_id,startIndex,count)
+        return {"schemas":["urn:ietf:params:scim:api:messages:2.0:ListResponse"],"totalResults":total,
+                "startIndex":startIndex,"itemsPerPage":len(rows),"Resources":[scim_group_resource(row) for row in rows]}
+
+    @app.post("/scim/v2/Groups",status_code=201)
+    def create_scim_group(payload: dict,authorization: str | None = Header(default=None)) -> Response:
+        tenant_id=scim_tenant(authorization)
+        try:
+            group=scim_group_resource(db.scim_upsert_group(tenant_id,payload))
+        except ValueError as exc:
+            raise HTTPException(status_code=400,detail=str(exc)) from exc
+        return Response(json.dumps(group),status_code=201,media_type="application/scim+json",
+                        headers={"Location":f"/scim/v2/Groups/{group['id']}"})
+
+    @app.put("/scim/v2/Groups/{group_id}")
+    def replace_scim_group(group_id: str,payload: dict,authorization: str | None = Header(default=None)) -> dict:
+        tenant_id=scim_tenant(authorization)
+        current=db.get_scim_group(group_id,tenant_id)
+        if not current:
+            raise HTTPException(status_code=404,detail="SCIM group not found")
+        values=dict(payload)
+        values["id"]=group_id
+        values.setdefault("members",[{"value":member["id"]} for member in current["members"]])
+        try:
+            return scim_group_resource(db.scim_upsert_group(tenant_id,values))
+        except ValueError as exc:
+            raise HTTPException(status_code=400,detail=str(exc)) from exc
+
+    @app.get("/scim/v2/Groups/{group_id}")
+    def get_scim_group(group_id: str,authorization: str | None = Header(default=None)) -> dict:
+        tenant_id=scim_tenant(authorization)
+        group=db.get_scim_group(group_id,tenant_id)
+        if not group:
+            raise HTTPException(status_code=404,detail="SCIM group not found")
+        return scim_group_resource(group)
+
+    @app.patch("/scim/v2/Groups/{group_id}")
+    def patch_scim_group(group_id: str,payload: dict,authorization: str | None = Header(default=None)) -> dict:
+        tenant_id=scim_tenant(authorization)
+        if not db.get_scim_group(group_id,tenant_id):
+            raise HTTPException(status_code=404,detail="SCIM group not found")
+        operations=payload.get("Operations") or payload.get("operations") or []
+        result=None
+        for operation in operations:
+            if str(operation.get("path","")).casefold()!="members":
+                raise HTTPException(status_code=400,detail="Only SCIM group member PATCH operations are supported")
+            members=operation.get("value") or []
+            if isinstance(members,dict): members=[members]
+            result=db.scim_update_group_members(group_id,tenant_id,members,str(operation.get("op","add")).casefold())
+        return scim_group_resource(result or db.get_scim_group(group_id,tenant_id))
+
+    @app.delete("/scim/v2/Groups/{group_id}",status_code=204)
+    def delete_scim_group(group_id: str,authorization: str | None = Header(default=None)) -> Response:
+        tenant_id=scim_tenant(authorization)
+        if not db.scim_delete_group(group_id,tenant_id):
+            raise HTTPException(status_code=404,detail="SCIM group not found")
+        return Response(status_code=204)
 
     @app.get("/webhooks/microsoft-graph", include_in_schema=False)
     def graph_webhook_validation(validationToken: str = Query(...)) -> PlainTextResponse:
@@ -2110,7 +2551,7 @@ const $=id=>document.getElementById(id);function auth(){const t=$('token').value
 _RENEWAL_SCENARIOS_HTML = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Renewal Radar · Scenario planner</title><style>
 body{font:15px/1.5 system-ui,sans-serif;color:#182230;background:#f3f6fa;margin:0}header{background:#10243a;color:white;padding:20px 28px}main{max-width:1000px;margin:22px auto;padding:0 18px}.bar,.panel{background:#fff;border:1px solid #dbe2ea;border-radius:9px;padding:16px;margin:12px 0}.bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.bar a{color:#1677c8}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}label{display:block;font-weight:600;margin:8px 0}input,select,textarea,button{font:inherit;padding:9px;border:1px solid #cbd5e1;border-radius:6px}input,select,textarea{display:block;width:100%;box-sizing:border-box;margin-top:4px}textarea{min-height:75px}button{background:#1677c8;color:#fff;border:0;cursor:pointer;font-weight:650;margin-top:12px}.notice{min-height:22px;color:#b42318}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f7fa;padding:14px;border-radius:6px}.muted{color:#64748b}@media(max-width:650px){.grid{grid-template-columns:1fr}}
 </style></head><body><header><h1>Renewal scenario planner</h1><p>Compare spend, supplier risk, notice dates, and decision milestones with recorded assumptions.</p></header><main><div class="bar"><input id="token" type="password" placeholder="Bearer token (optional with SSO)" aria-label="Bearer token"><button onclick="load()">Connect / refresh</button><a href="/auth/oidc/login">Sign in with SSO</a><a href="/renewal-decisions/workspace">Renewal decisions</a><a href="/renewal-forecast">Portfolio forecast</a></div><p id="notice" class="notice" role="status"></p><section class="panel"><h2>Compare options</h2><label>Open renewal task<select id="task"></select></label><label>Saved forecast (optional)<select id="forecast"><option value="">No forecast selected</option></select></label><div class="grid"><label>Renewal increase %<input id="increase" type="number" min="-100" max="1000" step="0.01" value="0"></label><label>Renegotiation savings %<input id="savings" type="number" min="0" max="100" step="0.01" value="10"></label></div><div class="grid"><label>Termination transition cost<input id="transition" type="number" min="0" step="0.01" value="0"></label><label>Planning horizon in months<input id="horizon" type="number" min="1" max="60" value="12"></label></div><div class="grid"><label>As-of date<input id="asOf" type="date"></label><label>Assumptions note<textarea id="note" maxlength="5000" placeholder="Explain the basis for these planning assumptions"></textarea></label></div><button onclick="plan()">Save and compare</button></section><section class="panel"><h2>Saved comparison</h2><pre id="result" class="muted">Create a plan to see its evidence and comparison.</pre></section><section class="panel"><h2>Previous plans for this task</h2><div id="history" class="muted">Select a task to load prior plans.</div></section></main><script>
-const $=id=>document.getElementById(id);function auth(){const t=$('token').value.trim()||sessionStorage.getItem('radar-token')||'';return t?{Authorization:'Bearer '+t}:{}}async function api(path,options={}){const r=await fetch(path,{...options,headers:{...auth(),...(options.headers||{})}});if(!r.ok){let e={};try{e=await r.json()}catch{}throw Error(e.detail||r.status)}return r.json()}function say(s){$('notice').textContent=s}async function loadHistory(){const id=$('task').value;if(!id)return;const rows=await api('/tasks/'+encodeURIComponent(id)+'/scenario-plans');const root=$('history');root.replaceChildren();if(!rows.length)root.textContent='No saved plans for this task.';for(const row of rows){const b=document.createElement('button');b.className='secondary';b.textContent=new Date(row.created_at).toLocaleString()+' · '+row.results.supplier_risk+' risk · '+row.id;b.onclick=()=>{$('result').textContent=JSON.stringify({assumptions:row.assumptions,results:row.results},null,2)};root.append(b)}}async function load(){try{if($('token').value.trim())sessionStorage.setItem('radar-token',$('token').value.trim());const [tasks,forecasts]=await Promise.all([api('/tasks?status=open&kind=renewal'),api('/renewal-forecast/runs')]);const task=$('task');task.replaceChildren();for(const item of tasks)task.append(new Option(item.title+' · notice '+item.due_date,item.id));task.onchange=loadHistory;const forecast=$('forecast');forecast.replaceChildren(new Option('No forecast selected',''));for(const item of forecasts)forecast.append(new Option(item.period_start+' – '+item.period_end+' · '+item.contract_count+' contracts',item.id));await loadHistory();say('Loaded '+tasks.length+' renewal task(s).')}catch(e){say('Could not load planner: '+e.message)}}async function plan(){try{const payload={renewal_increase_pct:Number($('increase').value),renegotiation_savings_pct:Number($('savings').value),termination_transition_cost:Number($('transition').value),horizon_months:Number($('horizon').value),as_of_date:$('asOf').value||null,forecast_id:$('forecast').value||null,assumptions_note:$('note').value.trim()};const item=await api('/tasks/'+encodeURIComponent($('task').value)+'/scenario-plans',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});$('result').textContent=JSON.stringify({assumptions:item.assumptions,results:item.results},null,2);await loadHistory();say('Scenario plan saved to the renewal audit history.')}catch(e){say('Could not save scenario plan: '+e.message)}}const saved=sessionStorage.getItem('radar-token');if(saved)$('token').value=saved;load();
+const $=id=>document.getElementById(id);function auth(){const t=$('token').value.trim()||sessionStorage.getItem('radar-token')||'';return t?{Authorization:'Bearer '+t}:{}}async function api(path,options={}){const r=await fetch(path,{...options,headers:{...auth(),...(options.headers||{})}});if(!r.ok){let e={};try{e=await r.json()}catch{}throw Error(e.detail||r.status)}return r.json()}function say(s){$('notice').textContent=s}async function loadHistory(){const id=$('task').value;if(!id)return;const rows=await api('/tasks/'+encodeURIComponent(id)+'/scenario-plans');const root=$('history');root.replaceChildren();if(!rows.length)root.textContent='No saved plans for this task.';for(const row of rows){const b=document.createElement('button');b.className='secondary';b.textContent=new Date(row.created_at).toLocaleString()+' · '+row.results.supplier_risk+' risk · '+row.id;b.onclick=()=>{$('result').textContent=JSON.stringify({assumptions:row.assumptions,results:row.results},null,2)};root.append(b)}}async function load(){try{if($('token').value.trim())sessionStorage.setItem('radar-token',$('token').value.trim());const [tasks,forecasts,calibration]=await Promise.all([api('/tasks?status=open&kind=renewal'),api('/renewal-forecast/runs'),api('/renewal-forecast/calibration')]);if(calibration.profile){$('increase').value=calibration.profile.renewal_increase_pct;$('savings').value=calibration.profile.renegotiation_savings_pct;say('Loaded adopted portfolio assumptions. You can edit them for this plan.')}const task=$('task');task.replaceChildren();for(const item of tasks)task.append(new Option(item.title+' · notice '+item.due_date,item.id));task.onchange=loadHistory;const forecast=$('forecast');forecast.replaceChildren(new Option('No forecast selected',''));for(const item of forecasts)forecast.append(new Option(item.period_start+' – '+item.period_end+' · '+item.contract_count+' contracts',item.id));await loadHistory();if(!calibration.profile)say('Loaded '+tasks.length+' renewal task(s).')}catch(e){say('Could not load planner: '+e.message)}}async function plan(){try{const payload={renewal_increase_pct:Number($('increase').value),renegotiation_savings_pct:Number($('savings').value),termination_transition_cost:Number($('transition').value),horizon_months:Number($('horizon').value),as_of_date:$('asOf').value||null,forecast_id:$('forecast').value||null,assumptions_note:$('note').value.trim()};const item=await api('/tasks/'+encodeURIComponent($('task').value)+'/scenario-plans',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});$('result').textContent=JSON.stringify({assumptions:item.assumptions,results:item.results},null,2);await loadHistory();say('Scenario plan saved to the renewal audit history.')}catch(e){say('Could not save scenario plan: '+e.message)}}const saved=sessionStorage.getItem('radar-token');if(saved)$('token').value=saved;load();
 </script></body></html>'''
 
 _DATA_GOVERNANCE_HTML = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Renewal Radar · Data governance</title><style>
@@ -2123,6 +2564,12 @@ _RENEWAL_SENSITIVITY_HTML = r'''<!doctype html><html lang="en"><head><meta chars
 body{font:15px/1.5 system-ui,sans-serif;color:#182230;background:#f3f6fa;margin:0}header{background:#10243a;color:white;padding:20px 28px}main{max-width:1100px;margin:22px auto;padding:0 18px}.bar,.panel{background:#fff;border:1px solid #dbe2ea;border-radius:9px;padding:16px;margin:12px 0}.bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.bar a{color:#1677c8}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}label{display:block;font-weight:600;margin:8px 0}input,select,button{font:inherit;padding:9px;border:1px solid #cbd5e1;border-radius:6px}input,select{display:block;width:100%;box-sizing:border-box;margin-top:4px}button{background:#1677c8;color:white;border:0;cursor:pointer;font-weight:650;margin-top:12px}.notice{min-height:22px;color:#b42318}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f7fa;padding:14px;border-radius:6px;max-height:70vh;overflow:auto}.muted{color:#64748b}@media(max-width:650px){.grid{grid-template-columns:1fr}}
 </style></head><body><header><h1>Renewal sensitivity analysis</h1><p>Vary cost assumptions and planning horizons across a bounded grid. Every row exposes inputs, components, differences, and lowest-cost options.</p></header><main><div class="bar"><input id="token" type="password" placeholder="Reviewer bearer token" aria-label="Bearer token"><button onclick="load()">Connect / refresh</button><a href="/auth/oidc/login">Sign in with SSO</a><a href="/renewal-scenarios">Scenario planner</a><a href="/renewal-decisions/workspace">Renewal decisions</a></div><p id="notice" class="notice" role="status"></p><section class="panel"><h2>Assumption ranges</h2><label>Renewal task<select id="task"></select></label><label>Saved forecast (optional)<select id="forecast"><option value="">No forecast selected</option></select></label><div class="grid"><label>Renewal increases, % (comma separated)<input id="increases" value="0, 5, 10"></label><label>Negotiation savings, %<input id="savings" value="5, 10, 15"></label><label>Termination transition costs<input id="transitions" value="0, 25000"></label><label>Planning horizons, months<input id="horizons" value="12, 24, 36"></label></div><label>As-of date (optional)<input id="asOf" type="date"></label><button onclick="analyze()">Calculate sensitivity matrix</button><p class="muted">At most 250 assumption combinations are accepted. A transition cost is assumed to use the contract currency.</p></section><section class="panel"><h2>Comparison matrix</h2><pre id="result" class="muted">Choose a task and calculate to view the full matrix.</pre></section></main><script>
 const $=id=>document.getElementById(id);function auth(){const t=$('token').value.trim()||sessionStorage.getItem('radar-token')||'';return t?{Authorization:'Bearer '+t}:{}}async function api(path,options={}){const r=await fetch(path,{...options,headers:{...auth(),...(options.headers||{})}});if(!r.ok){let e={};try{e=await r.json()}catch{}throw Error(e.detail||r.status)}return r.json()}function say(s){$('notice').textContent=s}function axis(id,integer=false){const values=$ (id).value.split(',').map(x=>x.trim()).filter(Boolean).map(Number);if(values.some(x=>!Number.isFinite(x)||(integer&&!Number.isInteger(x))))throw Error('Enter comma-separated valid numbers for '+id);return values}async function load(){try{if($('token').value.trim())sessionStorage.setItem('radar-token',$('token').value.trim());const [tasks,forecasts]=await Promise.all([api('/tasks?status=open&kind=renewal'),api('/renewal-forecast/runs')]);$('task').replaceChildren();for(const task of tasks)$('task').append(new Option(task.title+' · notice '+task.due_date,task.id));$('forecast').replaceChildren(new Option('No forecast selected',''));for(const forecast of forecasts)$('forecast').append(new Option(forecast.period_start+' – '+forecast.period_end+' · '+forecast.contract_count+' contracts',forecast.id));say('Loaded '+tasks.length+' renewal task(s).')}catch(e){say('Could not load planner: '+e.message)}}async function analyze(){try{const payload={renewal_increase_pcts:axis('increases'),renegotiation_savings_pcts:axis('savings'),termination_transition_costs:axis('transitions'),horizon_months:axis('horizons',true),as_of_date:$('asOf').value||null,forecast_id:$('forecast').value||null};const result=await api('/tasks/'+encodeURIComponent($('task').value)+'/scenario-sensitivity',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});$('result').textContent=JSON.stringify(result,null,2);say('Calculated '+result.combination_count+' combinations.')}catch(e){say('Could not calculate sensitivity: '+e.message)}}const saved=sessionStorage.getItem('radar-token');if(saved)$('token').value=saved;load();
+</script></body></html>'''
+
+_RENEWAL_CALIBRATION_HTML = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Renewal Radar · Forecast calibration</title><style>
+body{font:15px/1.5 system-ui,sans-serif;color:#182230;background:#f3f6fa;margin:0}header{background:#10243a;color:white;padding:20px 28px}main{max-width:1100px;margin:22px auto;padding:0 18px}.bar,.panel{background:#fff;border:1px solid #dbe2ea;border-radius:9px;padding:16px;margin:12px 0}.bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.bar a{color:#1677c8}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}label{display:block;font-weight:600;margin:8px 0}input,select,button{font:inherit;padding:9px;border:1px solid #cbd5e1;border-radius:6px}input,select{display:block;width:100%;box-sizing:border-box;margin-top:4px}button{background:#1677c8;color:white;border:0;cursor:pointer;font-weight:650;margin:8px 6px 0 0}.notice{min-height:22px;color:#b42318}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f7fa;padding:14px;max-height:55vh;overflow:auto}.muted{color:#64748b}@media(max-width:700px){.grid{grid-template-columns:1fr}}
+</style></head><body><header><h1>Forecast calibration</h1><p>Review historical estimate errors, filter to a reporting window, and adopt revised planning assumptions with an audit record.</p></header><main><div class="bar"><input id="token" type="password" placeholder="Reviewer bearer token" aria-label="Bearer token"><button onclick="load()">Connect / refresh report</button><a href="/renewal-decisions/workspace">Renewal decisions</a><a href="/renewal-scenarios">Scenario planner</a></div><p id="notice" class="notice" role="status"></p><section class="panel"><h2>Report window</h2><div class="grid"><label>From date<input id="from" type="date"></label><label>Through date<input id="to" type="date"></label><label>Supplier filter<input id="supplier" placeholder="All suppliers"></label></div><button onclick="load()">Refresh report</button><pre id="report" class="muted">Load the report to see linked outcome errors by scenario and month.</pre></section><section class="panel"><h2>Adopt planning assumptions</h2><p id="profile" class="muted">No assumptions adopted for this tenant.</p><div class="grid"><label>Renewal increase (%)<input id="increase" type="number" min="-100" max="500" step="0.01"></label><label>Renegotiation savings (%)<input id="savings" type="number" min="0" max="100" step="0.01"></label><label>Rationale<input id="rationale" maxlength="1000" placeholder="Why should the portfolio use these values?"></label></div><button onclick="useRecommendations()">Use historical recommendations</button><button onclick="adopt()">Adopt assumptions</button><p class="muted">Adoption records the reviewer, rationale, date window, and sample count. It does not silently change existing forecasts.</p></section></main><script>
+const $=id=>document.getElementById(id);function auth(){const t=$('token').value.trim()||sessionStorage.getItem('radar-token')||'';return t?{Authorization:'Bearer '+t}:{}}async function api(path,options={}){const r=await fetch(path,{...options,headers:{...auth(),...(options.headers||{})}});if(!r.ok){let e={};try{e=await r.json()}catch{}throw Error(typeof e.detail==='string'?e.detail:JSON.stringify(e.detail)||r.status)}return r.json()}function say(s){$('notice').textContent=s}function reportPath(){const q=new URLSearchParams();if($('from').value)q.set('from_date',$('from').value);if($('to').value)q.set('to_date',$('to').value);if($('supplier').value.trim())q.set('supplier',$('supplier').value.trim());return '/renewal-scenario-feedback?'+q.toString()}async function load(){try{if($('token').value.trim())sessionStorage.setItem('radar-token',$('token').value.trim());const [report,calibration]=await Promise.all([api(reportPath()),api('/renewal-forecast/calibration')]);$('report').textContent=JSON.stringify(report,null,2);const p=calibration.profile;if(p){$('profile').textContent='Current assumptions: renewal increase '+p.renewal_increase_pct+'% · renegotiation savings '+p.renegotiation_savings_pct+'% · adopted '+new Date(p.adopted_at).toLocaleString()+' by '+p.adopted_by+' · from '+p.source_outcome_count+' outcomes';}else $('profile').textContent='No assumptions adopted for this tenant.';say('Report loaded: '+report.linked_outcome_count+' linked outcome(s).')}catch(e){say('Could not load calibration report: '+e.message)}}function useRecommendations(){try{const r=JSON.parse($('report').textContent),a=r.recommended_assumptions;if(a.renewal_increase_pct===null||a.renegotiation_savings_pct===null)throw Error('Both recommendations need historical data.');$('increase').value=a.renewal_increase_pct;$('savings').value=a.renegotiation_savings_pct;say('Historical median assumptions copied. Review and enter a rationale before adoption.')}catch(e){say(e.message)}}async function adopt(){try{const payload={renewal_increase_pct:Number($('increase').value),renegotiation_savings_pct:Number($('savings').value),rationale:$('rationale').value.trim()};if($('from').value)payload.report_window_start=$('from').value;if($('to').value)payload.report_window_end=$('to').value;const result=await api('/renewal-forecast/calibration/adopt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});$('profile').textContent=JSON.stringify(result.profile,null,2);say('Calibration assumptions adopted and audit recorded.')}catch(e){say('Could not adopt assumptions: '+e.message)}}const saved=sessionStorage.getItem('radar-token');if(saved)$('token').value=saved;load();
 </script></body></html>'''
 
 _DATA_GOVERNANCE_PREVIEW_HTML = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Renewal Radar · Data governance</title><style>

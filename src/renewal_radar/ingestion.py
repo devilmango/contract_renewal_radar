@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import hashlib
 from pathlib import Path
 from uuid import uuid4
 
@@ -53,6 +54,16 @@ def ingest_pdf_bytes(
             contract_id, safe_filename, provider_name, extracted, text, tenant_id,
             source_provider, source_key, external_id, revision, source_url,
         )
+        if created:
+            store.save_contract_document(
+                saved_id, tenant_id, safe_filename, "application/pdf", content,
+                hashlib.sha256(content).hexdigest(), f"integration:{source_provider}",
+                source_reference=source_url,
+            )
         return saved_id, created
     store.save_contract(contract_id, safe_filename, provider_name, extracted, text, actor, tenant_id)
+    store.save_contract_document(
+        contract_id, tenant_id, safe_filename, "application/pdf", content,
+        hashlib.sha256(content).hexdigest(), actor,
+    )
     return contract_id, True

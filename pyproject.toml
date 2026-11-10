@@ -34,6 +34,7 @@ llm-all = [
 ocr = ["pymupdf>=1.24,<2.0", "pytesseract>=0.3.10,<1.0"]
 test = ["pytest>=8.0,<9.0"]
 database = ["psycopg[binary]>=3.2,<4.0"]
+audit-s3 = ["boto3>=1.34,<2.0"]
 
 [project.scripts]
 renewal-radar = "renewal_radar.cli:main"

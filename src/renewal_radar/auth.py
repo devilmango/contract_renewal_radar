@@ -83,6 +83,10 @@ class AuthRegistry:
         self.users = users
         self.oidc = oidc
         self._jwks_client = None
+        self.store = None
+
+    def bind_store(self, store) -> None:
+        self.store = store
 
     @classmethod
     def from_env(cls) -> "AuthRegistry":
@@ -138,6 +142,7 @@ class AuthRegistry:
                 "audience": audience,
                 "roles_claim": os.getenv("OIDC_ROLES_CLAIM", "roles"),
                 "tenant_claim": os.getenv("OIDC_TENANT_CLAIM", "tenant_id"),
+                "groups_claim": os.getenv("OIDC_GROUPS_CLAIM", "groups"),
             }
         return cls(records, oidc)
 
@@ -153,7 +158,10 @@ class AuthRegistry:
         digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
         for record in self.users:
             if hmac.compare_digest(digest, record.token_sha256):
-                return record.principal
+                principal = record.principal
+                if self.store and not self.store.scim_user_is_active(principal.tenant_id, principal.actor, principal.email):
+                    return None
+                return principal
         if self.oidc:
             claims = self.verify_oidc_token(token)
             if claims is None:
@@ -164,10 +172,25 @@ class AuthRegistry:
             roles = frozenset(role for role in raw_roles if role in SUPPORTED_ROLES) if isinstance(raw_roles, list) else frozenset()
             tenant_id = claims.get(self.oidc["tenant_claim"])
             actor = claims.get("preferred_username") or claims.get("email") or claims.get("sub")
-            if not roles or not isinstance(tenant_id, str) or not tenant_id.strip() or not isinstance(actor, str):
+            if not isinstance(tenant_id, str) or not tenant_id.strip() or not isinstance(actor, str):
                 return None
             email = claims.get("email")
-            return Principal(actor, roles, email if isinstance(email, str) else None, tenant_id)
+            email = email if isinstance(email, str) else None
+            if self.store:
+                raw_groups = claims.get(self.oidc.get("groups_claim", "groups"), [])
+                groups = [value for value in raw_groups if isinstance(value, str)] if isinstance(raw_groups, list) else ([raw_groups] if isinstance(raw_groups, str) else [])
+                resolution = self.store.resolve_scim_identity(tenant_id.strip(), str(claims.get("sub") or ""), email, groups)
+                if not resolution["allowed"]:
+                    return None
+                if resolution["roles"] is not None:
+                    roles = frozenset(role for role in resolution["roles"] if role in SUPPORTED_ROLES)
+                    if not roles:
+                        return None
+                elif resolution.get("user") and not bool(resolution["user"]["active"]):
+                    return None
+            if not roles:
+                return None
+            return Principal(actor, roles, email, tenant_id)
         return None
 
     def verify_oidc_token(self, token: str) -> dict | None:

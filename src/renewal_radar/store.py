@@ -97,6 +97,19 @@ class Store:
                     tenant_id TEXT NOT NULL DEFAULT 'default',
                     supplier_id TEXT
                 );
+                CREATE TABLE IF NOT EXISTS contract_documents (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    contract_id TEXT NOT NULL REFERENCES contracts(id),
+                    document_type TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    content_type TEXT NOT NULL,
+                    content BLOB NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    source_reference TEXT,
+                    uploaded_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS suppliers (
                     id TEXT PRIMARY KEY,
                     tenant_id TEXT NOT NULL,
@@ -245,6 +258,102 @@ class Store:
                     results_json TEXT NOT NULL,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS renewal_signature_envelopes (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    decision_id TEXT NOT NULL REFERENCES renewal_decisions(id),
+                    contract_id TEXT NOT NULL REFERENCES contracts(id),
+                    provider_envelope_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_event_id TEXT,
+                    failure_detail TEXT,
+                    UNIQUE(tenant_id, provider_envelope_id)
+                );
+                CREATE TABLE IF NOT EXISTS renewal_signature_events (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    envelope_record_id TEXT NOT NULL REFERENCES renewal_signature_envelopes(id),
+                    provider_event_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    UNIQUE(tenant_id, provider_event_id)
+                );
+                CREATE TABLE IF NOT EXISTS audit_archive_uploads (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    bucket TEXT NOT NULL,
+                    object_key TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    checksum_sha256 TEXT NOT NULL,
+                    record_count INTEGER NOT NULL,
+                    object_version_id TEXT,
+                    retention_mode TEXT NOT NULL,
+                    retain_until TEXT NOT NULL,
+                    verification_status TEXT NOT NULL,
+                    failure_detail TEXT,
+                    uploaded_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    verified_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS scim_credentials (
+                    tenant_id TEXT PRIMARY KEY,
+                    token_sha256 TEXT NOT NULL UNIQUE,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS scim_users (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    external_id TEXT,
+                    user_name TEXT NOT NULL,
+                    display_name TEXT,
+                    email TEXT,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    attributes_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(tenant_id, user_name)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_scim_user_external ON scim_users(tenant_id,external_id) WHERE external_id IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS scim_groups (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    external_id TEXT,
+                    display_name TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(tenant_id, display_name)
+                );
+                CREATE TABLE IF NOT EXISTS scim_group_members (
+                    tenant_id TEXT NOT NULL,
+                    group_id TEXT NOT NULL REFERENCES scim_groups(id),
+                    user_id TEXT NOT NULL REFERENCES scim_users(id),
+                    PRIMARY KEY(tenant_id, group_id, user_id)
+                );
+                CREATE TABLE IF NOT EXISTS scim_group_role_mappings (
+                    tenant_id TEXT NOT NULL,
+                    group_identifier TEXT NOT NULL,
+                    roles_json TEXT NOT NULL,
+                    updated_by TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(tenant_id, group_identifier)
+                );
+                CREATE TABLE IF NOT EXISTS renewal_calibration_profiles (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    renewal_increase_pct TEXT NOT NULL,
+                    renegotiation_savings_pct TEXT NOT NULL,
+                    rationale TEXT NOT NULL,
+                    report_window_start TEXT,
+                    report_window_end TEXT,
+                    source_outcome_count INTEGER NOT NULL,
+                    adopted_by TEXT NOT NULL,
+                    adopted_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS data_retention_policies (
                     tenant_id TEXT PRIMARY KEY,
@@ -655,6 +764,7 @@ class Store:
                 """
             if self.is_postgres:
                 schema = schema.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+                schema = schema.replace("content BLOB NOT NULL", "content BYTEA NOT NULL")
             db.executescript(schema)
             if self.is_postgres:
                 db.execute("ALTER TABLE notification_deliveries ADD COLUMN IF NOT EXISTS recipient TEXT")
@@ -664,6 +774,7 @@ class Store:
                 db.execute("ALTER TABLE data_retention_policies ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1")
                 db.execute("ALTER TABLE renewal_decisions ADD COLUMN IF NOT EXISTS scenario_plan_id TEXT")
                 db.execute("ALTER TABLE renewal_outcomes ADD COLUMN IF NOT EXISTS actual_transition_cost TEXT")
+                db.execute("ALTER TABLE audit_archive_uploads ADD COLUMN IF NOT EXISTS bucket TEXT NOT NULL DEFAULT ''")
             else:
                 for table, column, declaration in (
                     ("notification_deliveries", "recipient", "TEXT"),
@@ -673,6 +784,7 @@ class Store:
                     ("data_retention_policies", "version", "INTEGER NOT NULL DEFAULT 1"),
                     ("renewal_decisions", "scenario_plan_id", "TEXT"),
                     ("renewal_outcomes", "actual_transition_cost", "TEXT"),
+                    ("audit_archive_uploads", "bucket", "TEXT NOT NULL DEFAULT ''"),
                 ):
                     columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
                     if column not in columns:
@@ -765,6 +877,69 @@ class Store:
                 (contract_id, filename, provider, data.model_dump_json(), raw_text, now, tenant_id),
             )
             self.add_audit(db, contract_id, "contract.ingested", actor, {"filename": filename, "provider": provider}, tenant_id)
+
+    def save_contract_document(
+        self, contract_id: str, tenant_id: str, filename: str, content_type: str, content: bytes,
+        sha256: str, actor: str, document_type: str = "source", source_reference: str | None = None,
+    ) -> dict[str, Any]:
+        document_id, now = str(uuid4()), utc_now().isoformat()
+        with self.connect() as db:
+            contract = db.execute("SELECT id FROM contracts WHERE id=? AND tenant_id=?", (contract_id, tenant_id)).fetchone()
+            if not contract:
+                raise ValueError("Contract document must belong to a contract in this tenant")
+            db.execute(
+                "INSERT INTO contract_documents (id,tenant_id,contract_id,document_type,filename,content_type,content,sha256,source_reference,uploaded_by,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (document_id,tenant_id,contract_id,document_type,filename,content_type,content,sha256,source_reference,actor,now),
+            )
+            self.add_audit(db, contract_id, "contract.document_attached", actor, {
+                "document_id": document_id, "document_type": document_type, "filename": filename,
+                "content_type": content_type, "sha256": sha256, "source_reference": source_reference,
+            }, tenant_id)
+            self._governance_event(db, tenant_id, "contract.document_attached", "contract_document", document_id,
+                                   actor, {"contract_id": contract_id, "document_type": document_type, "sha256": sha256}, now)
+        return self.get_contract_document(document_id, tenant_id, include_content=False)
+
+    def get_contract_document(
+        self, document_id: str, tenant_id: str, *, include_content: bool = False,
+    ) -> dict[str, Any] | None:
+        columns = "*" if include_content else "id,tenant_id,contract_id,document_type,filename,content_type,sha256,source_reference,uploaded_by,created_at"
+        with self.connect() as db:
+            row = db.execute(f"SELECT {columns} FROM contract_documents WHERE id=? AND tenant_id=?", (document_id,tenant_id)).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        if include_content:
+            result["content"] = bytes(result["content"])
+        return result
+
+    def latest_contract_document(self, contract_id: str, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM contract_documents WHERE contract_id=? AND tenant_id=? AND document_type='source' ORDER BY created_at DESC,id DESC LIMIT 1",
+                (contract_id,tenant_id),
+            ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["content"] = bytes(result["content"])
+        return result
+
+    def list_contract_documents(self, contract_id: str, tenant_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT id,document_type,filename,content_type,sha256,source_reference,uploaded_by,created_at "
+                "FROM contract_documents WHERE contract_id=? AND tenant_id=? ORDER BY created_at,id",
+                (contract_id,tenant_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def contract_document_source_exists(self, contract_id: str, tenant_id: str, document_type: str, source_reference: str) -> bool:
+        with self.connect() as db:
+            return db.execute(
+                "SELECT 1 FROM contract_documents WHERE contract_id=? AND tenant_id=? AND document_type=? AND source_reference=? LIMIT 1",
+                (contract_id,tenant_id,document_type,source_reference),
+            ).fetchone() is not None
 
     def external_document_exists(self, tenant_id: str, provider: str, source_key: str, external_id: str, revision: str) -> bool:
         with self.connect() as db:
@@ -2329,6 +2504,7 @@ class Store:
                              "terminate": {"terminated", "expired", "no_action"}}
         return {
             "scenario_plan_id": plan["id"], "scenario": strategy,
+            "recorded_at": outcome.get("recorded_at"),
             "outcome": actual_outcome,
             "decision_matches_outcome": actual_outcome in expected_outcomes[strategy],
             "currency": results.get("currency"), "actual_currency": outcome.get("currency"),
@@ -2475,6 +2651,308 @@ class Store:
             self._renewal_decision_event(db,tenant_id,decision_id,"approved" if approved else "rejected",{"comment":comment},actor,now)
             self.add_audit(db,row["contract_id"],f"renewal.decision_{status}",actor,{"decision_id":decision_id,"comment":comment},tenant_id)
         return self.get_renewal_decision(decision_id,tenant_id)
+
+    def create_signature_envelope_record(
+        self, decision_id: str, tenant_id: str, provider_envelope_id: str, actor: str,
+        status: str = "sent",
+    ) -> dict[str, Any]:
+        if status not in {"created", "sent"}:
+            raise ValueError("New signature handoffs must be created or sent")
+        record_id, now = str(uuid4()), utc_now().isoformat()
+        with self.connect() as db:
+            decision = db.execute(
+                "SELECT * FROM renewal_decisions WHERE id=? AND tenant_id=?", (decision_id,tenant_id),
+            ).fetchone()
+            if not decision:
+                raise KeyError("Renewal decision not found")
+            if decision["status"] != "approved":
+                raise ValueError("Only an approved renewal decision can be sent for signature")
+            existing = db.execute(
+                "SELECT * FROM renewal_signature_envelopes WHERE tenant_id=? AND provider_envelope_id=?",
+                (tenant_id,provider_envelope_id),
+            ).fetchone()
+            if existing:
+                return dict(existing)
+            db.execute(
+                "INSERT INTO renewal_signature_envelopes (id,tenant_id,decision_id,contract_id,provider_envelope_id,status,created_by,created_at,updated_at,last_event_id,failure_detail) "
+                "VALUES (?,?,?,?,?,?,?,?,?,NULL,NULL)",
+                (record_id,tenant_id,decision_id,decision["contract_id"],provider_envelope_id,status,actor,now,now),
+            )
+            self._renewal_decision_event(db,tenant_id,decision_id,"signature_envelope_linked",{
+                "envelope_record_id": record_id, "provider_envelope_id": provider_envelope_id, "status": status,
+            },actor,now)
+            self.add_audit(db,decision["contract_id"],"renewal.signature_envelope_linked",actor,{
+                "decision_id": decision_id, "envelope_record_id": record_id,
+                "provider_envelope_id": provider_envelope_id, "status": status,
+            },tenant_id)
+        return self.get_signature_envelope(record_id,tenant_id)
+
+    def get_signature_envelope(self, record_id: str, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM renewal_signature_envelopes WHERE id=? AND tenant_id=?", (record_id,tenant_id)).fetchone()
+            events = db.execute("SELECT * FROM renewal_signature_events WHERE envelope_record_id=? AND tenant_id=? ORDER BY received_at,id", (record_id,tenant_id)).fetchall() if row else []
+        if not row:
+            return None
+        result = dict(row)
+        result["events"] = [{**dict(event),"details":json.loads(event["details_json"])} for event in events]
+        return result
+
+    def list_signature_envelopes(self, decision_id: str, tenant_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute("SELECT id FROM renewal_signature_envelopes WHERE decision_id=? AND tenant_id=? ORDER BY created_at", (decision_id,tenant_id)).fetchall()
+        return [self.get_signature_envelope(row["id"],tenant_id) for row in rows]
+
+    def record_signature_envelope_event(
+        self, tenant_id: str, provider_envelope_id: str, provider_event_id: str,
+        event_type: str, status: str, details: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if status not in {"sent", "signed", "declined", "voided"}:
+            raise ValueError("Unsupported DocuSign envelope status")
+        now = utc_now().isoformat()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM renewal_signature_envelopes WHERE tenant_id=? AND provider_envelope_id=?",
+                (tenant_id,provider_envelope_id),
+            ).fetchone()
+            if not row:
+                return None
+            event_id = str(uuid4())
+            inserted = db.execute(
+                "INSERT INTO renewal_signature_events (id,tenant_id,envelope_record_id,provider_event_id,event_type,details_json,received_at) "
+                "VALUES (?,?,?,?,?,?,?) ON CONFLICT(tenant_id,provider_event_id) DO NOTHING",
+                (event_id,tenant_id,row["id"],provider_event_id,event_type,json.dumps(details,default=str),now),
+            )
+            if not inserted.rowcount:
+                return dict(row)
+            terminal = {"signed", "declined", "voided"}
+            final_status = row["status"] if row["status"] in terminal else status
+            db.execute(
+                "UPDATE renewal_signature_envelopes SET status=?,updated_at=?,last_event_id=?,failure_detail=NULL WHERE id=? AND tenant_id=?",
+                (final_status,now,provider_event_id,row["id"],tenant_id),
+            )
+            self._renewal_decision_event(db,tenant_id,row["decision_id"],"signature_envelope_"+status,{
+                "envelope_record_id":row["id"],"provider_envelope_id":provider_envelope_id,
+                "provider_event_id":provider_event_id,"event_type":event_type,
+            },"docusign-connect",now)
+            self.add_audit(db,row["contract_id"],"renewal.signature_envelope_"+status,"docusign-connect",{
+                "decision_id":row["decision_id"],"envelope_record_id":row["id"],
+                "provider_envelope_id":provider_envelope_id,"provider_event_id":provider_event_id,
+            },tenant_id)
+        return self.get_signature_envelope(row["id"],tenant_id)
+
+    def fail_signature_envelope(self, record_id: str, tenant_id: str, actor: str, error: str) -> None:
+        now = utc_now().isoformat()
+        safe_error = error[:1000]
+        with self.connect() as db:
+            row = db.execute("SELECT contract_id FROM renewal_signature_envelopes WHERE id=? AND tenant_id=?", (record_id,tenant_id)).fetchone()
+            if not row:
+                return
+            db.execute("UPDATE renewal_signature_envelopes SET failure_detail=?,updated_at=? WHERE id=? AND tenant_id=?",
+                       (safe_error,now,record_id,tenant_id))
+            self.add_audit(db,row["contract_id"],"renewal.signature_document_attach_failed",actor,{
+                "envelope_record_id":record_id,"error":safe_error,
+            },tenant_id)
+
+    def save_scim_credential(self, tenant_id: str, token_sha256: str, actor: str) -> None:
+        now = utc_now().isoformat()
+        with self.connect() as db:
+            db.execute("INSERT INTO scim_credentials (tenant_id,token_sha256,created_by,created_at) VALUES (?,?,?,?) "
+                       "ON CONFLICT(tenant_id) DO UPDATE SET token_sha256=excluded.token_sha256,created_by=excluded.created_by,created_at=excluded.created_at",
+                       (tenant_id,token_sha256,actor,now))
+            self._governance_event(db,tenant_id,"scim.credential_rotated","scim_credential",tenant_id,actor,{},now)
+
+    def scim_tenant_for_token(self, token_sha256: str) -> str | None:
+        with self.connect() as db:
+            row = db.execute("SELECT tenant_id FROM scim_credentials WHERE token_sha256=?", (token_sha256,)).fetchone()
+        return row["tenant_id"] if row else None
+
+    def scim_upsert_user(self, tenant_id: str, values: dict[str, Any], actor: str) -> dict[str, Any]:
+        now, user_id = utc_now().isoformat(), values.get("id") or str(uuid4())
+        user_name = (values.get("userName") or "").strip()
+        if not user_name:
+            raise ValueError("SCIM userName is required")
+        external_id = values.get("externalId")
+        display_name = values.get("displayName") or values.get("name", {}).get("formatted")
+        emails = values.get("emails") or []
+        email = next((item.get("value") for item in emails if isinstance(item, dict) and item.get("primary")), None)
+        email = email or next((item.get("value") for item in emails if isinstance(item, dict)), None)
+        active = int(bool(values.get("active", True)))
+        attrs = json.dumps({key:value for key,value in values.items() if key not in {"id","externalId","userName","displayName","name","emails","active","groups"}},default=str)
+        with self.connect() as db:
+            current = db.execute("SELECT id FROM scim_users WHERE tenant_id=? AND (user_name=? OR (? IS NOT NULL AND external_id=?)) ORDER BY CASE WHEN user_name=? THEN 0 ELSE 1 END LIMIT 1",
+                                 (tenant_id,user_name,external_id,external_id,user_name)).fetchone()
+            if current:
+                user_id = current["id"]
+                db.execute("UPDATE scim_users SET external_id=?,user_name=?,display_name=?,email=?,active=?,attributes_json=?,updated_at=? WHERE id=? AND tenant_id=?",
+                           (external_id,user_name,display_name,email,active,attrs,now,user_id,tenant_id))
+            else:
+                db.execute("INSERT INTO scim_users (id,tenant_id,external_id,user_name,display_name,email,active,attributes_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                           (user_id,tenant_id,external_id,user_name,display_name,email,active,attrs,now,now))
+            if "groups" in values:
+                db.execute("DELETE FROM scim_group_members WHERE user_id=? AND tenant_id=?", (user_id,tenant_id))
+                for member in values.get("groups") or []:
+                    group_ref = member.get("value") if isinstance(member,dict) else member
+                    group = db.execute("SELECT id FROM scim_groups WHERE tenant_id=? AND (id=? OR external_id=? OR display_name=?) LIMIT 1",
+                                       (tenant_id,str(group_ref),str(group_ref),str(group_ref))).fetchone()
+                    if group:
+                        db.execute("INSERT INTO scim_group_members (tenant_id,group_id,user_id) VALUES (?,?,?) ON CONFLICT DO NOTHING",
+                                   (tenant_id,group["id"],user_id))
+            self._governance_event(db,tenant_id,"scim.user_provisioned" if active else "scim.user_deactivated","scim_user",user_id,actor,
+                                   {"user_name":user_name,"active":bool(active)},now)
+        return self.get_scim_user(user_id,tenant_id)
+
+    def get_scim_user(self, user_id: str, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM scim_users WHERE id=? AND tenant_id=?", (user_id,tenant_id)).fetchone()
+            groups = db.execute("SELECT g.id,g.external_id,g.display_name FROM scim_groups g JOIN scim_group_members m ON m.group_id=g.id AND m.tenant_id=g.tenant_id WHERE m.user_id=? AND m.tenant_id=? ORDER BY g.display_name",
+                                (user_id,tenant_id)).fetchall() if row else []
+        if not row:
+            return None
+        user = dict(row)
+        user["active"] = bool(user["active"])
+        user["attributes"] = json.loads(user.pop("attributes_json"))
+        user["groups"] = [dict(group) for group in groups]
+        return user
+
+    def list_scim_users(self, tenant_id: str, start_index: int = 1, count: int = 100) -> tuple[list[dict[str, Any]], int]:
+        with self.connect() as db:
+            total = db.execute("SELECT COUNT(*) AS n FROM scim_users WHERE tenant_id=?", (tenant_id,)).fetchone()["n"]
+            rows = db.execute("SELECT id FROM scim_users WHERE tenant_id=? ORDER BY user_name LIMIT ? OFFSET ?",
+                              (tenant_id,count,start_index-1)).fetchall()
+        return [self.get_scim_user(row["id"],tenant_id) for row in rows], total
+
+    def scim_set_user_active(self, user_id: str, tenant_id: str, active: bool, actor: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT user_name FROM scim_users WHERE id=? AND tenant_id=?", (user_id,tenant_id)).fetchone()
+            if not row:
+                return None
+            db.execute("UPDATE scim_users SET active=?,updated_at=? WHERE id=? AND tenant_id=?",
+                       (int(active),utc_now().isoformat(),user_id,tenant_id))
+            self._governance_event(db,tenant_id,"scim.user_activated" if active else "scim.user_deactivated","scim_user",user_id,actor,
+                                   {"user_name":row["user_name"],"active":active})
+        return self.get_scim_user(user_id,tenant_id)
+
+    def scim_upsert_group(self, tenant_id: str, values: dict[str, Any]) -> dict[str, Any]:
+        now, group_id = utc_now().isoformat(), values.get("id") or str(uuid4())
+        name = (values.get("displayName") or "").strip()
+        if not name:
+            raise ValueError("SCIM group displayName is required")
+        with self.connect() as db:
+            row = db.execute("SELECT id FROM scim_groups WHERE tenant_id=? AND (display_name=? OR (? IS NOT NULL AND external_id=?)) LIMIT 1",
+                             (tenant_id,name,values.get("externalId"),values.get("externalId"))).fetchone()
+            if row:
+                group_id = row["id"]
+                db.execute("UPDATE scim_groups SET external_id=?,display_name=?,updated_at=? WHERE id=? AND tenant_id=?",
+                           (values.get("externalId"),name,now,group_id,tenant_id))
+            else:
+                db.execute("INSERT INTO scim_groups (id,tenant_id,external_id,display_name,created_at,updated_at) VALUES (?,?,?,?,?,?)",
+                           (group_id,tenant_id,values.get("externalId"),name,now,now))
+            if "members" in values:
+                db.execute("DELETE FROM scim_group_members WHERE group_id=? AND tenant_id=?", (group_id,tenant_id))
+                for member in values.get("members") or []:
+                    reference = member.get("value") if isinstance(member,dict) else member
+                    user = db.execute("SELECT id FROM scim_users WHERE tenant_id=? AND (id=? OR external_id=? OR user_name=?) LIMIT 1",
+                                      (tenant_id,str(reference),str(reference),str(reference))).fetchone()
+                    if user:
+                        db.execute("INSERT INTO scim_group_members (tenant_id,group_id,user_id) VALUES (?,?,?) ON CONFLICT DO NOTHING",
+                                   (tenant_id,group_id,user["id"]))
+            self._governance_event(db,tenant_id,"scim.group_provisioned","scim_group",group_id,"scim",{"display_name":name},now)
+        return self.get_scim_group(group_id,tenant_id)
+
+    def get_scim_group(self, group_id: str, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM scim_groups WHERE id=? AND tenant_id=?", (group_id,tenant_id)).fetchone()
+            members = db.execute("SELECT u.id,u.external_id,u.user_name, u.display_name FROM scim_users u JOIN scim_group_members m ON m.user_id=u.id AND m.tenant_id=u.tenant_id WHERE m.group_id=? AND m.tenant_id=? ORDER BY u.user_name",
+                                 (group_id,tenant_id)).fetchall() if row else []
+        return {**dict(row),"members":[dict(member) for member in members]} if row else None
+
+    def list_scim_groups(self, tenant_id: str, start_index: int = 1, count: int = 100) -> tuple[list[dict[str, Any]], int]:
+        with self.connect() as db:
+            total = db.execute("SELECT COUNT(*) AS n FROM scim_groups WHERE tenant_id=?", (tenant_id,)).fetchone()["n"]
+            rows = db.execute("SELECT id FROM scim_groups WHERE tenant_id=? ORDER BY display_name LIMIT ? OFFSET ?",
+                              (tenant_id,count,start_index-1)).fetchall()
+        return [self.get_scim_group(row["id"],tenant_id) for row in rows], total
+
+    def scim_update_group_members(self, group_id: str, tenant_id: str, values: list[dict[str, Any]], operation: str) -> dict[str, Any] | None:
+        if operation not in {"add", "remove", "replace"}:
+            raise ValueError("SCIM group operation must be add, remove, or replace")
+        with self.connect() as db:
+            group = db.execute("SELECT * FROM scim_groups WHERE id=? AND tenant_id=?", (group_id,tenant_id)).fetchone()
+            if not group:
+                return None
+            if operation == "replace":
+                db.execute("DELETE FROM scim_group_members WHERE tenant_id=? AND group_id=?", (tenant_id,group_id))
+            for item in values:
+                reference = str(item.get("value", ""))
+                user = db.execute("SELECT id FROM scim_users WHERE tenant_id=? AND (id=? OR external_id=? OR user_name=?) LIMIT 1",
+                                  (tenant_id,reference,reference,reference)).fetchone()
+                if not user:
+                    continue
+                if operation == "remove":
+                    db.execute("DELETE FROM scim_group_members WHERE tenant_id=? AND group_id=? AND user_id=?",
+                               (tenant_id,group_id,user["id"]))
+                if operation in {"add", "replace"}:
+                    db.execute("INSERT INTO scim_group_members (tenant_id,group_id,user_id) VALUES (?,?,?) ON CONFLICT DO NOTHING",
+                               (tenant_id,group_id,user["id"]))
+            self._governance_event(db,tenant_id,"scim.group_members_updated","scim_group",group_id,"scim",
+                                   {"operation":operation,"member_count":len(values)})
+        return self.get_scim_group(group_id,tenant_id)
+
+    def scim_delete_group(self, group_id: str, tenant_id: str) -> bool:
+        with self.connect() as db:
+            group = db.execute("SELECT external_id,display_name FROM scim_groups WHERE id=? AND tenant_id=?", (group_id,tenant_id)).fetchone()
+            if not group:
+                return False
+            identifiers = {value for value in (group["external_id"],group["display_name"]) if value}
+            for identifier in identifiers:
+                db.execute("DELETE FROM scim_group_role_mappings WHERE tenant_id=? AND group_identifier=?", (tenant_id,identifier))
+            db.execute("DELETE FROM scim_group_members WHERE tenant_id=? AND group_id=?", (tenant_id,group_id))
+            db.execute("DELETE FROM scim_groups WHERE id=? AND tenant_id=?", (group_id,tenant_id))
+            self._governance_event(db,tenant_id,"scim.group_deleted","scim_group",group_id,"scim",
+                                   {"display_name":group["display_name"]})
+            return True
+
+    def save_scim_group_role_mapping(self, tenant_id: str, group_identifier: str, roles: list[str], actor: str) -> dict[str, Any]:
+        now = utc_now().isoformat()
+        with self.connect() as db:
+            db.execute("INSERT INTO scim_group_role_mappings (tenant_id,group_identifier,roles_json,updated_by,updated_at) VALUES (?,?,?,?,?) "
+                       "ON CONFLICT(tenant_id,group_identifier) DO UPDATE SET roles_json=excluded.roles_json,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+                       (tenant_id,group_identifier,json.dumps(sorted(set(roles))),actor,now))
+            self._governance_event(db,tenant_id,"scim.group_roles_mapped","scim_group_role_mapping",group_identifier,actor,{"roles":sorted(set(roles))},now)
+        return {"tenant_id":tenant_id,"group_identifier":group_identifier,"roles":sorted(set(roles)),"updated_by":actor,"updated_at":now}
+
+    def delete_scim_group_role_mapping(self, tenant_id: str, group_identifier: str, actor: str) -> bool:
+        with self.connect() as db:
+            deleted = db.execute("DELETE FROM scim_group_role_mappings WHERE tenant_id=? AND group_identifier=?",
+                                 (tenant_id,group_identifier))
+            if not deleted.rowcount:
+                return False
+            self._governance_event(db,tenant_id,"scim.group_roles_unmapped","scim_group_role_mapping",group_identifier,actor,{})
+            return True
+
+    def resolve_scim_identity(self, tenant_id: str, subject: str, email: str | None, groups: list[str]) -> dict[str, Any]:
+        """Enforce SCIM deprovisioning and resolve configured OIDC group-to-role grants."""
+        with self.connect() as db:
+            user = db.execute("SELECT * FROM scim_users WHERE tenant_id=? AND ((external_id=? AND ?!='') OR (lower(user_name)=lower(?) AND ?!='') OR (lower(COALESCE(email,''))=lower(?) AND ?!='')) ORDER BY CASE WHEN external_id=? THEN 0 ELSE 1 END LIMIT 1",
+                              (tenant_id,subject,subject,email or "",email or "",email or "",email or "",subject)).fetchone()
+            mappings = db.execute("SELECT group_identifier,roles_json FROM scim_group_role_mappings WHERE tenant_id=?", (tenant_id,)).fetchall()
+        if user and not bool(user["active"]):
+            return {"allowed":False,"roles":[]}
+        if not mappings:
+            return {"allowed":True,"roles":None,"user":dict(user) if user else None}
+        allowed: set[str] = set()
+        normalized_groups = {value.casefold() for value in groups}
+        for row in mappings:
+            if row["group_identifier"].casefold() in normalized_groups:
+                allowed.update(json.loads(row["roles_json"]))
+        # When group-role mapping is enabled, a provisioned active SCIM user and a mapped group are required.
+        return {"allowed":bool(user and bool(user["active"]) and allowed),"roles":sorted(allowed),"user":dict(user) if user else None}
+
+    def scim_user_is_active(self, tenant_id: str, actor: str, email: str | None = None) -> bool:
+        with self.connect() as db:
+            row = db.execute("SELECT active FROM scim_users WHERE tenant_id=? AND (lower(user_name)=lower(?) OR (? IS NOT NULL AND lower(email)=lower(?))) LIMIT 1",
+                              (tenant_id,actor,email,email)).fetchone()
+        return not row or bool(row["active"])
 
     def complete_renewal_decision(self, decision_id: str, tenant_id: str, request: dict[str, Any], actor: str) -> dict[str, Any] | None:
         now=utc_now().isoformat()
@@ -2668,7 +3146,10 @@ class Store:
             },
         }
 
-    def renewal_scenario_outcome_feedback(self, tenant_id: str) -> dict[str, Any]:
+    def renewal_scenario_outcome_feedback(
+        self, tenant_id: str, from_date: date | None = None, to_date: date | None = None,
+        supplier: str | None = None, strategy: str | None = None,
+    ) -> dict[str, Any]:
         """Summarize observed error for scenario plans explicitly linked to completed decisions."""
         decisions = self.list_renewal_decisions(tenant_id, "completed")
         groups: dict[tuple[str | None, str, str | None], list[dict[str, Any]]] = {}
@@ -2678,14 +3159,28 @@ class Store:
             if not feedback:
                 unlinked += 1
                 continue
-            supplier = decision.get("scenario_plan", {}).get("results", {}).get("supplier")
-            key = (supplier, feedback["scenario"], feedback.get("currency"))
+            supplier_name = decision.get("scenario_plan", {}).get("results", {}).get("supplier")
+            recorded = feedback.get("recorded_at") or ""
+            if from_date and recorded[:10] < from_date.isoformat():
+                continue
+            if to_date and recorded[:10] > to_date.isoformat():
+                continue
+            if supplier and (not supplier_name or supplier_name.casefold() != supplier.casefold()):
+                continue
+            if strategy and feedback["scenario"] != strategy:
+                continue
+            key = (decision.get("scenario_plan", {}).get("results", {}).get("supplier"), feedback["scenario"], feedback.get("currency"))
             groups.setdefault(key, []).append(feedback)
 
         def mean(values: list[Decimal]) -> str | None:
             return _money_string(sum(values, Decimal(0)) / len(values)) if values else None
 
         metrics = []
+        monthly: dict[tuple[str, str | None], list[dict[str, Any]]] = {}
+        all_feedback = [feedback for values in groups.values() for feedback in values]
+        for feedback in all_feedback:
+            month = (feedback.get("recorded_at") or "")[:7]
+            monthly.setdefault((month,feedback.get("currency")),[]).append(feedback)
         for (supplier, scenario, currency), rows in sorted(
             groups.items(), key=lambda item: (item[0][0] or "", item[0][1], item[0][2] or ""),
         ):
@@ -2709,8 +3204,53 @@ class Store:
             "linked_outcome_count": sum(len(rows) for rows in groups.values()),
             "unlinked_outcome_count": unlinked,
             "by_supplier_and_scenario": metrics,
+            "over_time": [{
+                "month": month,"currency":currency,"outcome_count":len(rows),
+                "mean_annual_value_variance":mean([Decimal(row["annual_value_variance"]) for row in rows if row.get("annual_value_variance") is not None]),
+                "mean_absolute_annual_value_error":mean([abs(Decimal(row["annual_value_variance"])) for row in rows if row.get("annual_value_variance") is not None]),
+                "mean_adjustment_error_percentage_points":str((sum((Decimal(row["adjustment_variance_percentage_points"]) for row in rows if row.get("adjustment_variance_percentage_points") is not None),Decimal(0))/sum(1 for row in rows if row.get("adjustment_variance_percentage_points") is not None)).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)) if any(row.get("adjustment_variance_percentage_points") is not None for row in rows) else None,
+            } for (month,currency),rows in sorted(monthly.items())],
+            "recommended_assumptions": {
+                "renewal_increase_pct": _percent_string(median([
+                    Decimal(row["actual_adjustment_pct"]) for row in all_feedback
+                    if row["scenario"] == "renew" and row.get("actual_adjustment_pct") is not None
+                ])) if any(row["scenario"] == "renew" and row.get("actual_adjustment_pct") is not None for row in all_feedback) else None,
+                "renegotiation_savings_pct": _percent_string(median([
+                    -Decimal(row["actual_adjustment_pct"]) for row in all_feedback
+                    if row["scenario"] == "renegotiate" and row.get("actual_adjustment_pct") is not None
+                ])) if any(row["scenario"] == "renegotiate" and row.get("actual_adjustment_pct") is not None for row in all_feedback) else None,
+            },
             "interpretation": "Annual value variance is actual minus estimated annual value; positive means actual spend exceeded the selected scenario estimate. Adjustment error is actual percentage change from the saved plan's baseline minus the assumed percentage change. Transition variance is actual minus assumed transition cost. Currency groups are never combined.",
         }
+
+    def adopt_renewal_calibration(
+        self, tenant_id: str, request: dict[str, Any], actor: str, source_outcome_count: int,
+    ) -> dict[str, Any]:
+        profile_id, now = str(uuid4()), utc_now().isoformat()
+        increase = str(request["renewal_increase_pct"])
+        savings = str(request["renegotiation_savings_pct"])
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO renewal_calibration_profiles (id,tenant_id,renewal_increase_pct,renegotiation_savings_pct,rationale,report_window_start,report_window_end,source_outcome_count,adopted_by,adopted_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (profile_id,tenant_id,increase,savings,request["rationale"],iso(request.get("report_window_start")),
+                 iso(request.get("report_window_end")),source_outcome_count,actor,now),
+            )
+            self._governance_event(db,tenant_id,"renewal.calibration_adopted","renewal_calibration",profile_id,actor,{
+                "renewal_increase_pct":increase,"renegotiation_savings_pct":savings,
+                "rationale":request["rationale"],"report_window_start":iso(request.get("report_window_start")),
+                "report_window_end":iso(request.get("report_window_end")),"source_outcome_count":source_outcome_count,
+            },now)
+        return self.get_renewal_calibration(tenant_id)
+
+    def get_renewal_calibration(self, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM renewal_calibration_profiles WHERE tenant_id=? ORDER BY adopted_at DESC LIMIT 1", (tenant_id,)).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["renewal_increase_pct"] = Decimal(result["renewal_increase_pct"])
+        result["renegotiation_savings_pct"] = Decimal(result["renegotiation_savings_pct"])
+        return result
 
     def renewal_outcome_summary(self, tenant_id: str) -> dict[str, Any]:
         with self.connect() as db:
@@ -3670,6 +4210,60 @@ class Store:
                 return True
             return False
 
+    def record_audit_archive_upload(
+        self, tenant_id: str, bucket: str, object_key: str, checksum_sha256: str, record_count: int,
+        retention_mode: str, retain_until: str, actor: str, *, status: str = "pending",
+        version_id: str | None = None, verification_status: str = "pending", failure_detail: str | None = None,
+    ) -> dict[str, Any]:
+        archive_id, now = str(uuid4()), utc_now().isoformat()
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO audit_archive_uploads (id,tenant_id,bucket,object_key,status,checksum_sha256,record_count,object_version_id,retention_mode,retain_until,verification_status,failure_detail,uploaded_by,created_at,verified_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (archive_id,tenant_id,bucket,object_key,status,checksum_sha256,record_count,version_id,retention_mode,
+                 retain_until,verification_status,failure_detail,actor,now,now if verification_status == "verified" else None),
+            )
+            self._governance_event(db, tenant_id, "audit.archive_upload_" + status, "audit_archive", archive_id, actor, {
+                "object_key": object_key, "checksum_sha256": checksum_sha256, "record_count": record_count,
+                "bucket":bucket,
+                "object_version_id": version_id, "retention_mode": retention_mode, "retain_until": retain_until,
+                "verification_status": verification_status, "failure_detail": failure_detail,
+            }, now)
+        return self.get_audit_archive_upload(archive_id, tenant_id)
+
+    def update_audit_archive_upload(
+        self, archive_id: str, tenant_id: str, actor: str, *, status: str,
+        version_id: str | None = None, verification_status: str = "failed", failure_detail: str | None = None,
+        retain_until: str | None = None,
+    ) -> dict[str, Any] | None:
+        now = utc_now().isoformat()
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM audit_archive_uploads WHERE id=? AND tenant_id=?", (archive_id,tenant_id)).fetchone()
+            if not row:
+                return None
+            db.execute(
+                "UPDATE audit_archive_uploads SET status=?,object_version_id=COALESCE(?,object_version_id),verification_status=?,failure_detail=?,retain_until=COALESCE(?,retain_until),verified_at=? WHERE id=? AND tenant_id=?",
+                (status,version_id,verification_status,failure_detail,retain_until,now if verification_status == "verified" else None,archive_id,tenant_id),
+            )
+            self._governance_event(db, tenant_id, "audit.archive_upload_" + status, "audit_archive", archive_id, actor, {
+                "object_key": row["object_key"], "checksum_sha256": row["checksum_sha256"],
+                "bucket":row["bucket"],
+                "object_version_id": version_id or row["object_version_id"],
+                "verification_status": verification_status, "failure_detail": failure_detail,
+                "retain_until": retain_until or row["retain_until"],
+            }, now)
+        return self.get_audit_archive_upload(archive_id, tenant_id)
+
+    def get_audit_archive_upload(self, archive_id: str, tenant_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM audit_archive_uploads WHERE id=? AND tenant_id=?", (archive_id,tenant_id)).fetchone()
+        return dict(row) if row else None
+
+    def list_audit_archive_uploads(self, tenant_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM audit_archive_uploads WHERE tenant_id=? ORDER BY created_at DESC LIMIT ?", (tenant_id,limit)).fetchall()
+        return [dict(row) for row in rows]
+
     def renewal_risk_snapshot(self, tenant_id: str, as_of: date | None = None) -> dict[str, Any]:
         today = as_of or date.today()
         with self.connect() as db:
@@ -4422,6 +5016,21 @@ class Store:
             ).fetchone()
             if hold:
                 raise ValueError("Contract is protected by an active legal hold")
+            # Remove retained source/signed documents and decision artifacts before their
+            # parent rows; task and contract foreign keys otherwise preserve sensitive data.
+            db.execute("DELETE FROM renewal_signature_events WHERE tenant_id=? AND envelope_record_id IN "
+                       "(SELECT id FROM renewal_signature_envelopes WHERE tenant_id=? AND contract_id=?)",
+                       (tenant_id, tenant_id, contract_id))
+            db.execute("DELETE FROM renewal_signature_envelopes WHERE contract_id=? AND tenant_id=?", (contract_id, tenant_id))
+            decision_ids = db.execute("SELECT id FROM renewal_decisions WHERE contract_id=? AND tenant_id=?", (contract_id, tenant_id)).fetchall()
+            for decision in decision_ids:
+                decision_id = decision["id"]
+                db.execute("DELETE FROM renewal_decision_events WHERE decision_id=? AND tenant_id=?", (decision_id, tenant_id))
+                db.execute("DELETE FROM renewal_decision_quotes WHERE decision_id=? AND tenant_id=?", (decision_id, tenant_id))
+                db.execute("DELETE FROM renewal_decision_milestones WHERE decision_id=? AND tenant_id=?", (decision_id, tenant_id))
+            db.execute("DELETE FROM renewal_decisions WHERE contract_id=? AND tenant_id=?", (contract_id, tenant_id))
+            db.execute("DELETE FROM renewal_scenario_plans WHERE contract_id=? AND tenant_id=?", (contract_id, tenant_id))
+            db.execute("DELETE FROM renewal_forecast_lines WHERE contract_id=? AND tenant_id=?", (contract_id, tenant_id))
             tasks = db.execute("SELECT id FROM tasks WHERE contract_id=?", (contract_id,)).fetchall()
             for task in tasks:
                 approval_targets = db.execute(
@@ -4444,6 +5053,8 @@ class Store:
                 db.execute("DELETE FROM contract_obligations WHERE task_id=?", (task["id"],))
                 db.execute("DELETE FROM renewal_outcomes WHERE task_id=?", (task["id"],))
             db.execute("DELETE FROM tasks WHERE contract_id=?", (contract_id,))
+            # Uploaded source PDFs and completed signature packets contain contract content too.
+            db.execute("DELETE FROM contract_documents WHERE contract_id=? AND tenant_id=?", (contract_id, tenant_id))
             db.execute("DELETE FROM external_documents WHERE contract_id=?", (contract_id,))
             db.execute("DELETE FROM review_feedback WHERE contract_id=? AND tenant_id=?", (contract_id, tenant_id))
             db.execute("DELETE FROM audit_events WHERE contract_id=? AND tenant_id=?", (contract_id, tenant_id))

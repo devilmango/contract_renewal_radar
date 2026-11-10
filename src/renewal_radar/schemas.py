@@ -93,7 +93,7 @@ class IntegrationConnectionRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    provider: Literal["google_calendar", "microsoft_calendar", "smtp", "microsoft_email", "gmail", "slack_webhook", "teams_webhook", "coupa", "sap_ariba"]
+    provider: Literal["google_calendar", "microsoft_calendar", "smtp", "microsoft_email", "gmail", "slack_webhook", "teams_webhook", "coupa", "sap_ariba", "s3_object_lock", "docusign"]
     settings: dict[str, str] = Field(default_factory=dict, max_length=20)
     credentials: dict[str, str] = Field(default_factory=dict, max_length=20)
 
@@ -461,6 +461,45 @@ class RenewalDecisionQuoteRequest(BaseModel):
     def validate_quote_dates(self) -> "RenewalDecisionQuoteRequest":
         if self.quote_date and self.valid_until and self.valid_until < self.quote_date:
             raise ValueError("valid_until cannot precede quote_date")
+        return self
+
+
+class SignatureEnvelopeRequest(BaseModel):
+    envelope_id: str | None = Field(default=None, max_length=200)
+    signer_name: str | None = Field(default=None, max_length=200)
+    signer_email: str | None = Field(default=None, max_length=320)
+    email_subject: str = Field(default="Please sign the approved renewal agreement", max_length=500)
+
+    @model_validator(mode="after")
+    def validate_signature_action(self) -> "SignatureEnvelopeRequest":
+        if not self.envelope_id and (not self.signer_name or not self.signer_email or "@" not in self.signer_email):
+            raise ValueError("Creating an envelope requires a signer name and valid email; provide envelope_id to link an existing envelope")
+        return self
+
+
+class ScimGroupRoleMappingRequest(BaseModel):
+    group_identifier: str = Field(min_length=1, max_length=200)
+    roles: list[Literal["admin", "reviewer", "owner", "scheduler"]] = Field(min_length=1, max_length=4)
+
+
+class RenewalCalibrationAdoptionRequest(BaseModel):
+    renewal_increase_pct: Decimal = Field(ge=Decimal("-100"), le=Decimal("1000"), max_digits=8, decimal_places=3)
+    renegotiation_savings_pct: Decimal = Field(ge=Decimal("0"), le=Decimal("100"), max_digits=8, decimal_places=3)
+    rationale: str = Field(min_length=1, max_length=2000)
+    report_window_start: date | None = None
+    report_window_end: date | None = None
+
+    @field_validator("rationale")
+    @classmethod
+    def validate_calibration_rationale(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("A reason is required to adopt calibration assumptions")
+        return value.strip()
+
+    @model_validator(mode="after")
+    def validate_calibration_window(self) -> "RenewalCalibrationAdoptionRequest":
+        if self.report_window_start and self.report_window_end and self.report_window_end < self.report_window_start:
+            raise ValueError("report_window_end must be on or after report_window_start")
         return self
 
 

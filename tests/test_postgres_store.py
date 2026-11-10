@@ -36,6 +36,24 @@ def test_postgres_schema_migrations_and_concurrent_worker_storage():
         currency="USD",
     )
     store.save_contract(contract_id, "agreement.pdf", "rules", terms, "notice 30 days", "ci", tenant)
+    store.save_contract_document(contract_id, tenant, "agreement.pdf", "application/pdf", b"%PDF-source", "a" * 64, "ci")
+    assert store.latest_contract_document(contract_id, tenant)["content"] == b"%PDF-source"
+    scim_user = store.scim_upsert_user(tenant, {
+        "externalId": "idp-ci-user", "userName": f"ci-{tenant}@example.com", "active": True,
+    }, "ci-scim")
+    scim_group = store.scim_upsert_group(tenant, {
+        "externalId": "legal-reviewers", "displayName": f"Legal {tenant}",
+        "members": [{"value": scim_user["id"]}],
+    })
+    store.save_scim_group_role_mapping(tenant, "legal-reviewers", ["reviewer"], "ci-admin")
+    assert store.resolve_scim_identity(tenant, "idp-ci-user", None, ["legal-reviewers"])["roles"] == ["reviewer"]
+    assert scim_group["members"][0]["id"] == scim_user["id"]
+    calibration = store.adopt_renewal_calibration(tenant, {
+        "renewal_increase_pct": Decimal("4.5"), "renegotiation_savings_pct": Decimal("8"),
+        "rationale": "CI migration coverage", "report_window_start": date(2025, 1, 1),
+        "report_window_end": date(2025, 12, 31),
+    }, "ci-reviewer", 0)
+    assert calibration["renewal_increase_pct"] == Decimal("4.5")
     task_id = store.confirm_contract(contract_id, terms, "ci", tenant)
     assert store.list_tasks(status="open", tenant_id=tenant, unassigned=True)[0]["id"] == task_id
     # Reminder state is only recorded for open tasks; capture it before the outcome closes this task.
@@ -89,3 +107,6 @@ def test_postgres_schema_migrations_and_concurrent_worker_storage():
     assert reopened.get_tenant_policy(tenant)["policy"] == policy
     assert reopened.task_notification_keys(task_id, tenant) == {"reminder:14"}
     assert len(reopened.list_contract_versions(contract_id, tenant)) == 2
+    assert reopened.latest_contract_document(contract_id, tenant)["content"] == b"%PDF-source"
+    assert reopened.get_scim_user(scim_user["id"], tenant)["active"] is True
+    assert reopened.get_renewal_calibration(tenant)["renewal_increase_pct"] == Decimal("4.5")
