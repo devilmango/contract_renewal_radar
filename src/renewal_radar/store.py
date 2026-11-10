@@ -2779,8 +2779,8 @@ class Store:
         active = int(bool(values.get("active", True)))
         attrs = json.dumps({key:value for key,value in values.items() if key not in {"id","externalId","userName","displayName","name","emails","active","groups"}},default=str)
         with self.connect() as db:
-            current = db.execute("SELECT id FROM scim_users WHERE tenant_id=? AND (user_name=? OR (? IS NOT NULL AND external_id=?)) ORDER BY CASE WHEN user_name=? THEN 0 ELSE 1 END LIMIT 1",
-                                 (tenant_id,user_name,external_id,external_id,user_name)).fetchone()
+            current = db.execute("SELECT id FROM scim_users WHERE tenant_id=? AND (user_name=? OR external_id=?) ORDER BY CASE WHEN user_name=? THEN 0 ELSE 1 END LIMIT 1",
+                                 (tenant_id,user_name,external_id,user_name)).fetchone()
             if current:
                 user_id = current["id"]
                 db.execute("UPDATE scim_users SET external_id=?,user_name=?,display_name=?,email=?,active=?,attributes_json=?,updated_at=? WHERE id=? AND tenant_id=?",
