@@ -451,6 +451,8 @@ docker compose -f docker-compose.test.yml down -v
 
 Set `POSTGRES_TEST_PORT` to use a different local port. The integration test skips when `TEST_POSTGRES_URL` is unset; CI starts the same PostgreSQL major version as a job service and runs the test with the database extra installed.
 
+When Docker or PostgreSQL is unavailable, `pytest -q tests/test_postgres_query_adapter.py` runs a DB-API mock regression check for PostgreSQL placeholder conversion and nullable SCIM lookups. The full `pytest -q` suite includes this check; it complements the real service test and does not replace it.
+
 ### Data governance
 
 Set `LLM_ALLOWED_PROVIDERS` to an explicit comma-separated list such as `rules,anthropic` to control which extraction providers may receive contract text. `rules` runs locally. The `.env.example` defaults this allowlist to `rules`; if the setting is omitted, existing deployments remain compatible and all configured providers are allowed. `LLM_PROVIDER=auto` and `renewal-radar evaluate --provider all` honor the allowlist too.

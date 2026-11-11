@@ -2838,8 +2838,10 @@ class Store:
         if not name:
             raise ValueError("SCIM group displayName is required")
         with self.connect() as db:
-            row = db.execute("SELECT id FROM scim_groups WHERE tenant_id=? AND (display_name=? OR (? IS NOT NULL AND external_id=?)) LIMIT 1",
-                             (tenant_id,name,values.get("externalId"),values.get("externalId"))).fetchone()
+            row = db.execute(
+                "SELECT id FROM scim_groups WHERE tenant_id=? AND (display_name=? OR external_id=?) LIMIT 1",
+                (tenant_id, name, values.get("externalId")),
+            ).fetchone()
             if row:
                 group_id = row["id"]
                 db.execute("UPDATE scim_groups SET external_id=?,display_name=?,updated_at=? WHERE id=? AND tenant_id=?",
@@ -2950,8 +2952,11 @@ class Store:
 
     def scim_user_is_active(self, tenant_id: str, actor: str, email: str | None = None) -> bool:
         with self.connect() as db:
-            row = db.execute("SELECT active FROM scim_users WHERE tenant_id=? AND (lower(user_name)=lower(?) OR (? IS NOT NULL AND lower(email)=lower(?))) LIMIT 1",
-                              (tenant_id,actor,email,email)).fetchone()
+            row = db.execute(
+                "SELECT active FROM scim_users WHERE tenant_id=? AND "
+                "(lower(user_name)=lower(?) OR lower(email)=lower(?)) LIMIT 1",
+                (tenant_id, actor, email),
+            ).fetchone()
         return not row or bool(row["active"])
 
     def complete_renewal_decision(self, decision_id: str, tenant_id: str, request: dict[str, Any], actor: str) -> dict[str, Any] | None:
